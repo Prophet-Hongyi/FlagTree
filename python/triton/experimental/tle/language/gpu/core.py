@@ -1056,7 +1056,6 @@ def copy(
         return tmacopy(src, dst, direction, shape, offsets, barrier, _semantic)
 
 
-
 def _expand_index_to_shape(index: tl.tensor, shape: Sequence[int], axis: int, _semantic) -> tl.tensor:
     idx = index
     for _ in builtins.range(axis):
