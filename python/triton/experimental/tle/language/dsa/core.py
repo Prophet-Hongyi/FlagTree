@@ -280,3 +280,91 @@ def extract_element(src, indice, _semantic=None, _generator=None):
     assert len(src.shape) > 0
     new_indice = [_semantic.to_tensor(i) if isinstance(i, constexpr) else i for i in indice]
     return tle_semantic.extract_element(src, new_indice, _semantic.builder)
+
+
+# ==============================================================================
+# TileIR builtin functions — 3-task flash attention operations
+# ==============================================================================
+
+@builtin
+def tile_alloc(shape: List[tl.constexpr], dtype: tl.dtype, mem_addr_space: address_space, _semantic=None, _generator=None) -> buffer:
+    """Allocate a buffer in a specific memory space (TileIR path)."""
+    assert (mem_addr_space is not None)
+    return tle_semantic.tile_alloc(dtype, shape, mem_addr_space, _semantic.builder)
+
+
+@builtin
+def tile_copy(src, dst, shape, inter_no_alias=False, _semantic=None, _generator=None):
+    """Copy data using TileIR tile.copy op."""
+    assert len(shape) != 0, "Can't deduce copy extents from args"
+    shape = _constexpr_to_value(shape)
+    inter_no_alias = _constexpr_to_value(inter_no_alias)
+    tle_semantic.tile_copy(src, dst, shape, inter_no_alias, _semantic.builder)
+
+
+@builtin
+def tile_subview(src: buffer, offsets: List[tl.constexpr], sizes: List[tl.constexpr], strides: List[tl.constexpr],
+                 _semantic=None, _generator=None) -> buffer:
+    """Extract a subview from a buffer using TileIR tile.subview op."""
+    new_sizes = []
+    for i, size in enumerate(sizes):
+        if isinstance(size, int):
+            new_sizes.append(tl.constexpr(size))
+        elif isinstance(size, tl.constexpr):
+            new_sizes.append(size)
+        else:
+            raise TypeError(f"sizes[{i}] must be constexpr, got {type(size).__name__}")
+
+    new_strides = []
+    for i, stride in enumerate(strides):
+        if isinstance(stride, int):
+            new_strides.append(tl.constexpr(stride))
+        elif isinstance(stride, tl.constexpr):
+            new_strides.append(stride)
+        else:
+            raise TypeError(f"strides[{i}] must be constexpr, got {type(stride).__name__}")
+
+    new_offsets = []
+    for offset in offsets:
+        if isinstance(offset, tl.constexpr):
+            if offset < 0:
+                raise ValueError(f"Offset value must be non-negative, got {offset}")
+            new_offsets.append(_semantic.to_tensor(offset))
+        elif isinstance(offset, int):
+            if offset < 0:
+                raise ValueError(f"Offset value must be non-negative, got {offset}")
+            new_offsets.append(_semantic.to_tensor(tl.constexpr(offset)))
+        else:
+            new_offsets.append(offset)
+
+    return tle_semantic.tile_subview(src, new_offsets, new_sizes, new_strides, _semantic.builder)
+
+
+@builtin
+def tile_to_tensor(memref: buffer, writable: bool = True, target_shape=None, _semantic=None, _generator=None) -> tl.tensor:
+    """Create a tl.tensor from a buffer (TileIR path)."""
+    return tle_semantic.tile_to_tensor(memref, writable, _semantic.builder, target_shape=target_shape)
+
+
+@builtin
+def tile_set_flag(producer_pipe, consumer_pipe, event_id, _semantic=None, _generator=None):
+    """Set a cross-engine synchronization flag (TileIR tile.set_flag)."""
+    tle_semantic.set_flag(producer_pipe, consumer_pipe, event_id, _semantic.builder)
+
+
+@builtin
+def tile_wait_flag(producer_pipe, consumer_pipe, event_id, _semantic=None, _generator=None):
+    """Wait for a cross-engine synchronization flag (TileIR tile.wait_flag)."""
+    tle_semantic.wait_flag(producer_pipe, consumer_pipe, event_id, _semantic.builder)
+
+
+@builtin
+def tile_pipe_barrier(pipe, _semantic=None, _generator=None):
+    """Insert an intra-engine pipeline barrier (TileIR tile.pipe_barrier)."""
+    tle_semantic.pipe_barrier(pipe, _semantic.builder)
+
+
+@builtin
+def tile_gm_offset(base, indices, strides, _semantic=None, _generator=None) -> tl.tensor:
+    """Compute a GM pointer with multi-dimensional offsets (TileIR tile.gm_offset)."""
+    return tle_semantic.tile_gm_offset(base, indices, strides, _semantic.builder)
