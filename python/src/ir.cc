@@ -13,6 +13,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -361,9 +362,10 @@ void init_triton_ir(py::module &&m) {
     DialectRegistry registry;
     registry.insert<TritonDialect, ::mlir::triton::gpu::TritonGPUDialect,
                     ::mlir::triton::instrument::TritonInstrumentDialect,
-                    math::MathDialect, arith::ArithDialect, scf::SCFDialect,
-                    ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
-                    LLVM::LLVMDialect, mlir::ub::UBDialect,
+                    math::MathDialect, arith::ArithDialect, index::IndexDialect,
+                    scf::SCFDialect, ::mlir::gpu::GPUDialect,
+                    cf::ControlFlowDialect, LLVM::LLVMDialect,
+                    mlir::ub::UBDialect, func::FuncDialect,
                     mlir::triton::gluon::GluonDialect,
                     DLTIDialect,                  // flagtree tle raw
                     mlir::triton::tle::TleDialect // flagtree tle raw
@@ -372,6 +374,8 @@ void init_triton_ir(py::module &&m) {
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);
     mlir::LLVM::registerInlinerInterface(registry);
+    // Register inliner interface for func dialect
+    func::registerInlinerExtension(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
