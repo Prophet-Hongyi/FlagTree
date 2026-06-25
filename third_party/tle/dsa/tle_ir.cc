@@ -203,27 +203,26 @@ void init_triton_tle(py::module &&m) {
                }
                staticOffsets.push_back(ShapedType::kDynamic);
              }
-             llvm::SmallVector<Value> sizes;
-             llvm::SmallVector<int64_t> staticSizes;
+             llvm::SmallVector<OpFoldResult> mixedOffsets;
+             for (Value offset : offsets) {
+               mixedOffsets.push_back(offset);
+             }
+             llvm::SmallVector<OpFoldResult> mixedSizes;
              llvm::SmallVector<int64_t> retSizes;
              for (const auto &s : sizs_vec) {
-               staticSizes.push_back(s);
+               mixedSizes.push_back(self.getBuilder().getIndexAttr(s));
                retSizes.push_back(s);
              }
-             llvm::SmallVector<Value> strides;
-             llvm::SmallVector<int64_t> staticStrides;
+             llvm::SmallVector<OpFoldResult> mixedStrides;
              for (const auto &s : strd_vec) {
-               auto v = self.create<arith::ConstantIndexOp>(s);
-               strides.push_back(v);
-               staticStrides.push_back(ShapedType::kDynamic);
+               mixedStrides.push_back(self.getBuilder().getIndexAttr(s));
              }
              auto retTy = RankedTensorType::get(
                  retSizes,
                  cast<RankedTensorType>(ful.getType()).getElementType());
 
              return self.create<tensor::ExtractSliceOp>(
-                 retTy, ful, offsets, sizes, strides, staticOffsets,
-                 staticSizes, staticStrides);
+                 retTy, ful, mixedOffsets, mixedSizes, mixedStrides);
            })
       .def("create_dsa_insert_slice",
            [](TritonOpBuilder &self, Value &ful, Value &sub,
@@ -242,26 +241,20 @@ void init_triton_tle(py::module &&m) {
                }
                staticOffsets.push_back(ShapedType::kDynamic);
              }
-             llvm::SmallVector<Value> sizes;
-             llvm::SmallVector<int64_t> staticSizes;
-             llvm::SmallVector<int64_t> retSizes;
+             llvm::SmallVector<OpFoldResult> mixedOffsets;
+             for (Value offset : offsets) {
+               mixedOffsets.push_back(offset);
+             }
+             llvm::SmallVector<OpFoldResult> mixedSizes;
              for (const auto &s : sizs_vec) {
-               staticSizes.push_back(s);
-               retSizes.push_back(s);
+               mixedSizes.push_back(self.getBuilder().getIndexAttr(s));
              }
-             llvm::SmallVector<Value> strides;
-             llvm::SmallVector<int64_t> staticStrides;
+             llvm::SmallVector<OpFoldResult> mixedStrides;
              for (const auto &s : strd_vec) {
-               auto v = self.create<arith::ConstantIndexOp>(s);
-               strides.push_back(v);
-               staticStrides.push_back(ShapedType::kDynamic);
+               mixedStrides.push_back(self.getBuilder().getIndexAttr(s));
              }
-             auto retTy = RankedTensorType::get(
-                 retSizes,
-                 cast<RankedTensorType>(ful.getType()).getElementType());
              auto ret = self.create<tensor::InsertSliceOp>(
-                 sub, ful, offsets, sizes, strides, staticOffsets, staticSizes,
-                 staticStrides);
+                 sub, ful, mixedOffsets, mixedSizes, mixedStrides);
              return ret;
            })
       .def("create_dsa_subview",
@@ -395,12 +388,21 @@ void init_triton_tle(py::module &&m) {
        [](DSAOpBuilder &self, Value source, std::vector<Value> &offsets,
           const std::vector<int64_t> &sizes,
           const std::vector<int64_t> &strides) -> Value {
+         SmallVector<Value> indexOffsets;
+         auto &builder = self.getBuilder();
+         auto indexType = builder.getIndexType();
+         for (Value offset : offsets) {
+           if (offset.getType() != indexType) {
+             offset = self.create<arith::IndexCastOp>(indexType, offset);
+           }
+           indexOffsets.push_back(offset);
+         }
          auto *ctx = self.getBuilder().getContext();
          auto srcBuf = mlir::cast<mlir::triton::tile::BufType>(source.getType());
          auto resTy = mlir::triton::tile::BufType::get(
              ctx, sizes, srcBuf.getElementType(), srcBuf.getMemorySpace());
          auto op = self.create<mlir::triton::tile::SubViewOp>(
-             resTy, source, offsets,
+             resTy, source, indexOffsets,
              self.getBuilder().getI64ArrayAttr(sizes),
              self.getBuilder().getI64ArrayAttr(strides));
          return op.getResult();
@@ -448,8 +450,45 @@ void init_triton_tle(py::module &&m) {
   .def("create_tile_gm_offset",
        [](DSAOpBuilder &self, Value &base, std::vector<Value> &indices,
           std::vector<Value> &strides) -> Value {
+         SmallVector<Value> indexValues;
+         SmallVector<Value> strideValues;
+         auto &builder = self.getBuilder();
+         auto indexType = builder.getIndexType();
+         for (Value index : indices) {
+           if (index.getType() != indexType) {
+             index = self.create<arith::IndexCastOp>(indexType, index);
+           }
+           indexValues.push_back(index);
+         }
+         for (Value stride : strides) {
+           if (stride.getType() != indexType) {
+             stride = self.create<arith::IndexCastOp>(indexType, stride);
+           }
+           strideValues.push_back(stride);
+         }
          auto op = self.create<mlir::triton::tile::GmOffsetOp>(
-             base.getType(), base, indices, strides);
+             base.getType(), base, indexValues, strideValues);
          return op.getResult();
+       })
+  // tile.cube_launch — async Cube matmul hook. The current TileIR op has no
+  // token result, so the matching wait is emitted as a standalone op.
+  .def("create_tile_cube_launch",
+       [](DSAOpBuilder &self, Value &a, Value &b, Value &acc, Value &stageA,
+          Value &stageB, Value &dst, bool transposeA, bool transposeB,
+          bool init, std::string mma) -> void {
+         auto &builder = self.getBuilder();
+         auto unitAttr = builder.getUnitAttr();
+         self.create<mlir::triton::tile::CubeLaunchOp>(
+             a, b, acc, stageA, stageB, dst,
+             transposeA ? unitAttr : mlir::UnitAttr(),
+             transposeB ? unitAttr : mlir::UnitAttr(),
+             init ? unitAttr : mlir::UnitAttr(),
+             mma.empty() ? mlir::StringAttr() : builder.getStringAttr(mma),
+             /*comment=*/mlir::StringAttr());
+       })
+  // tile.cube_wait
+  .def("create_tile_cube_wait",
+       [](DSAOpBuilder &self) -> void {
+         self.create<mlir::triton::tile::CubeWaitOp>();
        });
 }
