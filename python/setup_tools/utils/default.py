@@ -78,7 +78,8 @@ class FlagCXRegistrar:
     def _copy_required_files(self):
         flagcx_wrapper_src = Path(self.flagcx_src_dir) / "plugin" / "interservice" / "flagcx_wrapper.py"
         if flagcx_wrapper_src.exists():
-            dst = Path(self.flagtree_dir) / "python" / "triton" / "experimental" / "tle" / "language" / "flagcx_wrapper.py"
+            dst = Path(
+                self.flagtree_dir) / "python" / "triton" / "experimental" / "tle" / "language" / "flagcx_wrapper.py"
             shutil.copy(flagcx_wrapper_src, dst)
             printinfo(f"flagcx_wrapper.py copied from {flagcx_wrapper_src} to {dst}")
             dst = Path(self.flagtree_dir) / "third_party" / "nvidia" / "backend" / "flagcx_wrapper.py"
