@@ -40,7 +40,7 @@ def init_language():
 
     @_jit
     def unsqueeze(x, dim: _constexpr):
-        return x.reshape(x.shape[:dim] + (1,) + x.shape[dim:])
+        return x.reshape(x.shape[:dim] + (1, ) + x.shape[dim:])
 
     @_builtin
     def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _semantic=None):
