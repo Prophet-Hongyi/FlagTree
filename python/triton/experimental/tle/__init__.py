@@ -1,38 +1,12 @@
-# flagtree tle
-from .distributed import (
-    B,
-    P,
-    S,
-    ShardedTensor,
-    ShardingSpec,
-    device_mesh,
-    distributed_barrier,
-    distributed_dot,
-    make_sharded_tensor,
-    remote,
-    reshard,
-    shard_id,
-    sharding,
-)
-
-from . import language
-
-try:
-    from . import raw
-except ModuleNotFoundError:
-    raw = None
-
 # Copyright 2026- Xcoresigma Technology Co., Ltd
 
-import ast
-import importlib
-from typing import Dict, Optional
-
 from triton._C.libtriton import ir
+from typing import Optional, Dict
 from triton.runtime import JITFunction
-from typing_extensions import override
-
 from .language.builder import setup_unified_builder_with_tle_builder
+import importlib
+import ast
+from typing_extensions import override
 
 try:
     from triton._C.libtriton import tle as tle_ir
@@ -40,6 +14,36 @@ except ImportError:
     raise RuntimeError("tle is not available")
 
 triton_compiler = importlib.import_module("triton.compiler", package=__package__)
+
+
+class scope:
+    """Frontend-only marker for `with tle.scope(core_mode=...)`."""
+
+    def __init__(self, *, core_mode):
+        if core_mode not in ("cube", "vector"):
+            raise ValueError(f'core_mode must be "cube" or "vector", got {core_mode!r}')
+        self.core_mode = core_mode
+
+    def __enter__(self):
+        raise RuntimeError("tle.scope() can only be used inside a Triton kernel")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
+def _is_tle_attr_call(context, attr):
+    return isinstance(context, ast.Call) and isinstance(context.func, ast.Attribute) and context.func.attr == attr
+
+
+def _validate_tle_scope(context):
+    if context.args:
+        raise ValueError("tle.scope() only accepts keyword arguments")
+    keywords = {kw.arg: kw.value for kw in context.keywords}
+    if set(keywords) != {"core_mode"}:
+        raise ValueError('tle.scope() requires exactly core_mode="cube" or core_mode="vector"')
+    value = keywords["core_mode"]
+    if not isinstance(value, ast.Constant) or value.value not in ("cube", "vector"):
+        raise ValueError('tle.scope() core_mode must be the literal "cube" or "vector"')
 
 
 def tle_patch_for_triton_compile():
@@ -73,22 +77,19 @@ code_generator = importlib.import_module("triton.compiler.code_generator", packa
 
 class TleCodeGenerator(code_generator.CodeGenerator):
 
-    def __init__(self, context, prototype, gscope, function_name, jit_fn: JITFunction, *, options, codegen_fns,
-                 module_map, is_gluon, module=None, is_kernel=False, function_types: Optional[Dict] = None,
-                 noinline=False, caller_context=None, file_name: Optional[str] = None, begin_line=0):
-        super().__init__(context, prototype, gscope, function_name, jit_fn, options=options, codegen_fns=codegen_fns,
-                         module_map=module_map, is_gluon=is_gluon, module=module, is_kernel=is_kernel,
-                         function_types=function_types, noinline=noinline, caller_context=caller_context,
-                         file_name=file_name, begin_line=begin_line)
+    def __init__(self, context, prototype, gscope, attributes, constants, function_name, jit_fn: JITFunction, options,
+                 codegen_fns, module_map, module=None, is_kernel=False, function_types: Optional[Dict] = None,
+                 noinline=False, file_name: Optional[str] = None, begin_line=0):
+        super().__init__(context, prototype, gscope, attributes, constants, function_name, jit_fn, options, codegen_fns,
+                         module_map, module, is_kernel, function_types, noinline, file_name, begin_line)
+        self.tle_builder = tle_ir.tle_builder(context)
+        self.tle_builder.set_loc(file_name, begin_line, 0)
 
         # Stack to keep track of active `with`-hints (e.g., tle.hint(...))
         # Each entry is a dict mapping hint names to literal values.
         self.with_hints = []
 
-        if not is_gluon:
-            self.tle_builder = self.builder
-        else:
-            self.tle_builder = None
+        setup_unified_builder_with_tle_builder(self.builder, self.tle_builder)
 
     @override
     def visit_With(self, node):
@@ -97,29 +98,23 @@ class TleCodeGenerator(code_generator.CodeGenerator):
 
         # extract tle hints
         hints = {}
-        is_tle_hint = False
-        if isinstance(context, ast.Call):
-            if isinstance(context.func, ast.Attribute) and context.func.attr == "hint":
-                is_tle_hint = True
-                for kw in context.keywords:
-                    if not isinstance(kw.value, ast.Constant):
-                        raise self._unsupported(node,
-                                                "keyword arguments to hint() are only supported for constant values")
-                    hints[kw.arg] = kw.value.value
+        if _is_tle_attr_call(context, "hint"):
+            for kw in context.keywords:
+                if not isinstance(kw.value, ast.Constant):
+                    raise self._unsupported(node, "keyword arguments to hint() are only supported for constant values")
+                hints[kw.arg] = kw.value.value
 
         # append hints to with_hints anyway, to indicate that we're in the with scope
         self.with_hints.append(hints)
 
-        if is_tle_hint:
-            # tle.dsa.hint() is a marker for TLE codegen, not a runtime context
-            # manager. Do not visit the context expression, otherwise the dummy
-            # Python function is called and raises.
-            self.visit_compound_statement(node.body)
-        else:
-            super().visit_With(node)
-
-        # pop hints to indicate that we're out of the with scope
-        self.with_hints.pop()
+        try:
+            if _is_tle_attr_call(context, "scope") and self.visit(context.func) is scope:
+                _validate_tle_scope(context)
+                return self.visit_compound_statement(node.body)
+            return super().visit_With(node)
+        finally:
+            # pop hints to indicate that we're out of the with scope
+            self.with_hints.pop()
 
 
 def extract_tle_hints_scope(generator: TleCodeGenerator):
@@ -155,32 +150,9 @@ def extract_tle_hints_scope(generator: TleCodeGenerator):
 triton_compiler.compile = tle_patch_for_triton_compile()
 code_generator.CodeGenerator = TleCodeGenerator
 
-
-def __getattr__(name):
-    if name == "dsa":
-        from .language import dsa
-        globals()[name] = dsa
-        return dsa
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
+from .language import dsa
 
 __all__ = [
-    "device_mesh",
-    "S",
-    "P",
-    "B",
-    "sharding",
-    "ShardingSpec",
-    "ShardedTensor",
-    "make_sharded_tensor",
-    "reshard",
-    "remote",
-    "shard_id",
-    "distributed_barrier",
-    "distributed_dot",
-    "language",
     "dsa",
+    "scope",
 ]
-
-if raw is not None:
-    __all__.append("raw")
