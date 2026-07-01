@@ -1,6 +1,6 @@
 [[中文版](./install_tsingmicro_cn.md)|English]
 
-## 💫 Tsingmicro（清微智能）[tsingmicro](https://github.com/flagos-ai/FlagTree/tree/triton_v3.3.x/third_party/tsingmicro/) (Triton 3.5)
+## 💫 Tsingmicro（清微智能）[tsingmicro](https://github.com/flagos-ai/FlagTree/tree/triton_v3.3.x/third_party/tsingmicro/) (Triton 3.3)
 
 - Based on Triton 3.3, x64
 - Available for TX81
@@ -87,6 +87,7 @@ export LLVM_SYSPATH=~/.flagtree/tsingmicro/tsingmicro-llvm21-glibc2.30-glibcxx3.
 export LLVM_BINARY_DIR=${LLVM_SYSPATH}/bin
 export PYTHONPATH=${LLVM_SYSPATH}/python_packages/mlir_core:$PYTHONPATH
 export LD_LIBRARY_PATH=$TX8_DEPS_ROOT/lib:$LD_LIBRARY_PATH
+export PATH=${LLVM_BINARY_DIR}:${PATH}
 ```
 
 ```shell
