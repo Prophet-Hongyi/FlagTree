@@ -41,11 +41,9 @@ _filecheck_system = shutil.which("FileCheck")
 filecheck_path = _filecheck_local if os.path.isfile(_filecheck_local) else _filecheck_system
 
 if filecheck_path is None:
-    raise FileNotFoundError(
-        "FileCheck binary not found.  Install it with your package manager\n"
-        "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
-        f"  {_filecheck_local}"
-    )
+    raise FileNotFoundError("FileCheck binary not found.  Install it with your package manager\n"
+                            "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
+                            f"  {_filecheck_local}")
 
 
 class MatchError(ValueError):
