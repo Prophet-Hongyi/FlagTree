@@ -35,15 +35,23 @@ def _get_stub_target() -> GPUTarget:
     return GPUTarget("cuda", 100, 32)
 
 
-triton_dir = os.path.dirname(__file__)
-_filecheck_local = os.path.join(triton_dir, "FileCheck")
+_triton_dir = os.path.dirname(__file__)
+_filecheck_local = os.path.join(_triton_dir, "FileCheck")
 _filecheck_system = shutil.which("FileCheck")
-filecheck_path = _filecheck_local if os.path.isfile(_filecheck_local) else _filecheck_system
+_filecheck_path = _filecheck_local if os.path.isfile(_filecheck_local) else _filecheck_system
 
-if filecheck_path is None:
-    raise FileNotFoundError("FileCheck binary not found.  Install it with your package manager\n"
-                            "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
-                            f"  {_filecheck_local}")
+_MISSING_FILECHECK_MSG = (
+    "FileCheck binary not found.  Install it with your package manager\n"
+    "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
+    f"  {_filecheck_local}"
+)
+
+
+def _get_filecheck_path():
+    """Return the path to the FileCheck binary, or raise FileNotFoundError."""
+    if _filecheck_path is None:
+        raise FileNotFoundError(_MISSING_FILECHECK_MSG)
+    return _filecheck_path
 
 
 class MatchError(ValueError):
@@ -68,7 +76,7 @@ def run_filecheck(name, module_str, check_template):
 
         try:
             subprocess.check_output(
-                [filecheck_path, temp_expected, "--input-file", temp_module, "--dump-input-context=50"],
+                [_get_filecheck_path(), temp_expected, "--input-file", temp_module, "--dump-input-context=50"],
                 stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as error:
             decoded = error.output.decode('unicode_escape')
