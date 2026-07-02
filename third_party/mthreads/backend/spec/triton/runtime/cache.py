@@ -279,23 +279,25 @@ def make_so_cache_key(version_hash, signature, constants, ids, **kwargs):
 @functools.lru_cache()
 def triton_key():
     import pkgutil
+    import sys
     # This file lives under .../spec/triton/runtime/cache.py.
-    # spec/triton/ is the overlay (takes priority); .../triton/ is the base
-    # package.  Walk spec first, fall back to base for paths missing from spec.
+    # spec/triton/ is the mthreads overlay (takes priority).
+    # The compiled _C/ and base backends/ live under the main triton package.
     TRITON_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # spec/triton
-    _base_triton = os.path.join(os.path.dirname(os.path.dirname(TRITON_PATH)), 'triton')  # base triton
+    _main_triton = os.path.dirname(
+        os.path.abspath(sys.modules['triton'].__file__))  # main triton root
 
     contents = []
     # frontend
     with open(__file__, "rb") as f:
         contents += [hashlib.sha256(f.read()).hexdigest()]
 
-    # compiler & backends — spec overlay first, base for the rest
+    # compiler & backends — spec overlay first, main triton for the rest
     _seen = set()
     for path, prefix in [
         (os.path.join(TRITON_PATH, "compiler"), "triton.compiler."),
-        (os.path.join(_base_triton, "compiler"), "triton.compiler."),
-        (os.path.join(_base_triton, "backends"), "triton.backends."),
+        (os.path.join(_main_triton, "compiler"), "triton.compiler."),
+        (os.path.join(_main_triton, "backends"), "triton.backends."),
     ]:
         if not os.path.isdir(path):
             continue
@@ -306,10 +308,10 @@ def triton_key():
             with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
                 contents += [hashlib.sha256(f.read()).hexdigest()]
 
-    # backend native library — only in base triton
+    # backend native library — from main triton package
     libtriton_hash = hashlib.sha256()
     ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
-    with open(os.path.join(_base_triton, "_C", f"libtriton.{ext}"), "rb") as f:
+    with open(os.path.join(_main_triton, "_C", f"libtriton.{ext}"), "rb") as f:
         while True:
             chunk = f.read(1024**2)
             if not chunk:
@@ -317,10 +319,10 @@ def triton_key():
             libtriton_hash.update(chunk)
     contents.append(libtriton_hash.hexdigest())
 
-    # language — spec overlay first, base for the rest
+    # language — spec overlay first, main triton for the rest
     for language_path in [
-            os.path.join(TRITON_PATH, 'language'),
-            os.path.join(_base_triton, 'language'),
+        os.path.join(TRITON_PATH, 'language'),
+        os.path.join(_main_triton, 'language'),
     ]:
         if not os.path.isdir(language_path):
             continue
