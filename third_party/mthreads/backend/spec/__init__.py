@@ -6,6 +6,12 @@ FLAGTREE_BACKEND=mthreads. Functions defined here are callable
 via flagtree_spec.spec("function_name", ...).
 """
 
+# Imported at module level so the JIT code generator can resolve
+# the annotation name from fn.__globals__.  The module is loaded
+# dynamically by flagtree_spec AFTER triton.language is ready, so
+# this is safe against circular imports.
+from triton.language.core import constexpr
+
 
 def init_language():
     """Add mthreads-specific symbols to triton.language.
@@ -18,7 +24,6 @@ def init_language():
     from triton.runtime.jit import jit as _jit
     from triton.language.core import (
         builtin as _builtin,
-        constexpr as _constexpr,
         static_assert as _static_assert,
         _unwrap_if_constexpr,
     )
@@ -34,12 +39,12 @@ def init_language():
     _ext = _Ext()
 
     @_jit
-    def squeeze(x, dim: _constexpr):
+    def squeeze(x, dim: constexpr):
         _static_assert(x.shape[dim] == 1)
         return x.reshape(x.shape[:dim] + x.shape[dim + 1:])
 
     @_jit
-    def unsqueeze(x, dim: _constexpr):
+    def unsqueeze(x, dim: constexpr):
         return x.reshape(x.shape[:dim] + (1, ) + x.shape[dim:])
 
     @_builtin
