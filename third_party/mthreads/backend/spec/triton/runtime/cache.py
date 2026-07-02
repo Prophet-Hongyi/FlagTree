@@ -284,8 +284,7 @@ def triton_key():
     # spec/triton/ is the mthreads overlay (takes priority).
     # The compiled _C/ and base backends/ live under the main triton package.
     TRITON_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # spec/triton
-    _main_triton = os.path.dirname(
-        os.path.abspath(sys.modules['triton'].__file__))  # main triton root
+    _main_triton = os.path.dirname(os.path.abspath(sys.modules['triton'].__file__))  # main triton root
 
     contents = []
     # frontend
@@ -321,8 +320,8 @@ def triton_key():
 
     # language — spec overlay first, main triton for the rest
     for language_path in [
-        os.path.join(TRITON_PATH, 'language'),
-        os.path.join(_main_triton, 'language'),
+            os.path.join(TRITON_PATH, 'language'),
+            os.path.join(_main_triton, 'language'),
     ]:
         if not os.path.isdir(language_path):
             continue
