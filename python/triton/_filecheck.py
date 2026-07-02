@@ -24,11 +24,9 @@ _filecheck_local = os.path.join(triton_dir, "FileCheck")
 _filecheck_system = shutil.which("FileCheck")
 _filecheck_path = _filecheck_local if os.path.isfile(_filecheck_local) else _filecheck_system
 
-_MISSING_FILECHECK_MSG = (
-    "FileCheck binary not found.  Install it with your package manager\n"
-    "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
-    f"  {_filecheck_local}"
-)
+_MISSING_FILECHECK_MSG = ("FileCheck binary not found.  Install it with your package manager\n"
+                          "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
+                          f"  {_filecheck_local}")
 
 
 def _get_filecheck_path():
