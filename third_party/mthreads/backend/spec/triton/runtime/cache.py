@@ -283,8 +283,7 @@ def triton_key():
     # spec/triton/ is the overlay (takes priority); .../triton/ is the base
     # package.  Walk spec first, fall back to base for paths missing from spec.
     TRITON_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # spec/triton
-    _base_triton = os.path.join(
-        os.path.dirname(os.path.dirname(TRITON_PATH)), 'triton')  # base triton
+    _base_triton = os.path.join(os.path.dirname(os.path.dirname(TRITON_PATH)), 'triton')  # base triton
 
     contents = []
     # frontend
@@ -320,8 +319,8 @@ def triton_key():
 
     # language — spec overlay first, base for the rest
     for language_path in [
-        os.path.join(TRITON_PATH, 'language'),
-        os.path.join(_base_triton, 'language'),
+            os.path.join(TRITON_PATH, 'language'),
+            os.path.join(_base_triton, 'language'),
     ]:
         if not os.path.isdir(language_path):
             continue
