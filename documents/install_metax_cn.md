@@ -68,7 +68,7 @@ sh python/scripts/unpack_triton_build_deps.sh ./build-deps-triton_3.6.x-linux-x6
 # Note: First install PyTorch, then execute the following commands
 python3 -m pip uninstall -y triton  # Repeat the cmd until fully uninstalled
 RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
-python3.12 -m pip install flagtree===0.6.0+metax3.6 $RES
+python3.12 -m pip install flagtree===0.6.1a1+metax3.6 $RES
 ```
 
 安装 `flagtree` 后，可通过下列命令查看：
@@ -89,6 +89,8 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 ### 3. 测试验证
 
 参考 [Tests of metax3.6 backend](https://github.com/flagos-ai/FlagTree/blob/triton_v3.6.x/.github/workflows/metax3.6-build-and-test.yml)
+
+---
 
 ## 💫 MetaX（沐曦股份）[metax](/third_party/metax/) (Triton 3.0)
 
