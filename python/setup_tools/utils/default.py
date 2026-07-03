@@ -76,26 +76,19 @@ class FlagCXRegistrar:
                 printinfo(f"[32m{lib_name} copied from {src_path} to cache at {runtime_path}")
 
     def _copy_required_files(self):
-        flagcx_wrapper_src = Path(self.flagcx_src_dir) / "plugin" / "interservice" / "flagcx_wrapper.py"
-        if flagcx_wrapper_src.exists():
-            dst = Path(
-                self.flagtree_dir) / "python" / "triton" / "experimental" / "tle" / "language" / "flagcx_wrapper.py"
-            shutil.copy(flagcx_wrapper_src, dst)
-            printinfo(f"flagcx_wrapper.py copied from {flagcx_wrapper_src} to {dst}")
-            dst = Path(self.flagtree_dir) / "third_party" / "nvidia" / "backend" / "flagcx_wrapper.py"
-            shutil.copy(flagcx_wrapper_src, dst)
-            printinfo(f"flagcx_wrapper.py copied from {flagcx_wrapper_src} to {dst}")
-        else:
-            printinfo(f"flagcx_wrapper.py not found at {flagcx_wrapper_src}, skipping copy")
-        include_src = Path(self.flagcx_src_dir) / "flagcx" / "include"
-        if include_src.exists():
-            dst = Path(self.flagtree_dir) / "python" / "triton" / "experimental" / "tle" / "language" / "include"
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(include_src, dst)
-            printinfo(f"FlagCX headers copied from {include_src} to {dst}")
-        else:
-            printinfo(f"FlagCX include dir not found at {include_src}, skipping copy")
+        dst = Path(self.flagtree_dir) / "python" / "triton" / "experimental" / "tle" / "language" / "flagcx_wrapper.py"
+        src = Path(self.flagcx_src_dir) / "plugin" / "interservice" / "flagcx_wrapper.py"
+        shutil.copy(src, dst)
+        printinfo(f"flagcx_wrapper.py copied from {src} to {dst}")
+        dst = Path(self.flagtree_dir) / "third_party" / "nvidia" / "backend" / "flagcx_wrapper.py"
+        shutil.copy(src, dst)
+        printinfo(f"flagcx_wrapper.py copied from {src} to {dst}")
+        dst = Path(self.flagtree_dir) / "python" / "triton" / "experimental" / "tle" / "language" / "include"
+        src = Path(self.flagcx_src_dir) / "flagcx" / "include"
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        printinfo(f"FlagCX headers copied from {src} to {dst}")
 
     def run(self):
         self._compile_and_cache()
