@@ -37,8 +37,18 @@ def _get_stub_target() -> GPUTarget:
 
 _triton_dir = os.path.dirname(__file__)
 _filecheck_local = os.path.join(_triton_dir, "FileCheck")
+# CMake copies FileCheck to ${TRITON_WHEEL_DIR}/FileCheck (the triton package root).
+# This module lives at triton/backends/mthreads/spec/triton/_filecheck.py,
+# so triton/ is 4 levels up from _triton_dir.
+_triton_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_triton_dir))))
+_filecheck_wheel = os.path.join(_triton_root, "FileCheck")
 _filecheck_system = shutil.which("FileCheck")
-_filecheck_path = _filecheck_local if os.path.isfile(_filecheck_local) else _filecheck_system
+# Search order: same directory, triton package root, system PATH
+_filecheck_path = None
+for _candidate in (_filecheck_local, _filecheck_wheel, _filecheck_system):
+    if _candidate and os.path.isfile(_candidate):
+        _filecheck_path = _candidate
+        break
 
 _MISSING_FILECHECK_MSG = ("FileCheck binary not found.  Install it with your package manager\n"
                           "  (e.g. apt-get install llvm-15-tools) or place it next to this module:\n"
