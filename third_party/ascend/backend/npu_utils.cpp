@@ -37,10 +37,9 @@
 static std::unordered_map<std::string, size_t> registered_names;
 static std::unordered_map<std::string, std::unique_ptr<size_t>> func_stubs;
 
-static std::tuple<void *, void *> registerKernel(const char *name,
-                                                 const void *data,
-                                                 size_t data_size, int device,
-                                                 const char *kernel_mode_str) {
+static std::tuple<void *, void *>
+registerKernel(const char *name, const void *data, size_t data_size, int shared,
+               int device, const char *kernel_mode_str) {
   rtError_t rtRet;
 
   rtDevBinary_t devbin;
@@ -56,14 +55,14 @@ static std::tuple<void *, void *> registerKernel(const char *name,
   rtRet = rtSetDevice(device);
   if (rtRet != RT_ERROR_NONE) {
     printf("rtSetDevice failed, 0x%x\n", rtRet);
-    return {nullptr, nullptr};
+    return {NULL, NULL};
   }
 
-  void *devbinHandle = nullptr;
+  void *devbinHandle = NULL;
   rtRet = rtDevBinaryRegister(&devbin, &devbinHandle);
   if (rtRet != RT_ERROR_NONE) {
     printf("rtDevBinaryRegister failed, 0x%x\n", rtRet);
-    return {nullptr, nullptr};
+    return {NULL, NULL};
   }
 
   std::string stubName = name;
@@ -76,7 +75,7 @@ static std::tuple<void *, void *> registerKernel(const char *name,
   if (rtRet != RT_ERROR_NONE) {
     printf("rtFunctionRegister failed(stubName = %s), 0x%x\n", stubName.c_str(),
            rtRet);
-    return {nullptr, nullptr};
+    return {NULL, NULL};
   }
 
   return std::make_tuple(devbinHandle, func_stub_handle);
@@ -89,23 +88,22 @@ static PyObject *loadKernelBinary(PyObject *self, PyObject *args) {
   int shared;              // shared_memory(meaningless now)
   int device;              // device ID
   const char *kernel_mode; // kernel mode
-  int32_t n_max_threads = 0;
 
   if (!PyArg_ParseTuple(args, "ss#iis", &name, &data, &data_size, &shared,
                         &device, &kernel_mode)) {
-    return nullptr;
+    return NULL;
   }
 
   auto [module_handle, func_handle] =
-      registerKernel(name, data, data_size, device, kernel_mode);
+      registerKernel(name, data, data_size, shared, device, kernel_mode);
 
   uint64_t mod = reinterpret_cast<uint64_t>(module_handle);
   uint64_t func = reinterpret_cast<uint64_t>(func_handle);
   if (PyErr_Occurred()) {
-    return nullptr;
+    return NULL;
   }
 
-  return Py_BuildValue("(KKiii)", mod, func, 0, 0, n_max_threads);
+  return Py_BuildValue("(KKii)", mod, func, 0, 0);
 }
 
 static PyObject *getArch(PyObject *self, PyObject *args) {
@@ -115,10 +113,10 @@ static PyObject *getArch(PyObject *self, PyObject *args) {
 
   if (rtRet != RT_ERROR_NONE) {
     printf("rtGetSocVersion failed, 0x%x", rtRet);
-    return nullptr;
+    return NULL;
   }
   if (PyErr_Occurred()) {
-    return nullptr;
+    return NULL;
   }
   return Py_BuildValue("s", name);
 }
@@ -130,10 +128,10 @@ static PyObject *getAiCoreNum(PyObject *self, PyObject *args) {
 
   if (rtRet != RT_ERROR_NONE) {
     printf("rtGetAiCoreCount failed, 0x%x", rtRet);
-    return nullptr;
+    return NULL;
   }
   if (PyErr_Occurred()) {
-    return nullptr;
+    return NULL;
   }
   return Py_BuildValue("I", aiCoreCnt);
 }
@@ -145,15 +143,15 @@ static PyObject *createStream(PyObject *self, PyObject *args) {
 
   if (rtRet != RT_ERROR_NONE) {
     printf("rtStreamCreate failed, 0x%x", rtRet);
-    return nullptr;
+    return NULL;
   }
   if (PyErr_Occurred()) {
-    return nullptr;
+    return NULL;
   }
   uint64_t stream_uint64 = reinterpret_cast<uint64_t>(stream);
   PyObject *result = Py_BuildValue("K", stream_uint64);
 
-  if (result == nullptr) {
+  if (result == NULL) {
     rtStreamDestroy(stream);
   }
 
@@ -198,7 +196,7 @@ static PyObject *readDataFromBinaryFileWrapper(PyObject *self, PyObject *args) {
   const char *filename;
   uint64_t arr_ptr;
   if (!PyArg_ParseTuple(args, "sK", &filename, &arr_ptr)) {
-    return nullptr;
+    return NULL;
   }
 
   try {
@@ -208,7 +206,7 @@ static PyObject *readDataFromBinaryFileWrapper(PyObject *self, PyObject *args) {
     return Py_None;
   } catch (const std::exception &e) {
     PyErr_SetString(PyExc_RuntimeError, e.what());
-    return nullptr;
+    return NULL;
   }
 }
 
@@ -232,7 +230,7 @@ static PyObject *writeDataToBinaryFileWrapper(PyObject *self, PyObject *args) {
   size_t num_bytes;
 
   if (!PyArg_ParseTuple(args, "sKn", &filename, &arr_ptr, &num_bytes)) {
-    return nullptr;
+    return NULL;
   }
 
   try {
@@ -241,27 +239,27 @@ static PyObject *writeDataToBinaryFileWrapper(PyObject *self, PyObject *args) {
     return Py_None;
   } catch (const std::exception &e) {
     PyErr_SetString(PyExc_RuntimeError, e.what());
-    return nullptr;
+    return NULL;
   }
 }
 
 static PyObject *allocateHostMemory(PyObject *self, PyObject *args) {
   uint64_t num_bytes;
   if (!PyArg_ParseTuple(args, "K", &num_bytes)) {
-    return nullptr;
+    return NULL;
   }
 
-  void *host_ptr = nullptr;
+  void *host_ptr = NULL;
   rtError_t error = rtMallocHost(&host_ptr, num_bytes, RT_MEMORY_HOST);
   if (error != RT_ERROR_NONE) {
     PyErr_Format(PyExc_RuntimeError,
                  "rtMallocHost failed with error code: 0x%x", error);
-    return nullptr;
+    return NULL;
   }
 
   PyObject *result = Py_BuildValue("K", (uint64_t)host_ptr);
 
-  if (result == nullptr) {
+  if (result == NULL) {
     rtFreeHost(host_ptr);
   }
 
@@ -271,20 +269,20 @@ static PyObject *allocateHostMemory(PyObject *self, PyObject *args) {
 static PyObject *allocateDeviceMemory(PyObject *self, PyObject *args) {
   uint64_t num_bytes;
   if (!PyArg_ParseTuple(args, "K", &num_bytes)) {
-    return nullptr;
+    return NULL;
   }
 
-  void *device_ptr = nullptr;
+  void *device_ptr = NULL;
   rtError_t error = rtMalloc(&device_ptr, num_bytes, RT_MEMORY_HBM, 0);
   if (error != RT_ERROR_NONE) {
     PyErr_Format(PyExc_RuntimeError, "rtMalloc failed with error code: 0x%x",
                  error);
-    return nullptr;
+    return NULL;
   }
 
   PyObject *result = Py_BuildValue("K", (uint64_t)device_ptr);
 
-  if (result == nullptr) {
+  if (result == NULL) {
     rtFree(device_ptr);
   }
 
@@ -300,7 +298,7 @@ static PyObject *copyMemory(PyObject *self, PyObject *args) {
 
   if (!PyArg_ParseTuple(args, "KKns", &dst_ptr, &src_ptr, &count,
                         &direction_str)) {
-    return nullptr;
+    return NULL;
   }
 
   if (strcmp(direction_str, "H2D") == 0) {
@@ -310,7 +308,7 @@ static PyObject *copyMemory(PyObject *self, PyObject *args) {
   } else {
     PyErr_SetString(PyExc_ValueError,
                     "Invalid copy direction. Must be 'H2D' or 'D2H'.");
-    return nullptr;
+    return NULL;
   }
 
   void *dst = (void *)dst_ptr;
@@ -320,10 +318,42 @@ static PyObject *copyMemory(PyObject *self, PyObject *args) {
   if (error != RT_ERROR_NONE) {
     PyErr_Format(PyExc_RuntimeError, "rtMemcpy failed with error code: 0x%x",
                  error);
-    return nullptr;
+    return NULL;
   }
 
   Py_INCREF(Py_None);
+  return Py_None;
+}
+
+static const std::unordered_map<std::string, rtLimitType_t> LimitTypeMap = {
+    {"LOW_POWER_TIMEOUT", rtLimitType_t::RT_LIMIT_TYPE_LOW_POWER_TIMEOUT},
+    {"WARP_STACK_SIZE", rtLimitType_t::RT_LIMIT_TYPE_SIMT_STACK_SIZE},
+    {"DVG_WARP_STACK_SIZE",
+     rtLimitType_t::RT_LIMIT_TYPE_SIMT_DVG_WARP_STACK_SIZE},
+    {"STACK_SIZE", rtLimitType_t::RT_LIMIT_TYPE_STACK_SIZE}};
+
+static PyObject *setDeviceLimit(PyObject *self, PyObject *args) {
+  int device; // device ID
+  const char *type_str;
+  uint32_t val;
+  if (!PyArg_ParseTuple(args, "isI", &device, &type_str, &val)) {
+    return NULL;
+  }
+
+  auto it = LimitTypeMap.find(type_str);
+  if (it == LimitTypeMap.end()) {
+    printf("Invalid limit type: %s.\n", type_str);
+    return NULL;
+  }
+
+  rtError_t rtRet = rtDeviceSetLimit(device, it->second, val);
+  if (rtRet != RT_ERROR_NONE) {
+    printf("rtDeviceSetLimit failed, 0x%x\n", rtRet);
+    return NULL;
+  }
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
   return Py_None;
 }
 
@@ -344,7 +374,8 @@ static PyMethodDef NpuUtilsMethods[] = {
      "Allocate host memory"},
     {"copy_memory", copyMemory, METH_VARARGS,
      "Copy data between host and device"},
-    {nullptr, nullptr, 0, nullptr}};
+    {"set_device_limit", setDeviceLimit, METH_VARARGS, "Set the limit of NPU"},
+    {NULL, NULL, 0, NULL}};
 
 static PyModuleDef ModuleDef = {
     PyModuleDef_HEAD_INIT, "npu_utils",
@@ -353,8 +384,8 @@ static PyModuleDef ModuleDef = {
 
 PyMODINIT_FUNC PyInit_npu_utils(void) {
   PyObject *m = PyModule_Create(&ModuleDef);
-  if (m == nullptr) {
-    return nullptr;
+  if (m == NULL) {
+    return NULL;
   }
 
   PyModule_AddFunctions(m, NpuUtilsMethods);
