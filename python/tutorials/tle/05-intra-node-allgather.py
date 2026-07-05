@@ -30,14 +30,12 @@ import triton.experimental.tle.language as tle
 
 
 @triton.jit
-def _all_gather_pull_kernel(
-    ag_ptr,  #  当前 rank 本地的 all-gather 输出 buffer
-    ag_dev_mem,  # DevMem 句柄(远端内存句柄)，用来让 kernel 找到远端 rank 的 buffer 
-    dev_comm_dptr,  # DevComm 句柄(通信上下文句柄)，用来在 kernel 内查询当前 rank 
-    mesh: tl.constexpr,
-    ELEM_PER_RANK: tl.constexpr, #  每个 rank 的 shard 有多少个元素
-    BLOCK: tl.constexpr,  # 每个 Triton program 一次处理多少元素
-):
+def _all_gather_pull_kernel(ag_ptr,  #  当前 rank 本地的 all-gather 输出 buffer
+                            ag_dev_mem,  # DevMem 句柄(远端内存句柄)，用来让 kernel 找到远端 rank 的 buffer
+                            dev_comm_dptr,  # DevComm 句柄(通信上下文句柄)，用来在 kernel 内查询当前 rank
+                            mesh: tl.constexpr, ELEM_PER_RANK: tl.constexpr,  #  每个 rank 的 shard 有多少个元素
+                            BLOCK: tl.constexpr,  # 每个 Triton program 一次处理多少元素
+                            ):
     peer = tl.program_id(0)
     block_id = tl.program_id(1)
     offsets = block_id * BLOCK + tl.arange(0, BLOCK)
@@ -78,8 +76,8 @@ def main():
     if mem_pool is None:
         raise RuntimeError("FlagCX memory pool is unavailable; check FlagCX build and environment variables.")
 
-    rank = dist.get_rank()    # 获取 rank 和 world_size
-    world_size = dist.get_world_size()   # 
+    rank = dist.get_rank()  # 获取 rank 和 world_size
+    world_size = dist.get_world_size()  #
     local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", str(world_size)))
     assert world_size == local_world_size, "This tutorial is designed for a single node"
 
@@ -96,32 +94,30 @@ def main():
         ag_buffer = torch.empty((M, N), dtype=dtype, device=device)
 
     # 一个cuda tensor，作为 signal，告诉每个 rank 其他 rank 的数据已经拉完了
-    signal = torch.zeros((world_size,), dtype=torch.int32, device=device)
-
+    signal = torch.zeros((world_size, ), dtype=torch.int32, device=device)
 
     dev_comm_dptr, ag_dev_mem = tle.create_comm_tensor(ag_buffer)
     # ag_dev_mem  FlagCX/TLE 创建出来的 device-side DevMem 句柄地址，
     # 给 Triton kernel 用来解析远端地址。dev_comm_dptr 给设备侧
     # tle.shard_id(..., comm_ptr=...) 查询当前 rank 使用。
 
-
     golden = torch.empty((M, N), dtype=dtype, device=device)
-    dist.all_gather_into_tensor(golden, local_data) # 这里对比缺少了一个group参数
+    dist.all_gather_into_tensor(golden, local_data)  # 这里对比缺少了一个group参数
 
     ag_buffer.fill_(-1)
     ag_buffer[rank * m_per_rank:(rank + 1) * m_per_rank, :].copy_(local_data)
     signal.zero_()
 
-    torch.cuda.synchronize() # 同步当前 CUDA 设备，确保前面的 fill/copy/zero 已经完成
-    dist.barrier() # 跨 rank barrier，确保所有 rank 都已经把自己的 shard 写进自己的 ag_buffer，然后才允许其他 rank 去远程读取
+    torch.cuda.synchronize()  # 同步当前 CUDA 设备，确保前面的 fill/copy/zero 已经完成
+    dist.barrier()  # 跨 rank barrier，确保所有 rank 都已经把自己的 shard 写进自己的 ag_buffer，然后才允许其他 rank 去远程读取
 
-    elem_per_rank = m_per_rank * N   # 每一个 rank 的 shard 有多少个元素
+    elem_per_rank = m_per_rank * N  # 每一个 rank 的 shard 有多少个元素
     block = 1024  # 每个 Triton program 处理 1024 个元素
 
     # grid 是二维：第一维遍历 world_size 个 peer，
     # 第二维遍历 peer shard 的所有 block
     grid = (world_size, triton.cdiv(elem_per_rank, block))  # 主要服务于tle.shard_id 和 tle.remote 等
-    mesh = tle.device_mesh(tle.MeshConfig(device=world_size))  # 
+    mesh = tle.device_mesh(tle.MeshConfig(device=world_size))  #
     _all_gather_pull_kernel[grid](
         ag_buffer,
         ag_dev_mem,
@@ -131,10 +127,10 @@ def main():
         BLOCK=block,
         num_warps=4,
     )
-    _mark_pull_done_kernel[(world_size,)](signal, dev_comm_dptr, mesh, num_warps=1)
+    _mark_pull_done_kernel[(world_size, )](signal, dev_comm_dptr, mesh, num_warps=1)
 
     torch.cuda.synchronize()  # rank内的gpu同步，保证所有 kernel 都执行完了
-    dist.barrier()    # 跨rank的gpu 同步
+    dist.barrier()  # 跨rank的gpu 同步
 
     _rank_print(rank, f"Rank {rank} FlagTree Result:", ag_buffer)
     _rank_print(rank, f"Rank {rank} FlagTree Signal:", signal)

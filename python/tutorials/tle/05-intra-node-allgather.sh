@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 如果第一个参数是 debug，就打开 NCCL/FlagCX 的调试日志；
 # 比如 bash 05-intra-node-allgather.sh debug
-if [[ "${1:-}" == "debug" ]]; then 
+if [[ "${1:-}" == "debug" ]]; then
     export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"  # 打开 NCCL/FlagCX 的调试日志
     export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-all}"  # 默认打开全部子系统日志
     export FLAGCX_DEBUG="${FLAGCX_DEBUG:-TRACE}"   # 设置 FlagCX 日志等级， 默认设成 TRACE， 方便看 FlagCX 内部通信细节

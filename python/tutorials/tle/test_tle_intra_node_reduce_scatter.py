@@ -48,9 +48,7 @@ def scatter_kernel(
 
         in_row = peer * M_per_rank + tile_m * BLOCK_M
         in_col = tile_n * BLOCK_N
-        in_ptrs = (input_ptr
-                   + (in_row + row_offs[:, None]) * N
-                   + (in_col + col_offs[None, :]))
+        in_ptrs = (input_ptr + (in_row + row_offs[:, None]) * N + (in_col + col_offs[None, :]))
         data = tl.load(in_ptrs)
 
         out_row_in_peer = LOCAL_RANK * M_per_rank + tile_m * BLOCK_M
@@ -64,12 +62,9 @@ def scatter_kernel(
             shard_id=peer,
             offset=out_offset_elems,
         )
-        remote_ptrs = (remote_base
-                       + row_offs[:, None] * N
-                       + col_offs[None, :])
+        remote_ptrs = (remote_base + row_offs[:, None] * N + col_offs[None, :])
         # 把当前 rank 的本地数据写到远程 peer 的 scatter buffer 里。
         tl.store(remote_ptrs, data)
-
 
 
 @triton.jit
@@ -103,47 +98,36 @@ def ring_reduce_kernel(
         row_in_shard = tile_m * BLOCK_M
         col = tile_n * BLOCK_N
 
-
         src_rank = (begin_idx + 1) % WORLD_SIZE
         row = src_rank * M_per_rank + row_in_shard
-        ptrs = (local_scatter_ptr
-                + (row + row_offs[:, None]) * N
-                + (col + col_offs[None, :]))
+        ptrs = (local_scatter_ptr + (row + row_offs[:, None]) * N + (col + col_offs[None, :]))
         accum = tl.load(ptrs)
-
 
         for i in range(1, WORLD_SIZE):
             src_rank = (i + begin_idx + 1) % WORLD_SIZE
             row = src_rank * M_per_rank + row_in_shard
-            ptrs = (local_scatter_ptr
-                    + (row + row_offs[:, None]) * N
-                    + (col + col_offs[None, :]))
+            ptrs = (local_scatter_ptr + (row + row_offs[:, None]) * N + (col + col_offs[None, :]))
             data = tl.load(ptrs)
             accum += data
 
         # store to local output
         out_row = row_in_shard
         out_col = col
-        out_ptrs = (output_ptr
-                    + (out_row + row_offs[:, None]) * N
-                    + (out_col + col_offs[None, :]))
+        out_ptrs = (output_ptr + (out_row + row_offs[:, None]) * N + (out_col + col_offs[None, :]))
         tl.store(out_ptrs, accum)
-
 
 
 def torch_reduce_scatter(input_tensor, group):
     M, N = input_tensor.shape
     world_size = dist.get_world_size(group)
-    output = torch.empty((M // world_size, N),
-                         dtype=input_tensor.dtype,
-                         device=input_tensor.device)
+    output = torch.empty((M // world_size, N), dtype=input_tensor.dtype, device=input_tensor.device)
     dist.reduce_scatter_tensor(output, input_tensor, group=group)
     return output
 
 
 def main():
- 
-    mem_pool = tle.get_mem_pool()          # calls tle.init_communicator()
+
+    mem_pool = tle.get_mem_pool()  # calls tle.init_communicator()
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -160,7 +144,6 @@ def main():
     M, N = 8192, 16384
     M_per_rank = M // world_size
 
-
     input_tensor = torch.rand((M, N), dtype=dtype, device="cuda")
 
     with torch.cuda.use_mem_pool(mem_pool):
@@ -171,19 +154,14 @@ def main():
 
     stream = torch.cuda.current_stream()
 
-
     torch_output = torch_reduce_scatter(input_tensor, group=None)
 
     torch.cuda.synchronize()
 
-    grid_scatter = lambda META: (
-        min(
-            triton.cdiv(M_per_rank, META["BLOCK_M"])
-            * triton.cdiv(N, META["BLOCK_N"])
-            * world_size,
-            128,  
-        ),
-    )
+    grid_scatter = lambda META: (min(
+        triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]) * world_size,
+        128,
+    ), )
     with torch.cuda.stream(stream):
         scatter_kernel[grid_scatter](
             input_tensor,
@@ -197,15 +175,11 @@ def main():
             num_warps=4,
         )
 
-
     torch.cuda.synchronize()
-  
+
     dist.barrier()
 
-    grid_reduce = lambda META: (
-        triton.cdiv(M_per_rank, META["BLOCK_M"])
-        * triton.cdiv(N, META["BLOCK_N"]),
-    )
+    grid_reduce = lambda META: (triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
     with torch.cuda.stream(stream):
         ring_reduce_kernel[grid_reduce](
             scatter_buf,
