@@ -87,8 +87,8 @@ def main():
     if mem_pool is None:
         raise RuntimeError("FlagCX memory pool is unavailable; check FlagCX build and environment variables.")
 
-    rank = dist.get_rank()    # 获取 rank 和 world_size
-    world_size = dist.get_world_size()   
+    rank = dist.get_rank()  # 获取 rank 和 world_size
+    world_size = dist.get_world_size()
     local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", str(world_size)))
     assert world_size == local_world_size, "This tutorial is designed for a single node"
 
@@ -103,7 +103,7 @@ def main():
 
     with torch.cuda.use_mem_pool(mem_pool):  # 在 FlagCX mem pool 里分配通信 buffer，后面注册成 FlagCX/TLE 可解析的远端内存
         ag_buffer = torch.empty((M, N), dtype=dtype, device=device)
-        signal = torch.empty((world_size,), dtype=torch.int32, device=device)
+        signal = torch.empty((world_size, ), dtype=torch.int32, device=device)
 
     dev_comm_dptr, ag_dev_mem = tle.create_comm_tensor(ag_buffer)
     _, signal_dev_mem = tle.create_comm_tensor(signal)
@@ -127,7 +127,7 @@ def main():
 
     # 一维 grid：每个 producer CTA 负责把本 rank shard push 到一个 peer，
     # 写完 data 后马上远端写 signal[local_rank]。
-    grid = (world_size,)
+    grid = (world_size, )
     mesh = tle.device_mesh(tle.MeshConfig(device=world_size))
     _all_gather_push_kernel[grid](
         ag_buffer,

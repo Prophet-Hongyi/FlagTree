@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-set -euo pipefail  
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ "${1:-}" == "debug" ]]; then 
-    export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"  
-    export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-all}"  
-    export FLAGCX_DEBUG="${FLAGCX_DEBUG:-TRACE}"   
+if [[ "${1:-}" == "debug" ]]; then
+    export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+    export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-all}"
+    export FLAGCX_DEBUG="${FLAGCX_DEBUG:-TRACE}"
 fi
 
-export FLAGCX_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_8,mlx5_9 
-export FLAGCX_MEM_ENABLE=1  
-export FLAGCX_USE_HETERO_COMM=1  
-export FLAGCX_VMM_ENABLE=0   
-export FLAGCX_P2P_DISABLE=1  
-export CUDA_VISIBLE_DEVICES=0,1,2,3  
+export FLAGCX_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+export FLAGCX_MEM_ENABLE=1
+export FLAGCX_USE_HETERO_COMM=1
+export FLAGCX_VMM_ENABLE=0
+export FLAGCX_P2P_DISABLE=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 
 if [[ "${CLEAR_TRITON_CACHE:-0}" == "1" ]]; then
@@ -22,8 +22,8 @@ if [[ "${CLEAR_TRITON_CACHE:-0}" == "1" ]]; then
 fi
 
 NPROC_PER_NODE=4
-MASTER_ADDR=localhost   
-MASTER_PORT=8333 
+MASTER_ADDR=localhost
+MASTER_PORT=8333
 
 
 torchrun \
