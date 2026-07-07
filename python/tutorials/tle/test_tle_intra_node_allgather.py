@@ -83,6 +83,9 @@ def _rank_print(rank: int, *items):
 
 
 def main():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+
     mem_pool = tle.get_mem_pool()
     if mem_pool is None:
         raise RuntimeError("FlagCX memory pool is unavailable; check FlagCX build and environment variables.")
@@ -97,7 +100,7 @@ def main():
     assert M % world_size == 0
     m_per_rank = M // world_size
     dtype = torch.float16
-    device = torch.device("cuda")
+    device = torch.device("cuda", local_rank)
 
     local_data = torch.randn((m_per_rank, N), dtype=dtype, device=device)
 
