@@ -63,7 +63,7 @@ def scatter_kernel(
             offset=out_offset_elems,
         )
         remote_ptrs = (remote_base + row_offs[:, None] * N + col_offs[None, :])
-        # 把当前 rank 的本地数据写到远程 peer 的 scatter buffer 里。
+        # Write the local data of the current rank to the scatter buffer of the remote peer.
         tl.store(remote_ptrs, data)
 
 
