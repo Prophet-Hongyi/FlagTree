@@ -1,6 +1,5 @@
 import ast
 import textwrap
-from pathlib import Path
 
 import pytest
 import triton
@@ -82,7 +81,8 @@ def test_bind_tle_raw_source_cache_key_rereads_source_file(tmp_path):
 
 def test_jit_cache_key_includes_raw_source(tmp_path):
     cu_file = tmp_path / "vector-add.cu"
-    cu_file.write_text(textwrap.dedent("""\
+    cu_file.write_text(
+        textwrap.dedent("""\
         __device__ void VectorAdd(float *C, const float *A, const float *B, const int N) {
           const int idx = blockIdx.x * blockDim.x + threadIdx.x;
           for (int i = idx; i < N; i += blockDim.x * gridDim.x) {
@@ -103,7 +103,9 @@ def test_jit_cache_key_includes_raw_source(tmp_path):
     def make_cache_key() -> str:
         finder = DependenciesFinder(
             name="add_kernel",
-            globals={"edsl": edsl, "tl": tl, "tle_raw": __import__("triton.experimental.tle.language.raw", fromlist=["raw"])},
+            globals={
+                "edsl": edsl, "tl": tl, "tle_raw": __import__("triton.experimental.tle.language.raw", fromlist=["raw"])
+            },
             nonlocals={},
             src=kernel_src,
         )
@@ -112,7 +114,8 @@ def test_jit_cache_key_includes_raw_source(tmp_path):
 
     key1 = make_cache_key()
 
-    cu_file.write_text(textwrap.dedent("""\
+    cu_file.write_text(
+        textwrap.dedent("""\
         __device__ void VectorAdd(float *C, const float *A, const float *B, const int N) {
           const int idx = blockIdx.x * blockDim.x + threadIdx.x;
           for (int i = idx; i < N; i += blockDim.x * gridDim.x) {
@@ -126,6 +129,7 @@ def test_jit_cache_key_includes_raw_source(tmp_path):
 
 
 def test_mlir_dialect_cache_key_changes_with_edsl_source():
+
     @dialect(name="mlir")
     def edsl_v1():
         pass
@@ -143,7 +147,8 @@ def test_cuda_vector_add_cache_miss_after_cu_change(tmp_path):
     import triton.experimental.tle.language.raw as tle_raw
 
     cu_file = tmp_path / "vector-add.cu"
-    cu_file.write_text(textwrap.dedent("""\
+    cu_file.write_text(
+        textwrap.dedent("""\
         __device__ void VectorAdd(__attribute__((address_space(1))) float *C,
                                   __attribute__((address_space(1))) const float *A,
                                   __attribute__((address_space(1))) const float *B,
@@ -156,6 +161,7 @@ def test_cuda_vector_add_cache_miss_after_cu_change(tmp_path):
     """))
 
     def build_kernel():
+
         @dialect(name="cuda", file=cu_file)
         def edsl(*args, **kwargs):
             ...
@@ -179,7 +185,8 @@ def test_cuda_vector_add_cache_miss_after_cu_change(tmp_path):
     add_kernel_v1[grid](x, y, output, n_elements, BLOCK_SIZE=128)
     assert torch.allclose(output, x + y)
 
-    cu_file.write_text(textwrap.dedent("""\
+    cu_file.write_text(
+        textwrap.dedent("""\
         __device__ void VectorAdd(__attribute__((address_space(1))) float *C,
                                   __attribute__((address_space(1))) const float *A,
                                   __attribute__((address_space(1))) const float *B,
