@@ -33,15 +33,15 @@ import triton.experimental.tle.language as tle
 
 @triton.jit
 def _all_gather_push_kernel(
-    ag_ptr,  
-    signal_ptr,  
-    ag_dev_mem,  
-    signal_dev_mem,  
+    ag_ptr,
+    signal_ptr,
+    ag_dev_mem,
+    signal_dev_mem,
     dev_comm_dptr,  # DevComm handle, used to query the current rank within the kernel
     mesh: tl.constexpr,
-    ELEM_PER_RANK: tl.constexpr,  
-    BLOCK: tl.constexpr,  
-    NUM_BLOCKS: tl.constexpr,  
+    ELEM_PER_RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
     SIGNAL_TARGET: tl.constexpr,
 ):
     peer = tl.program_id(0)
@@ -87,8 +87,8 @@ def main():
     if mem_pool is None:
         raise RuntimeError("FlagCX memory pool is unavailable; check FlagCX build and environment variables.")
 
-    rank = dist.get_rank()    # Obtain rank and world_size
-    world_size = dist.get_world_size()   
+    rank = dist.get_rank()  # Obtain rank and world_size
+    world_size = dist.get_world_size()
     local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", str(world_size)))
     assert world_size == local_world_size, "This tutorial is designed for a single node"
 
@@ -101,16 +101,15 @@ def main():
 
     local_data = torch.randn((m_per_rank, N), dtype=dtype, device=device)
 
-    with torch.cuda.use_mem_pool(mem_pool):  
+    with torch.cuda.use_mem_pool(mem_pool):
         ag_buffer = torch.empty((M, N), dtype=dtype, device=device)
-        signal = torch.empty((world_size,), dtype=torch.int32, device=device)
+        signal = torch.empty((world_size, ), dtype=torch.int32, device=device)
 
     dev_comm_dptr, ag_dev_mem = tle.create_comm_tensor(ag_buffer)
     _, signal_dev_mem = tle.create_comm_tensor(signal)
     # ag_dev_mem is the device-side DevMem handle address created by FlagCX/TLE,
     # signal_dev_mem is used to remotely write to the peer's signal[local_rank].
     # dev_comm_dptr is used on the device side by tle.shard_id(..., comm_ptr=...) to query the current rank.
-
 
     golden = torch.empty((M, N), dtype=dtype, device=device)
     dist.all_gather_into_tensor(golden, local_data)
@@ -122,13 +121,13 @@ def main():
     torch.cuda.synchronize()
     dist.barrier()
 
-    elem_per_rank = m_per_rank * N  
-    block = 1024  
+    elem_per_rank = m_per_rank * N
+    block = 1024
     num_blocks = triton.cdiv(elem_per_rank, block)
 
     # 1D grid: Each producer CTA is responsible for pushing this rank's shard to a peer.
     # Immediately after writing the data, it performs a remote write to signal[local_rank].
-    grid = (world_size,)
+    grid = (world_size, )
     mesh = tle.device_mesh(tle.MeshConfig(device=world_size))
     _all_gather_push_kernel[grid](
         ag_buffer,
@@ -144,8 +143,8 @@ def main():
         num_warps=4,
     )
 
-    torch.cuda.synchronize()  
-    dist.barrier()  
+    torch.cuda.synchronize()
+    dist.barrier()
 
     _rank_print(rank, f"Rank {rank} FlagTree Result:", ag_buffer)
     _rank_print(rank, f"Rank {rank} FlagTree Signal:", signal)
