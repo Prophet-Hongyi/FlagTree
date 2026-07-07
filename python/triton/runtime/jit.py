@@ -122,6 +122,11 @@ class DependenciesFinder(ast.NodeVisitor):
         if val is None or type(val) is ModuleType:
             return
 
+        tle_raw_source_cache_key = getattr(val, "__triton_tle_raw_source_cache_key__", None)
+        if tle_raw_source_cache_key is not None:
+            part = (tle_raw_source_cache_key() if callable(tle_raw_source_cache_key) else tle_raw_source_cache_key)
+            self.hasher.update(str(part).encode("utf-8"))
+
         if getattr(val, "__triton_aggregate__", False):
             for attr in val.hash_attrs:
                 self.record_reference(attr)
