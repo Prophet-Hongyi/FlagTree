@@ -60,8 +60,8 @@ jobs:
           pip uninstall -y triton
           source ~/env-3.6.sh
           env | grep -E '^(LLVM_SYSPATH)=' >> $GITHUB_ENV || true
-          export USE_FLAGCX=ON
-          MAX_JOBS=32 python3 -m pip install . --no-build-isolation
+          rm -rf ~/.triton/cache
+          USE_FLAGCX=ON MAX_JOBS=32 python3 -m pip install . --no-build-isolation
 
       - name: FlagTree Test on NVidia (triton_v3.6.x branch)
         if: ${{ steps.check_backend.outputs.should_skip != 'true' && env.TARGET_BRANCH == 'triton_v3.6.x' }}
@@ -70,11 +70,36 @@ jobs:
           set -x
           source ~/env.sh
           git log -1 --format='[debug] workspace commit %H %s'
-          for trial in $(seq 1 20); do
-            echo "[debug] trial ${trial}/20"
-            CLUSTER_GEMM_TRIAL="${trial}" python3 - <<'PY'
+          echo "[debug] runner=${RUNNER_NAME:-unset} cuda_visible=${CUDA_VISIBLE_DEVICES:-unset}"
+          nvidia-smi --query-gpu=index,name,uuid,memory.used,memory.total --format=csv || true
+          # Re-run the same CI prefix that completed before the original
+          # PR #760 attempt-3 cluster-gemm failure.
+          python3 python/tutorials/01-vector-add.py --only_unit_test
+          python3 python/tutorials/02-fused-softmax.py --only_unit_test
+          python3 python/tutorials/03-matrix-multiplication.py --only_unit_test
+          python3 python/tutorials/04-low-memory-dropout.py --only_unit_test
+          python3 python/tutorials/05-layer-norm.py --only_unit_test
+          python3 python/tutorials/06-fused-attention.py --only_unit_test
+          python3 python/tutorials/07-extern-functions.py --only_unit_test
+          python3 python/tutorials/08-grouped-gemm.py --only_unit_test
+          python3 python/tutorials/09-persistent-matmul.py --only_unit_test
+          python3 python/tutorials/11-programmatic-dependent-launch.py --only_unit_test
+          python3 -m pytest -s python/test/unit/cuda
+          python3 -m pytest -s python/test/unit/instrumentation
+          python3 -m pytest -s python/test/unit/language \
+              --ignore=python/test/unit/language/test_line_info.py
+          python3 -m pytest -s python/test/unit/runtime
+          if [ -d "python/test/operators" ]; then
+            python3 -m pytest -s python/test/operators
+          fi
+          python3 python/tutorials/tle/01-fft.py
+          python3 python/tutorials/tle/02-moe_align_block_size.py
+          python3 python/tutorials/tle/03-topk.py
+          echo "[debug] triton cache before cluster-gemm"
+          du -sh ~/.triton/cache || true
+          find ~/.triton/cache -type f 2>/dev/null | wc -l || true
+          python3 - <<'PY'
           import importlib.util
-          import os
           import pathlib
           import sys
 
@@ -86,80 +111,40 @@ jobs:
           sys.modules[spec.name] = mod
           spec.loader.exec_module(mod)
 
-          skip_reason = mod._cluster_remote_support_skip_reason()
-          if skip_reason is not None:
-              print(f"SKIP: {skip_reason}", flush=True)
-              raise SystemExit(0)
-
-          trial = os.environ.get("CLUSTER_GEMM_TRIAL", "?")
-          M = N = K = 4096
-          torch.manual_seed(0)
-          a = torch.randn((M, K), device="cuda", dtype=torch.float16)
-          b = torch.randn((K, N), device="cuda", dtype=torch.float16)
-          c_triton = torch.empty((M, N), device="cuda", dtype=torch.float16)
-          c_remote = torch.empty_like(c_triton)
-          print(
-              f"[debug] trial {trial} ptr mod256 a={a.data_ptr() % 256} "
-              f"b={b.data_ptr() % 256} c={c_remote.data_ptr() % 256}",
-              flush=True,
-          )
-
           progress = pathlib.Path("/tmp/cluster-gemm-candidate.txt")
 
-          def run_triton_case(idx, cfg):
-              progress.write_text(f"triton {idx}: {cfg}\n")
-              print(f"[debug] running triton {idx}: {cfg}", flush=True)
-              mod._run_triton(a, b, c_triton, cfg.bm, cfg.bn, cfg.bk, cfg.num_warps, cfg.num_stages)
-              torch.cuda.synchronize()
-              ms = mod.triton.testing.do_bench(
-                  lambda: mod._run_triton(
-                      a,
-                      b,
-                      c_triton,
-                      cfg.bm,
-                      cfg.bn,
-                      cfg.bk,
-                      cfg.num_warps,
-                      cfg.num_stages,
-                  ),
-                  warmup=10,
-                  rep=30,
+          def logged_autotune(name, candidates, run_fn, M, N, K, warmup, rep):
+              best_cfg = candidates[0]
+              best_ms = float("inf")
+              for idx, cfg in enumerate(candidates):
+                  progress.write_text(f"{name} candidate_{idx}: {cfg}\n")
+                  print(f"[debug] running {name} candidate_{idx}: {cfg}", flush=True)
+                  run_fn(cfg)
+                  torch.cuda.synchronize()
+                  ms = mod.triton.testing.do_bench(
+                      lambda: run_fn(cfg),
+                      warmup=warmup,
+                      rep=rep,
+                  )
+                  torch.cuda.synchronize()
+                  progress.write_text(f"{name} candidate_{idx}: {cfg} PASS ms={ms}\n")
+                  print(f"[debug] {name} candidate_{idx}: PASS ms={ms}", flush=True)
+                  if ms < best_ms:
+                      best_ms = ms
+                      best_cfg = cfg
+              print(
+                  f"[autotune] {name}: best cfg={best_cfg} "
+                  f"ms={best_ms:.3f} tflops={mod._tflops(M, N, K, best_ms):.2f}"
               )
-              torch.cuda.synchronize()
-              progress.write_text(f"triton {idx}: {cfg} PASS ms={ms}\n")
-              print(f"[debug] triton {idx}: PASS ms={ms}", flush=True)
+              return best_cfg
 
-          def run_case(name, cfg):
-              progress.write_text(f"{name}: {cfg}\n")
-              print(f"[debug] running {name}: {cfg}", flush=True)
-              mod._run_cluster_remote(a, b, c_remote, cfg.bm, cfg.bn, cfg.bk, cfg.num_warps, cfg.num_stages)
-              torch.cuda.synchronize()
-              ms = mod.triton.testing.do_bench(
-                  lambda: mod._run_cluster_remote(
-                      a,
-                      b,
-                      c_remote,
-                      cfg.bm,
-                      cfg.bn,
-                      cfg.bk,
-                      cfg.num_warps,
-                      cfg.num_stages,
-                  ),
-                  warmup=10,
-                  rep=30,
-              )
-              torch.cuda.synchronize()
-              progress.write_text(f"{name}: {cfg} PASS ms={ms}\n")
-              print(f"[debug] {name}: PASS ms={ms}", flush=True)
+          mod._autotune_config = logged_autotune
 
           try:
-              for idx, cfg in enumerate(mod.TRITON_TUNE_CONFIGS):
-                  run_triton_case(idx, cfg)
-              for idx, cfg in enumerate(mod.REMOTE_TUNE_CONFIGS):
-                  run_case(f"remote_candidate_{idx}", cfg)
+              mod.main([])
           except BaseException:
               print("[debug] last cluster-gemm candidate:", flush=True)
-              print(progress.read_text(), flush=True)
+              if progress.exists():
+                  print(progress.read_text(), flush=True)
               raise
           PY
-          done
