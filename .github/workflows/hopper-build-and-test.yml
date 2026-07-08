@@ -98,8 +98,11 @@ jobs:
           echo "[debug] triton cache before cluster-gemm"
           du -sh ~/.triton/cache || true
           find ~/.triton/cache -type f 2>/dev/null | wc -l || true
-          python3 - <<'PY'
+          for trial in $(seq 1 50); do
+            echo "[debug] cluster-gemm trial ${trial}/50"
+            CLUSTER_GEMM_TRIAL="${trial}" python3 - <<'PY'
           import importlib.util
+          import os
           import pathlib
           import sys
 
@@ -111,14 +114,15 @@ jobs:
           sys.modules[spec.name] = mod
           spec.loader.exec_module(mod)
 
-          progress = pathlib.Path("/tmp/cluster-gemm-candidate.txt")
+          trial = os.environ.get("CLUSTER_GEMM_TRIAL", "?")
+          progress = pathlib.Path(f"/tmp/cluster-gemm-candidate-{trial}.txt")
 
           def logged_autotune(name, candidates, run_fn, M, N, K, warmup, rep):
               best_cfg = candidates[0]
               best_ms = float("inf")
               for idx, cfg in enumerate(candidates):
-                  progress.write_text(f"{name} candidate_{idx}: {cfg}\n")
-                  print(f"[debug] running {name} candidate_{idx}: {cfg}", flush=True)
+                  progress.write_text(f"trial {trial} {name} candidate_{idx}: {cfg}\n")
+                  print(f"[debug] trial {trial} running {name} candidate_{idx}: {cfg}", flush=True)
                   run_fn(cfg)
                   torch.cuda.synchronize()
                   ms = mod.triton.testing.do_bench(
@@ -127,8 +131,8 @@ jobs:
                       rep=rep,
                   )
                   torch.cuda.synchronize()
-                  progress.write_text(f"{name} candidate_{idx}: {cfg} PASS ms={ms}\n")
-                  print(f"[debug] {name} candidate_{idx}: PASS ms={ms}", flush=True)
+                  progress.write_text(f"trial {trial} {name} candidate_{idx}: {cfg} PASS ms={ms}\n")
+                  print(f"[debug] trial {trial} {name} candidate_{idx}: PASS ms={ms}", flush=True)
                   if ms < best_ms:
                       best_ms = ms
                       best_cfg = cfg
@@ -141,6 +145,7 @@ jobs:
           mod._autotune_config = logged_autotune
 
           try:
+              print(f"[debug] cluster-gemm trial {trial} start", flush=True)
               mod.main([])
           except BaseException:
               print("[debug] last cluster-gemm candidate:", flush=True)
@@ -148,3 +153,4 @@ jobs:
                   print(progress.read_text(), flush=True)
               raise
           PY
+          done
