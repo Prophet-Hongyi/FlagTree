@@ -71,9 +71,12 @@ jobs:
           set -x
           source ~/env.sh
           git log -1 --format='[debug] workspace commit %H %s'
-          rm -rf ~/.triton/cache
-          python3 - <<'PY'
+          for trial in $(seq 1 20); do
+            echo "[debug] trial ${trial}/20"
+            rm -rf ~/.triton/cache
+            CLUSTER_GEMM_TRIAL="${trial}" python3 - <<'PY'
           import importlib.util
+          import os
           import pathlib
           import sys
 
@@ -90,6 +93,7 @@ jobs:
               print(f"SKIP: {skip_reason}", flush=True)
               raise SystemExit(0)
 
+          trial = os.environ.get("CLUSTER_GEMM_TRIAL", "?")
           M = N = K = 4096
           torch.manual_seed(0)
           a = torch.randn((M, K), device="cuda", dtype=torch.float16)
@@ -97,7 +101,7 @@ jobs:
           c_triton = torch.empty((M, N), device="cuda", dtype=torch.float16)
           c_remote = torch.empty_like(c_triton)
           print(
-              f"[debug] ptr mod256 a={a.data_ptr() % 256} "
+              f"[debug] trial {trial} ptr mod256 a={a.data_ptr() % 256} "
               f"b={b.data_ptr() % 256} c={c_remote.data_ptr() % 256}",
               flush=True,
           )
@@ -160,3 +164,4 @@ jobs:
               print(progress.read_text(), flush=True)
               raise
           PY
+          done
