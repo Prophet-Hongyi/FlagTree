@@ -10,8 +10,11 @@ add_triton_library(TritonTLETransforms
 
   DEPENDS
   TritonTLETransformsIncGen
-  NVWSAttrDefsIncGen
 
   LINK_LIBS PUBLIC
   TritonGPUIR
 )
+
+if(TARGET NVWSAttrDefsIncGen)
+    add_dependencies(TritonTLETransforms NVWSAttrDefsIncGen)
+endif()

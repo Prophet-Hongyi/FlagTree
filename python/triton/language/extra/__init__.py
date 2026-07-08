@@ -15,8 +15,11 @@ for module_finder, module_name, is_pkg in pkgutil.iter_modules(
     spec = module_finder.find_spec(module_name)
     if spec is None or spec.loader is None:
         continue
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except (ImportError, AttributeError):
+        continue
 
     _backends.append(module_name)
     modules[module_name] = module

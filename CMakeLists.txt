@@ -48,7 +48,9 @@ elseif(FLAGTREE_BACKEND STREQUAL "ascend")
   set(FLIR_BUILD_INCUBATED ON CACHE BOOL "Build FLIR incubated passes" FORCE)
   set(LLVM_MAJOR_VERSION_22_OR_HIGHER ON)
   set(LLVM_MAJOR_VERSION_22_COMPATIBLE ON CACHE BOOL "AscendNPU-IR build with llvm major version 22 or later" FORCE)
+  set(LLVM_MAJOR_VERSION_21_COMPATIBLE ON CACHE BOOL "AscendNPU-IR build with llvm major version 21 or later" FORCE)
   add_definitions(-D__LLVM_MAJOR_VERSION_22_COMPATIBLE__)
+  add_definitions(-D__LLVM_MAJOR_VERSION_21_COMPATIBLE__)
   add_compile_options("-Wno-deprecated-declarations")
   add_compile_options("-Wno-error=deprecated-declarations")
   # AscendNPU-IR
@@ -300,7 +302,12 @@ if (NOT WIN32 AND NOT APPLE AND NOT BSD)
 endif()
 
 if(FLAGTREE_BACKEND STREQUAL "ascend")
+  # Relax -Werror for AscendNPU-IR which has LLVM API compat warnings
+  set(_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+  string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error")
   add_subdirectory(${ASCENDNPU_IR_SRC_DIR} ${ASCENDNPU_IR_BINARY_DIR})
+  set(CMAKE_CXX_FLAGS "${_saved_cxx_flags}")
 endif()
 
 # -----
@@ -331,7 +338,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   if(FLAGTREE_BACKEND STREQUAL "ascend")
     list(APPEND TRITON_PLUGIN_NAMES "flir")
-    add_subdirectory(third_party/flir)
+    add_subdirectory(third_party/FLUTE)
   endif()
 
   if (DEFINED TRITON_PLUGIN_DIRS)
@@ -354,6 +361,22 @@ if(TRITON_BUILD_PYTHON_MODULE)
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
+
+  # For ascend builds without nvidia backend, we still need nvidia tablegen
+  # targets (NVGPUAttrDefsIncGen, NVWSAttrDefsIncGen) used by TLE and core code.
+  if(FLAGTREE_BACKEND STREQUAL "ascend" AND NOT "nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvidia/include)
+    include_directories(${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include)
+    add_subdirectory(third_party/nvidia/include/Dialect/NVGPU/IR
+                     ${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include/Dialect/NVGPU/IR)
+    add_subdirectory(third_party/nvidia/include/Dialect/NVWS/IR
+                     ${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include/Dialect/NVWS/IR)
+    add_subdirectory(third_party/nvidia/include/Dialect/NVWS/Transforms
+                     ${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include/Dialect/NVWS/Transforms)
+    # Ensure tablegen runs before anything that includes nvidia headers
+    add_custom_target(nvidia_tablegen_for_ascend ALL
+      DEPENDS NVGPUTableGen NVGPUAttrDefsIncGen NVWSTableGen NVWSAttrDefsIncGen NVWSTransformsIncGen)
+  endif()
 
   if(TRITON_BUILD_PROTON)
     add_definitions(-D__PROTON__)
@@ -436,6 +459,38 @@ if(TRITON_BUILD_PYTHON_MODULE)
       LLVMPasses
       LLVMIluvatarCodeGen
       LLVMIluvatarAsmParser
+    )
+  elseif(FLAGTREE_BACKEND STREQUAL "ascend")
+    set(TRITON_LIBRARIES
+      ${triton_libs}
+      ${triton_plugins}
+
+      # mlir
+      MLIRNVVMDialect
+      MLIRNVVMToLLVMIRTranslation
+      MLIRGPUToNVVMTransforms
+      MLIRGPUToGPURuntimeTransforms
+      MLIRGPUTransforms
+      MLIRIR
+      MLIRControlFlowToLLVM
+      MLIRBytecodeWriter
+      MLIRPass
+      MLIRTransforms
+      MLIRLLVMDialect
+      MLIRSupport
+      MLIRTargetLLVMIRExport
+      MLIRMathToLLVM
+      MLIRGPUDialect
+      MLIRSCFToControlFlow
+      MLIRIndexToLLVM
+      MLIRUBToLLVM
+      MLIRFuncInlinerExtension
+
+      # LLVM
+      LLVMPasses
+
+      Python3::Module
+      pybind11::headers
     )
   elseif(FLAGTREE_BACKEND STREQUAL "xpu")
     set(TRITON_LIBRARIES
@@ -542,10 +597,14 @@ if(TRITON_BUILD_PYTHON_MODULE)
       message(FATAL_ERROR "TRITON_WHEEL_DIR must be set.")
   endif()
 
-  configure_file(
-    "${LLVM_SYSPATH}/bin/FileCheck"
-    "${TRITON_WHEEL_DIR}/FileCheck"
-    COPYONLY)
+  if(EXISTS "${LLVM_SYSPATH}/bin/FileCheck")
+    configure_file(
+      "${LLVM_SYSPATH}/bin/FileCheck"
+      "${TRITON_WHEEL_DIR}/FileCheck"
+      COPYONLY)
+  else()
+    message(WARNING "FileCheck not found at ${LLVM_SYSPATH}/bin/FileCheck, skipping copy.")
+  endif()
 
 endif()
 
@@ -567,7 +626,7 @@ endif()
 if(NOT TRITON_BUILD_PYTHON_MODULE)
   add_subdirectory(third_party/tle)
   if(FLAGTREE_BACKEND STREQUAL "ascend")
-    add_subdirectory(third_party/flir)
+    add_subdirectory(third_party/FLUTE)
   endif()
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})

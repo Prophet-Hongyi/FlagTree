@@ -55,6 +55,9 @@ submodules = (Module(name="AscendNPU-IR", url="https://gitcode.com/Ascend/Ascend
 
 def precompile_hook_flir(*args, **kargs):
     default_backends = kargs["default_backends"]
+    # Remove nvidia/amd — their C++ doesn't compile with this LLVM version.
+    # Tablegen targets are added separately in CMakeLists.txt for ascend.
+    default_backends = tuple(b for b in default_backends if b not in ("nvidia", "amd"))
     kargs["default_backends"] = default_backends
     get_submodule()
     return default_backends

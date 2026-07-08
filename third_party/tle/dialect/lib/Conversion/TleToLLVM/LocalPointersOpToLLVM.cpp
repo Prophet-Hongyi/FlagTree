@@ -194,7 +194,7 @@ struct LocalPointersOpConversion
 
       Value ptrI8 = b.bitcast(smemObj.getBase(), i8PtrTy);
       Value advanced = b.gep(i8PtrTy, i8Ty, ptrI8, byteOffset,
-                             LLVM::GEPNoWrapFlags::inbounds);
+                             /*inbounds=*/true);
       outVals[idx] = b.bitcast(advanced, llvmPtrTy);
     }
 

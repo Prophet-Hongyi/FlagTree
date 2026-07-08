@@ -1,7 +1,7 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
-include_directories(${CMAKE_SOURCE_DIR}/third_party/flir/include)
-include_directories(${CMAKE_BINARY_DIR}/third_party/flir/include)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/FLUTE/include)
+include_directories(${CMAKE_BINARY_DIR}/third_party/FLUTE/include)
 
 # list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 

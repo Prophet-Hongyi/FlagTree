@@ -1,8 +1,8 @@
 get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
 
 include_directories(
-  ${CMAKE_SOURCE_DIR}/third_party/flir/include
-  ${CMAKE_BINARY_DIR}/third_party/flir/include
+  ${CMAKE_SOURCE_DIR}/third_party/FLUTE/include
+  ${CMAKE_BINARY_DIR}/third_party/FLUTE/include
 )
 
 add_llvm_executable(triton-opt triton-opt.cpp PARTIAL_SOURCES_INTENDED)

@@ -9,5 +9,8 @@ add_triton_library(TleToLLVM
     DEPENDS
     TleTableGen
     TritonGPUTypeInterfacesIncGen
-    NVGPUAttrDefsIncGen
 )
+
+if(TARGET NVGPUAttrDefsIncGen)
+    add_dependencies(TleToLLVM NVGPUAttrDefsIncGen)
+endif()

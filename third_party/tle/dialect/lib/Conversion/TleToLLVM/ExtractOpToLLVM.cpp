@@ -125,7 +125,11 @@ LogicalResult ExtractSizesOpConversion::matchAndRewrite(
           op.getLoc(), rewriter.getI64IntegerAttr(size));
       sizes.push_back(newOp);
     }
-    rewriter.replaceOpWithMultiple(op, sizes);
+    SmallVector<SmallVector<Value>> wrappedSizes;
+    for (auto &v : sizes)
+      wrappedSizes.push_back(SmallVector<Value>{v});
+    SmallVector<ValueRange> rangeVec(wrappedSizes.begin(), wrappedSizes.end());
+    rewriter.replaceOpWithMultiple(op, rangeVec);
     return success();
   } else {
     return failure();
@@ -156,7 +160,11 @@ LogicalResult ExtractStridesOpConversion::matchAndRewrite(
       strideValues.push_back(rewriter.create<arith::ConstantOp>(
           op.getLoc(), rewriter.getI64IntegerAttr(strides[i])));
     }
-    rewriter.replaceOpWithMultiple(op, strideValues);
+    SmallVector<SmallVector<Value>> wrappedStrides;
+    for (auto &v : strideValues)
+      wrappedStrides.push_back(SmallVector<Value>{v});
+    SmallVector<ValueRange> rangeVec(wrappedStrides.begin(), wrappedStrides.end());
+    rewriter.replaceOpWithMultiple(op, rangeVec);
     return success();
   } else {
     return failure();

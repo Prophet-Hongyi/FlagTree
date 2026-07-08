@@ -7,7 +7,7 @@ if(FLAGTREE_BACKEND STREQUAL "ascend")
   include_directories(${CMAKE_CURRENT_SOURCE_DIR}/dsa/dialect/include)
   include_directories(${CMAKE_CURRENT_BINARY_DIR}/dsa/dialect/include)
   set(TLE_DSA_PLUGIN_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/dsa/tle_ir.cc)
-  set(TLE_DSA_PLUGIN_DEPENDS TleDSATableGen)
+  set(TLE_DSA_PLUGIN_DEPENDS TleDSATableGen TileIRTableGen TileIRAttrDefsIncGen TileIRTypesIncGen)
   set(TLE_DSA_IR_DEPENDS TleDSATableGen)
   set(TLE_DSA_IR_LINK_LIBS TleDSAIR)
 endif()
@@ -32,8 +32,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
     LINK_LIBS
     MLIRTargetLLVMIRImport
     TritonTLETransforms
-    TritonIR)
+    TritonIR
+    ${TLE_DSA_IR_LINK_LIBS})
   if(FLAGTREE_BACKEND STREQUAL "ascend")
+    target_link_libraries(TritonTLE PRIVATE
+      TileIRIR
+      BiShengIRHIVMDialect
+      MLIRMeshDialect)
     target_include_directories(TritonTLE BEFORE PRIVATE
       ${FLAGTREE_BACKEND_DIR}/python/src)
   endif()
