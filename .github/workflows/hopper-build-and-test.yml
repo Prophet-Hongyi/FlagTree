@@ -178,18 +178,38 @@ jobs:
           torch.manual_seed(0)
           a = torch.randn((M, K), device="cuda", dtype=torch.float16)
           b = torch.randn((K, N), device="cuda", dtype=torch.float16)
-          c_remote = torch.empty((M, N), device="cuda", dtype=torch.float16)
+          c_triton = torch.empty((M, N), device="cuda", dtype=torch.float16)
+          c_remote = torch.empty_like(c_triton)
           print(
               f"[debug] ptr mod256 a={a.data_ptr() % 256} "
               f"b={b.data_ptr() % 256} c={c_remote.data_ptr() % 256}",
               flush=True,
           )
 
-          cases = [
-              ("remote_candidate_0", mod.KernelConfig(32, 512, 256, 4, 2)),
-              ("remote_candidate_1_suspected_stage3", mod.KernelConfig(32, 512, 128, 4, 3)),
-          ]
           progress = pathlib.Path("/tmp/cluster-gemm-candidate.txt")
+
+          def run_triton_case(idx, cfg):
+              progress.write_text(f"triton {idx}: {cfg}\n")
+              print(f"[debug] running triton {idx}: {cfg}", flush=True)
+              mod._run_triton(a, b, c_triton, cfg.bm, cfg.bn, cfg.bk, cfg.num_warps, cfg.num_stages)
+              torch.cuda.synchronize()
+              ms = mod.triton.testing.do_bench(
+                  lambda: mod._run_triton(
+                      a,
+                      b,
+                      c_triton,
+                      cfg.bm,
+                      cfg.bn,
+                      cfg.bk,
+                      cfg.num_warps,
+                      cfg.num_stages,
+                  ),
+                  warmup=10,
+                  rep=30,
+              )
+              torch.cuda.synchronize()
+              progress.write_text(f"triton {idx}: {cfg} PASS ms={ms}\n")
+              print(f"[debug] triton {idx}: PASS ms={ms}", flush=True)
 
           def run_case(name, cfg):
               progress.write_text(f"{name}: {cfg}\n")
@@ -207,16 +227,18 @@ jobs:
                       cfg.num_warps,
                       cfg.num_stages,
                   ),
-                  warmup=1,
-                  rep=1,
+                  warmup=10,
+                  rep=30,
               )
               torch.cuda.synchronize()
               progress.write_text(f"{name}: {cfg} PASS ms={ms}\n")
               print(f"[debug] {name}: PASS ms={ms}", flush=True)
 
           try:
-              for name, cfg in cases:
-                  run_case(name, cfg)
+              for idx, cfg in enumerate(mod.TRITON_TUNE_CONFIGS):
+                  run_triton_case(idx, cfg)
+              for idx, cfg in enumerate(mod.REMOTE_TUNE_CONFIGS):
+                  run_case(f"remote_candidate_{idx}", cfg)
           except BaseException:
               print("[debug] last cluster-gemm candidate:", flush=True)
               print(progress.read_text(), flush=True)
