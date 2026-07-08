@@ -182,6 +182,52 @@ struct TileAllocToMemRef : OpRewritePattern<tile::AllocOp> {
 };
 
 // =============================================================================
+// step 1.5
+// =============================================================================
+
+struct TileSubviewToMemrefSubview : public OpRewritePattern<tile::SubViewOp> {
+  using OpRewritePattern<tile::SubViewOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tile::SubViewOp op,
+                                PatternRewriter &rewriter) const override {
+    // 1. Convert the source buffer and deduce the result type
+    Value sourceMemRef = getAsMemRef(op.getOperand(0), rewriter);
+    auto sourceMemRefType = sourceMemRef.getType().cast<MemRefType>();
+
+    // 2. Map dynamic offsets directly to OpFoldResult
+    SmallVector<OpFoldResult> mixedOffsets = llvm::to_vector<4>(
+      llvm::map_range(op.getOffsets(), [](Value v) { return OpFoldResult(v); }));
+
+    // 3. Unpack static sizes and strides into OpFoldResult arrays
+    SmallVector<OpFoldResult> mixedSizes = getAsOpFoldResult(op.getSizesAttr());
+    SmallVector<OpFoldResult> mixedStrides = getAsOpFoldResult(op.getStridesAttr());
+
+    auto targetShape = op.getType().getShape();
+    auto inferredType = memref::SubViewOp::inferRankReducedResultType(
+      targetShape,
+      sourceMemRefType,
+      mixedOffsets,
+      mixedSizes,
+      mixedStrides
+    ).cast<MemRefType>();
+
+    // 4. Replace the old op with the standard memref.subview
+    auto memrefSubview = rewriter.create<memref::SubViewOp>(
+      op.getLoc(),
+      inferredType,
+      sourceMemRef,
+      mixedOffsets,
+      mixedSizes,
+      mixedStrides
+    );
+
+    rewriter.replaceOp(op, memrefSubview.getResult());
+
+    return success();
+  }
+};
+
+// =============================================================================
 // Step 2: tile.to_tensor → UnrealizedConversionCast (memref → tensor)
 // =============================================================================
 struct TileToTensorEliminate : OpRewritePattern<tile::ToTensorOp> {
@@ -191,7 +237,7 @@ struct TileToTensorEliminate : OpRewritePattern<tile::ToTensorOp> {
                                 PatternRewriter &rewriter) const final {
     // The src is now memref (from Step 1).  The result type is tensor<>.
     // Bridge the gap with UnrealizedConversionCast: memref → tensor.
-    Value src = op.getSrc();
+    Value src = op.getOperand();
     auto resultTy = op.getResult().getType();
     if (src.getType() != resultTy) {
       auto cast = rewriter.create<UnrealizedConversionCastOp>(
@@ -214,10 +260,10 @@ struct TileCopyToHIVM : OpRewritePattern<tile::CopyOp> {
 
   LogicalResult matchAndRewrite(tile::CopyOp op,
                                 PatternRewriter &rewriter) const final {
-    Value srcMem = getAsMemRef(op.getSrc(), rewriter);
-    Value dstMem = getAsMemRef(op.getDst(), rewriter);
+    Value srcMem = getAsMemRef(op.getOperand(0), rewriter);
+    Value dstMem = getAsMemRef(op.getOperand(1), rewriter);
 
-    if (isTritonPointerLike(op.getSrc().getType())) {
+    if (isTritonPointerLike(op.getOperand(0).getType())) {
       rewriter.replaceOpWithNewOp<memref::CopyOp>(op, srcMem, dstMem);
       return success();
     }
@@ -233,8 +279,8 @@ struct TileStoreTensorToHIVM : OpRewritePattern<tile::StoreTensorOp> {
 
   LogicalResult matchAndRewrite(tile::StoreTensorOp op,
                                 PatternRewriter &rewriter) const final {
-    Value dstMem = getAsMemRef(op.getDst(), rewriter);
-    Value srcMem = op.getSrc();
+    Value dstMem = getAsMemRef(op.getOperand(1), rewriter);
+    Value srcMem = op.getOperand(0);
     if (!isa<MemRefType>(srcMem.getType())) {
       auto tensorTy = dyn_cast<RankedTensorType>(srcMem.getType());
       if (!tensorTy)
@@ -262,7 +308,7 @@ struct TileLoadToHIVM : OpRewritePattern<tile::LoadOp> {
     auto resultTy = op.getResult().getType();
     if (auto t = dyn_cast<tile::TensorType>(resultTy)) {
       auto memrefTy = convertTensorToMemRef(t);
-      rewriter.replaceOpWithNewOp<hivm::LoadOp>(op, memrefTy, op.getSrc());
+      rewriter.replaceOpWithNewOp<hivm::LoadOp>(op, memrefTy, op.getOperand());
       return success();
     }
     return failure();
@@ -277,8 +323,8 @@ struct TileStoreToHIVM : OpRewritePattern<tile::StoreOp> {
 
   LogicalResult matchAndRewrite(tile::StoreOp op,
                                 PatternRewriter &rewriter) const final {
-    Value src = getAsMemRef(op.getSrc(), rewriter);
-    rewriter.replaceOpWithNewOp<hivm::StoreOp>(op, Type(), src, op.getDst());
+    Value src = getAsMemRef(op.getOperand(0), rewriter);
+    rewriter.replaceOpWithNewOp<hivm::StoreOp>(op, Type(), src, op.getOperand(1));
     return success();
   }
 };
@@ -367,14 +413,30 @@ void TileIRToHIVMPass::runOnOperation() {
   // This avoids the type-conversion complexity of the dialect conversion
   // framework: tile.alloc → memref.alloc replaces !tile.buf with memref,
   // then tile.copy (now seeing memref operands) → hivm.copy, etc.
-  RewritePatternSet patterns(&getContext());
-  patterns.add<TileAllocToMemRef, TileToTensorEliminate, TileCopyToHIVM,
-               TileStoreTensorToHIVM, TileLoadToHIVM, TileStoreToHIVM,
-               TileSetFlagToHIVM, TileWaitFlagToHIVM, TilePipeBarrierToHIVM,
-               TileCubeWaitToHIVM, TileGmOffsetToHIVM>(&getContext());
 
-  if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns))))
-    return signalPassFailure();
+// apply pattern separately to ensure their relative order
+// template lambda is a C++ 20 feature, so we'll have to use MACRO
+#define APPLY_REWRITE_PATTERN(pattern)                                     \
+{                                                                          \
+  RewritePatternSet patterns(&getContext());                               \
+  patterns.add<pattern>(&getContext());                                    \
+  if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) { \
+    return signalPassFailure();                                            \
+  }                                                                        \
+}                                                                          \
+
+  APPLY_REWRITE_PATTERN(TileAllocToMemRef);
+  APPLY_REWRITE_PATTERN(TileSubviewToMemrefSubview);
+  APPLY_REWRITE_PATTERN(TileToTensorEliminate);
+  APPLY_REWRITE_PATTERN(TileCopyToHIVM);
+  APPLY_REWRITE_PATTERN(TileStoreTensorToHIVM);
+  APPLY_REWRITE_PATTERN(TileLoadToHIVM);
+  APPLY_REWRITE_PATTERN(TileStoreToHIVM);
+  APPLY_REWRITE_PATTERN(TileSetFlagToHIVM);
+  APPLY_REWRITE_PATTERN(TileWaitFlagToHIVM);
+  APPLY_REWRITE_PATTERN(TilePipeBarrierToHIVM);
+  APPLY_REWRITE_PATTERN(TileCubeWaitToHIVM);
+  APPLY_REWRITE_PATTERN(TileGmOffsetToHIVM);
 
   // Step N: After all tile ops are lowered, convert !tile.buf types remaining
   // in tt.func signatures and tt.call ops (these arise when tile.alloc results

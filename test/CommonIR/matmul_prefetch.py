@@ -6,8 +6,8 @@ import triton
 import triton.language as tl
 
 import triton.experimental.tle as tle  # noqa: F401  (registers tile/tle dialects)
-from triton.experimental.tle.language.dsa.ascend import L1, L0C  # noqa: F401
-from triton.experimental.tle.language.dsa import tile_alloc, tile_copy, tile_to_tensor  # noqa: F401
+from triton.experimental.tle.language.dsa.ascend import L1  # noqa: F401
+from triton.experimental.tle.language.dsa import tile_alloc, tile_copy, tile_to_tensor, tile_subview  # noqa: F401
 
 # =============================================================================
 #  Compile-time configuration
@@ -32,10 +32,13 @@ def get_number_cores():
 
 
 # =============================================================================
-#  Simple matmul kernel: single loop with tile_copy + tl.dot
+#  Prefetch matmul kernel: K-dimension loop unrolled with 3-slot rotating buffer
 #
 #  grid = (NUM_CORES,). Each core handles multiple (M_tile, N_tile) output
-#  blocks in round-robin fashion, iterating over K dimension.
+#  blocks in round-robin fashion.
+#  L1 buffers allocate 3x space to hold prefetched K-tiles in a rotating manner.
+#  Prologue loads the first 2 K-tiles, then the main loop consumes slot[s]
+#  while prefetching into slot[(s+2)%3].
 # =============================================================================
 @triton.jit
 def matmul_kernel(
@@ -56,9 +59,9 @@ def matmul_kernel(
     NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
     NUM_K_BLOCKS = tl.cdiv(K, BLOCK_K)
 
-    # On-chip buffers: A/B in L1, accumulator in L0C
-    mat_a_l1 = tile_alloc([BLOCK_M, BLOCK_K], mat_a.dtype.element_ty, L1)
-    mat_b_l1 = tile_alloc([BLOCK_K, BLOCK_N], mat_b.dtype.element_ty, L1)
+    # On-chip buffers: A/B in L1 with 3x space for rotating prefetch slots
+    mat_a_l1 = tile_alloc([3 * BLOCK_M, BLOCK_K], mat_a.dtype.element_ty, L1)
+    mat_b_l1 = tile_alloc([3 * BLOCK_K, BLOCK_N], mat_b.dtype.element_ty, L1)
 
     # Each core processes output blocks in round-robin
     for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
@@ -68,33 +71,58 @@ def matmul_kernel(
         m_start = pid_m * BLOCK_M
         n_start = pid_n * BLOCK_N
 
-        # Create block pointers for A and B
-        a_block_ptr = tl.make_block_ptr(
-            mat_a, (M, K), (K, 1),
-            (m_start, 0),
-            (BLOCK_M, BLOCK_K), (1, 0))
-        b_block_ptr = tl.make_block_ptr(
-            mat_b, (K, N), (N, 1),
-            (0, n_start),
-            (BLOCK_K, BLOCK_N), (1, 0))
-        
         mat_c_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        # K-loop: load A/B tiles from GM to L1, then dot
+
+        # ── Prologue: prefetch K-tiles into slot 0 and slot 1 ──────────────
+        # Slot 0: k_idx = 0
+        tile_copy(tl.make_block_ptr(
+            mat_a, (M, K), (K, 1), (m_start, 0),
+            (BLOCK_M, BLOCK_K), (1, 0)),
+            tile_subview(mat_a_l1, [0 * BLOCK_M, 0], [BLOCK_M, BLOCK_K], [1, 1]),
+            [BLOCK_M, BLOCK_K])
+        tile_copy(tl.make_block_ptr(
+            mat_b, (K, N), (N, 1), (0, n_start),
+            (BLOCK_K, BLOCK_N), (1, 0)),
+            tile_subview(mat_b_l1, [0 * BLOCK_K, 0], [BLOCK_K, BLOCK_N], [1, 1]),
+            [BLOCK_K, BLOCK_N])
+
+        # Slot 1: k_idx = 1 (if exists)
+        if NUM_K_BLOCKS > 1:
+            tile_copy(tl.make_block_ptr(
+                mat_a, (M, K), (K, 1), (m_start, 1 * BLOCK_K),
+                (BLOCK_M, BLOCK_K), (1, 0)),
+                tile_subview(mat_a_l1, [1 * BLOCK_M, 0], [BLOCK_M, BLOCK_K], [1, 1]),
+                [BLOCK_M, BLOCK_K])
+            tile_copy(tl.make_block_ptr(
+                mat_b, (K, N), (N, 1), (1 * BLOCK_K, n_start),
+                (BLOCK_K, BLOCK_N), (1, 0)),
+                tile_subview(mat_b_l1, [1 * BLOCK_K, 0], [BLOCK_K, BLOCK_N], [1, 1]),
+                [BLOCK_K, BLOCK_N])
+
+        # ── Main loop: consume slot[s], prefetch into slot[(s+2)%3] ────────
         for k_idx in range(0, NUM_K_BLOCKS):
-            # Copy A tile
-            tile_copy(a_block_ptr, mat_a_l1, [BLOCK_M, BLOCK_K])
-            # Copy B tile
-            tile_copy(b_block_ptr, mat_b_l1, [BLOCK_K, BLOCK_N])
+            s = k_idx % 3
 
-            # Accumulate: C += A @ B
+            # Prefetch: load k_idx+2 into slot (s+2)%3
+            k_pf = k_idx + 2
+            if k_pf < NUM_K_BLOCKS:
+                s_pf = k_pf % 3
+                tile_copy(tl.make_block_ptr(
+                    mat_a, (M, K), (K, 1), (m_start, k_pf * BLOCK_K),
+                    (BLOCK_M, BLOCK_K), (1, 0)),
+                    tile_subview(mat_a_l1, [s_pf * BLOCK_M, 0], [BLOCK_M, BLOCK_K], [1, 1]),
+                    [BLOCK_M, BLOCK_K])
+                tile_copy(tl.make_block_ptr(
+                    mat_b, (K, N), (N, 1), (k_pf * BLOCK_K, n_start),
+                    (BLOCK_K, BLOCK_N), (1, 0)),
+                    tile_subview(mat_b_l1, [s_pf * BLOCK_K, 0], [BLOCK_K, BLOCK_N], [1, 1]),
+                    [BLOCK_K, BLOCK_N])
+
+            # Compute: C += A[slot s] @ B[slot s]
             mat_c_acc = tl.dot(
-                tile_to_tensor(mat_a_l1, writable=False),
-                tile_to_tensor(mat_b_l1, writable=False),
+                tile_to_tensor(tile_subview(mat_a_l1, [s * BLOCK_M, 0], [BLOCK_M, BLOCK_K], [1, 1]), writable=False),
+                tile_to_tensor(tile_subview(mat_b_l1, [s * BLOCK_K, 0], [BLOCK_K, BLOCK_N], [1, 1]), writable=False),
                 mat_c_acc, out_dtype=tl.float32)
-
-            # Advance block pointers along K
-            a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_K])
-            b_block_ptr = tl.advance(b_block_ptr, [BLOCK_K, 0])
 
         # Store result back to GM
         tl.store(
