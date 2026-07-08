@@ -98,8 +98,8 @@ jobs:
           echo "[debug] triton cache before cluster-gemm"
           du -sh ~/.triton/cache || true
           find ~/.triton/cache -type f 2>/dev/null | wc -l || true
-          for trial in $(seq 1 50); do
-            echo "[debug] cluster-gemm trial ${trial}/50"
+          for trial in $(seq 1 200); do
+            echo "[debug] cluster-gemm trial ${trial}/200"
             CLUSTER_GEMM_TRIAL="${trial}" python3 - <<'PY'
           import importlib.util
           import os
@@ -130,7 +130,6 @@ jobs:
                       warmup=warmup,
                       rep=rep,
                   )
-                  torch.cuda.synchronize()
                   progress.write_text(f"trial {trial} {name} candidate_{idx}: {cfg} PASS ms={ms}\n")
                   print(f"[debug] trial {trial} {name} candidate_{idx}: PASS ms={ms}", flush=True)
                   if ms < best_ms:
