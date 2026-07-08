@@ -58,6 +58,7 @@ jobs:
           git clean -ffdx
           git log -1 --format='%H %s'
           pip uninstall -y triton
+          rm -rf ~/.triton/cache
           source ~/env-3.6.sh
           env | grep -E '^(LLVM_SYSPATH)=' >> $GITHUB_ENV || true
           export USE_FLAGCX=ON
@@ -70,6 +71,7 @@ jobs:
           set -x
           source ~/env.sh
           git log -1 --format='[debug] workspace commit %H %s'
+          rm -rf ~/.triton/cache
           python3 - <<'PY'
           import importlib.util
           import pathlib
