@@ -51,6 +51,12 @@ jobs:
         shell: bash
         run: |
           set -x
+          # Reproduce the original PR #760 attempt-3 merge commit that hit
+          # cluster-gemm misaligned address before the base branch moved.
+          git fetch origin dd79a2328a578057bd9dc8e0a1a2f6351bbf635a
+          git checkout --force FETCH_HEAD
+          git clean -ffdx
+          git log -1 --format='%H %s'
           pip uninstall -y triton
           source ~/env-3.6.sh
           env | grep -E '^(LLVM_SYSPATH)=' >> $GITHUB_ENV || true
@@ -63,7 +69,8 @@ jobs:
         run: |
           set -x
           source ~/env.sh
-          CUDA_LAUNCH_BLOCKING=1 python3 - <<'PY'
+          git log -1 --format='[debug] workspace commit %H %s'
+          python3 - <<'PY'
           import importlib.util
           import pathlib
           import sys
