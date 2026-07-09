@@ -118,6 +118,34 @@ jobs:
           mod.main([])
           PY
           python3 python/tutorials/tle/03-topk.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("python/tutorials/tle/04-cluster-gemm.py")
+          text = path.read_text()
+          old = "\n".join([
+              "    for cfg in candidates:",
+              "        run_fn(cfg)",
+              "        torch.cuda.synchronize()",
+              "        ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup, rep=rep)",
+              "        if ms < best_ms:",
+              "",
+          ])
+          new = "\n".join([
+              "    for cfg in candidates:",
+              "        print(f\"[autotune-candidate] {name}: start cfg={cfg}\", flush=True)",
+              "        run_fn(cfg)",
+              "        torch.cuda.synchronize()",
+              "        print(f\"[autotune-candidate] {name}: initial_sync_ok cfg={cfg}\", flush=True)",
+              "        ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup, rep=rep)",
+              "        print(f\"[autotune-candidate] {name}: bench_ok cfg={cfg} ms={ms:.3f}\", flush=True)",
+              "        if ms < best_ms:",
+              "",
+          ])
+          if old not in text:
+              raise SystemExit("cluster-gemm autotune patch target not found")
+          path.write_text(text.replace(old, new))
+          PY
           echo "[debug] triton cache before cluster-gemm original loop"
           du -sh ~/.triton/cache || true
           find ~/.triton/cache -type f 2>/dev/null | wc -l || true
