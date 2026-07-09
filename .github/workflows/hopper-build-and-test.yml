@@ -121,7 +121,7 @@ jobs:
           echo "[debug] triton cache before cluster-gemm original loop"
           du -sh ~/.triton/cache || true
           find ~/.triton/cache -type f 2>/dev/null | wc -l || true
-          for trial in $(seq 1 50); do
-            echo "[debug] original cluster-gemm trial ${trial}/50"
+          for trial in $(seq 1 200); do
+            echo "[debug] original cluster-gemm trial ${trial}/200"
             python3 python/tutorials/tle/04-cluster-gemm.py
           done
