@@ -42,7 +42,7 @@ python3 -c "import torch"
 # If "ImportError: libmusa.so.4: cannot open shared object file: No such file or directory" occurs,
 # create a symbolic link as follows.
 cd /usr/lib/x86_64-linux-gnu/
-ln -s libmusa.so.4.3.3 libmusa.so.4
+ln -s libmusa.so.4.3.* libmusa.so.4
 ```
 
 #### 1.2 手动下载 FlagTree 依赖库
@@ -94,6 +94,14 @@ cd ${YOUR_CODE_DIR}/FlagTree
 git checkout -b triton_v3.6.x origin/triton_v3.6.x
 export FLAGTREE_BACKEND=mthreads
 MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
+```
+
+```shell
+# If libjsoncpp.so or librhash.so not found,
+# Run the following command on the host (Outside the container).
+apt install -y build-essential libc6-dev libjsoncpp25 librhash0
+apt install -y zlib1g zlib1g-dev libxml2 libxml2-dev nlohmann-json3-dev
+apt install -y libhiredis0.14
 ```
 
 ### 3. 测试验证
