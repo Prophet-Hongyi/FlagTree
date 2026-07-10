@@ -32,23 +32,24 @@ import triton.experimental.tle.language as tle
 
 
 @triton.jit
-def _all_gather_push_kernel(
+def _all_gather_push_2d_kernel(
+    local_ptr,
     ag_ptr,
-    signal_ptr,
     ag_dev_mem,
-    signal_dev_mem,
     dev_comm_dptr,  # DevComm handle, used to query the current rank within the kernel
     mesh: tl.constexpr,
     ELEM_PER_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    SIGNAL_TARGET: tl.constexpr,
 ):
     peer = tl.program_id(0)
+    block_id = tl.program_id(1)
     local_rank = tle.shard_id(mesh, "device", comm_ptr=dev_comm_dptr)
+    dst_base = local_rank * ELEM_PER_RANK
+    offsets = block_id * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < ELEM_PER_RANK
+    vals = tl.load(local_ptr + offsets, mask=mask, other=0.0)
 
     if peer != local_rank:
-        dst_base = local_rank * ELEM_PER_RANK
         dst_ptr = tle.remote(
             ag_dev_mem,
             shard_id=peer,
@@ -56,12 +57,23 @@ def _all_gather_push_kernel(
             dtype=ag_ptr.dtype.element_ty,
             offset=dst_base,
         )
-        for block_id in tl.range(0, NUM_BLOCKS):
-            offsets = block_id * BLOCK + tl.arange(0, BLOCK)
-            mask = offsets < ELEM_PER_RANK
-            vals = tl.load(ag_ptr + dst_base + offsets, mask=mask, other=0.0)
-            tl.store(dst_ptr + offsets, vals, mask=mask)
+        tl.store(dst_ptr + offsets, vals, mask=mask)
+    else:
+        tl.store(ag_ptr + dst_base + offsets, vals, mask=mask)
 
+
+@triton.jit
+def _all_gather_signal_kernel(
+    signal_ptr,
+    signal_dev_mem,
+    dev_comm_dptr,
+    mesh: tl.constexpr,
+    SIGNAL_TARGET: tl.constexpr,
+):
+    peer = tl.program_id(0)
+    local_rank = tle.shard_id(mesh, "device", comm_ptr=dev_comm_dptr)
+
+    if peer != local_rank:
         remote_signal_ptr = tle.remote(
             signal_dev_mem,
             shard_id=peer,
@@ -118,7 +130,6 @@ def main():
     dist.all_gather_into_tensor(golden, local_data)
 
     ag_buffer.fill_(-1)
-    ag_buffer[rank * m_per_rank:(rank + 1) * m_per_rank, :].copy_(local_data)
     signal.zero_()
 
     torch.cuda.synchronize()
@@ -128,24 +139,33 @@ def main():
     block = 1024
     num_blocks = triton.cdiv(elem_per_rank, block)
 
-    # 1D grid: Each producer CTA is responsible for pushing this rank's shard to a peer.
-    # Immediately after writing the data, it performs a remote write to signal[local_rank].
-    grid = (world_size, )
+    # 2D copy grid: split each peer transfer into independent chunks.
+    # The signal is written by a second kernel so it is ordered after all copy chunks in this stream.
+    copy_grid = (world_size, num_blocks)
+    signal_grid = (world_size, )
     mesh = tle.device_mesh(tle.MeshConfig(device=world_size))
-    _all_gather_push_kernel[grid](
-        ag_buffer,
-        signal,
-        ag_dev_mem,
-        signal_dev_mem,
-        dev_comm_dptr,
-        mesh,
-        ELEM_PER_RANK=elem_per_rank,
-        BLOCK=block,
-        NUM_BLOCKS=num_blocks,
-        SIGNAL_TARGET=1,
-        num_warps=4,
-    )
 
+    def launch_tle_all_gather():
+        _all_gather_push_2d_kernel[copy_grid](
+            local_data,
+            ag_buffer,
+            ag_dev_mem,
+            dev_comm_dptr,
+            mesh,
+            ELEM_PER_RANK=elem_per_rank,
+            BLOCK=block,
+            num_warps=4,
+        )
+        _all_gather_signal_kernel[signal_grid](
+            signal,
+            signal_dev_mem,
+            dev_comm_dptr,
+            mesh,
+            SIGNAL_TARGET=1,
+            num_warps=4,
+        )
+
+    launch_tle_all_gather()
     torch.cuda.synchronize()
     dist.barrier()
 
