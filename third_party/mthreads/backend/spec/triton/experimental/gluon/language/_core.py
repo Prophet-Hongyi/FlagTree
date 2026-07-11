@@ -574,6 +574,14 @@ def num_ctas(_semantic=None):
 
 
 @builtin
+def thread_barrier(_semantic=None):
+    """
+    Insert a barrier to synchronize threads within a CTA.
+    """
+    return _semantic.debug_barrier()
+
+
+@builtin
 def barrier(*, cluster: bool = False, _semantic=None):
     """
     Insert a barrier to synchronize threads within a CTA, or across a cluster.
