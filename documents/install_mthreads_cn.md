@@ -1,6 +1,6 @@
 [中文版|[English](./install_mthreads.md)]
 
-## 💫 Moore Threads（摩尔线程）[mthreads](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/mthreads/) (Triton 3.6)
+## 💫 Moore Threads（摩尔线程）[mthreads](/third_party/mthreads/) (Triton 3.6)
 
 - 对应的 Triton 版本为 3.6，基于 x64 平台
 - 可用于 S4000/S5000
@@ -106,7 +106,7 @@ apt install -y libhiredis0.14
 
 ### 3. 测试验证
 
-参考 [Tests of mthreads3.6 backend](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/.github/workflows/mthreads3.6-build-and-test.yml)
+参考 [Tests of mthreads3.6 backend](/.github/workflows/mthreads3.6-build-and-test.yml)
 
 ---
 
@@ -206,7 +206,7 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 
 ---
 
-## 💫 Moore Threads（摩尔线程）[mthreads](https://github.com/flagos-ai/FlagTree/tree/main/third_party/mthreads/) (Triton 3.1)
+## 💫 Moore Threads（摩尔线程）[mthreads](https://github.com/flagos-ai/flagtree/tree/triton_v3.1.x/third_party/mthreads/) (Triton 3.1)
 
 - 对应的 Triton 版本为 3.1，基于 x64/aarch64 平台
 - 可用于 S4000/S5000
@@ -305,6 +305,6 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 
 ### 3. 测试验证
 
-参考 [Tests of mthreads3.1 backend](/.github/workflows/mthreads-build-and-test.yml)
+参考 [Tests of mthreads3.1 backend](https://github.com/flagos-ai/flagtree/blob/triton_v3.1.x/.github/workflows/mthreads-build-and-test.yml)
 
 对于使用 `tl.dot` 的 triton 3.1 kernel，设置环境变量 `export MUSA_ENABLE_SQMMA=1` 可提升性能。

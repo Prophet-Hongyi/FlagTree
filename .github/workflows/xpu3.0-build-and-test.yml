@@ -3,9 +3,9 @@ name: Xpu3.0-Build-And-Test
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "triton_v3.1.x" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "triton_v3.1.x" ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

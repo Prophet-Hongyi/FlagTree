@@ -1,6 +1,6 @@
 [[English](./install_cpu.md)|中文版]
 
-## 💫 ARM64 CPU [cpu](/third_party/cpu/) & [tle_arm64](/third_party/tle_arm64/)
+## 💫 ARM64 CPU [cpu](https://github.com/flagos-ai/flagtree/tree/triton_v3.3.x/third_party/cpu/) & [tle_arm64](https://github.com/flagos-ai/flagtree/tree/triton_v3.3.x/third_party/tle_arm64/) (Triton 3.3)
 
 - 对应 Triton 版本 3.3，基于 LLVM **a66376b0**，aarch64 平台
 - 目标平台：AArch64 Linux，支持 NEON / SVE2 + i8mm（如 Armv9-A Cortex-A720）

@@ -108,7 +108,7 @@ Refer to [Tests of xpu3.6 backend](/.github/workflows/xpu3.6-build-and-test.yml)
 
 ---
 
-## 💫 KLX [xpu](/third_party/xpu/) (Triton 3.0)
+## 💫 KLX [xpu](https://github.com/flagos-ai/flagtree/tree/triton_v3.1.x/third_party/xpu/) (Triton 3.0)
 
 - Based on Triton 3.0, x64
 - Available for P800
@@ -204,4 +204,4 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 
 Before testing, you need to execute `export XPU_EVENT_KL3_ENABLE=1`
 
-Refer to [Tests of xpu3.0 backend](/.github/workflows/xpu3.0-build-and-test.yml)
+Refer to [Tests of xpu3.0 backend](https://github.com/flagos-ai/flagtree/blob/triton_v3.1.x/.github/workflows/xpu3.0-build-and-test.yml)

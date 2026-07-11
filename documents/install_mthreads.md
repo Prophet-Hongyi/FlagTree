@@ -1,6 +1,6 @@
 [[中文版](./install_mthreads_cn.md)|English]
 
-## 💫 Moore Threads（摩尔线程）[mthreads](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/mthreads/) (Triton 3.6)
+## 💫 Moore Threads（摩尔线程）[mthreads](/third_party/mthreads/) (Triton 3.6)
 
 - Based on Triton 3.6, x64
 - Available for S4000/S5000
@@ -106,7 +106,7 @@ apt install -y libhiredis0.14
 
 ### 3. Testing and validation
 
-Refer to [Tests of mthreads3.6 backend](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/.github/workflows/mthreads3.6-build-and-test.yml)
+Refer to [Tests of mthreads3.6 backend](/.github/workflows/mthreads3.6-build-and-test.yml)
 
 ---
 
@@ -206,7 +206,7 @@ Refer to [Tests of mthreads3.2 backend](https://github.com/flagos-ai/FlagTree/tr
 
 ---
 
-## 💫 Moore Threads（摩尔线程）[mthreads](https://github.com/flagos-ai/FlagTree/tree/main/third_party/mthreads/) (Triton 3.1)
+## 💫 Moore Threads（摩尔线程）[mthreads](https://github.com/flagos-ai/flagtree/tree/triton_v3.1.x/third_party/mthreads/) (Triton 3.1)
 
 - Based on Triton 3.1, x64/aarch64
 - Available for S4000/S5000
@@ -305,6 +305,6 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 
 ### 3. Testing and validation
 
-Refer to [Tests of mthreads3.1 backend](/.github/workflows/mthreads-build-and-test.yml)
+Refer to [Tests of mthreads3.1 backend](https://github.com/flagos-ai/flagtree/blob/triton_v3.1.x/.github/workflows/mthreads-build-and-test.yml)
 
 For triton 3.1 kernels that use `tl.dot`, setting the environment variable `export MUSA_ENABLE_SQMMA=1` can improve performance.

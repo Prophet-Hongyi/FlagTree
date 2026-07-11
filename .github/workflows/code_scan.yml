@@ -2,9 +2,9 @@ name: code-scan
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "triton_v3.1.x" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "triton_v3.1.x" ]
 
 jobs:
   scan-code-and-report:

@@ -1,6 +1,6 @@
 [中文版|[English](./install_sunrise.md)]
 
-## 💫 Sunrise（曦望芯科）[sunrise](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/sunrise/) (Triton 3.6)
+## 💫 Sunrise（曦望芯科）[sunrise](/third_party/sunrise/) (Triton 3.6)
 
 - 对应的 Triton 版本为 3.6，基于 x64 平台
 - 可用于 S2
@@ -71,7 +71,7 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 
 ### 3. 测试验证
 
-参考 [Tests of sunrise3.6 backend](https://github.com/flagos-ai/FlagTree/blob/triton_v3.6.x/.github/workflows/sunrise-build-and-test.yml)
+参考 [Tests of sunrise3.6 backend](/.github/workflows/sunrise-build-and-test.yml)
 
 
 ## 💫 Sunrise（曦望芯科）[sunrise](https://github.com/flagos-ai/FlagTree/tree/triton_v3.4.x/third_party/sunrise/) (Triton 3.4)

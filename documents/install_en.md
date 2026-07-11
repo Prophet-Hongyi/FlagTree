@@ -143,7 +143,7 @@ unset LLVM_SYSPATH LLVM_INCLUDE_DIRS LLVM_LIBRARY_DIR
 
 ### 3. Testing and validation
 
-Refer to [Tests of nvidia backend](https://github.com/flagos-ai/FlagTree/blob/triton_v3.6.x/.github/workflows/hopper-build-and-test.yml)
+Refer to [Tests of nvidia3.6 backend](.github/workflows/hopper-build-and-test.yml)
 
 ## Q&A
 

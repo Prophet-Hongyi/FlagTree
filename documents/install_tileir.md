@@ -1,6 +1,6 @@
 [[中文版](./install_tileir_cn.md)|English]
 
-## 💫 NVIDIA TileIR [tileir](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/tileir/) (Triton 3.6)
+## 💫 NVIDIA TileIR [tileir](/third_party/tileir/) (Triton 3.6)
 
 - Based on Triton 3.6, x64
 - Available for Hopper/Blackwell
@@ -90,4 +90,4 @@ MAX_JOBS=32 python3 -m pip install . --no-build-isolation -v
 
 ### 3. Testing and validation
 
-Refer to [Tests of tileir3.6 backend](https://github.com/flagos-ai/FlagTree/blob/triton_v3.6.x/.github/workflows/tileir3.6-build-and-test.yml)
+Refer to [Tests of tileir3.6 backend](/.github/workflows/tileir3.6-build-and-test.yml)

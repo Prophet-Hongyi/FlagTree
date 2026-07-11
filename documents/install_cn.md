@@ -143,7 +143,7 @@ unset LLVM_SYSPATH LLVM_INCLUDE_DIRS LLVM_LIBRARY_DIR
 
 ### 3. 测试验证
 
-参考 [Tests of nvidia backend](https://github.com/flagos-ai/FlagTree/blob/triton_v3.6.x/.github/workflows/hopper-build-and-test.yml)
+参考 [Tests of nvidia3.6 backend](/.github/workflows/hopper-build-and-test.yml)
 
 ## Q&A
 

@@ -1,6 +1,6 @@
 [中文版|[English](./install_enflame.md)]
 
-## 💫 Enflame（燧原）[enflame](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/enflame/) (Triton 3.6)
+## 💫 Enflame（燧原）[enflame](/third_party/enflame/) (Triton 3.6)
 
 - 对应的 Triton 版本为 3.6，基于 x64 平台
 - 可用于 GCU300 (S60), GCU400 (L300/L600)
@@ -87,7 +87,7 @@ MAX_JOBS=8 python3 -m pip install . --no-build-isolation -v --break-system-packa
 
 ### 3. 测试验证
 
-参考 [Tests of enflame3.6 backend](https://github.com/flagos-ai/FlagTree/blob/triton_v3.6.x/.github/workflows/enflame3.6-gcu400-build-and-test.yml)
+参考 [Tests of enflame3.6 backend](/.github/workflows/enflame3.6-gcu400-build-and-test.yml)
 
 ---
 

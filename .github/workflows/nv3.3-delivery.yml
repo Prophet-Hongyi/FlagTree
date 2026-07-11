@@ -1,4 +1,4 @@
-name: CD-Hopper
+name: CD-NV3.3
 
 permissions:
   contents: write
@@ -16,6 +16,15 @@ on:
       PLATFORM:
         required: true
         default: 'x86_64'
+      BRANCH:
+        required: true
+        default: 'triton_v3.3.x'
+      TRITON:
+        required: true
+        default: '3.3'
+      BACKEND:
+        required: true
+        default: 'nvidia'
       FLAGTREE_PYPI_KEY:
         required: false
   workflow_call:
@@ -32,6 +41,18 @@ on:
         type: string
         required: true
         default: 'x86_64'
+      BRANCH:
+        type: string
+        required: true
+        default: 'triton_v3.3.x'
+      TRITON:
+        type: string
+        required: true
+        default: '3.3'
+      BACKEND:
+        type: string
+        required: true
+        default: 'nvidia'
       FLAGTREE_PYPI_KEY:
         type: string
         required: false
@@ -42,15 +63,15 @@ concurrency:
 
 jobs:
   delivery:
-    runs-on: hopper-cd
+    runs-on: nvidia3.3-cd
     if: ${{ github.repository == 'FlagTree/flagtree' || github.repository == 'flagos-ai/flagtree' }}
     steps:
       - name: Check branch
         shell: bash
         run: |
           TARGET_BRANCH="${{ github.ref_name }}"
-          if [[ ! "$TARGET_BRANCH" =~ ^(triton_v3\.(4|5|6)\.x)$ ]]; then
-            echo "❌ This workflow must be run from branch 'triton_v3.4.x'|'triton_v3.5.x'|'triton_v3.6.x', but got '${TARGET_BRANCH}'"
+          if [[ ! "$TARGET_BRANCH" =~ ^(triton_v3\.(1|2|3)\.x)$ ]]; then
+            echo "❌ This workflow must be run from branch 'triton_v3.1.x'|'triton_v3.2.x'|'triton_v3.3.x', but got '${TARGET_BRANCH}'"
             exit 1
           fi
           echo "TARGET_BRANCH=$TARGET_BRANCH" >> $GITHUB_ENV
@@ -67,45 +88,19 @@ jobs:
         with:
           checkout_version: 'v6'
 
-      - name: FlagTree bdist_wheel on NVidia (triton_v3.4.x branch)
-        if: ${{ env.TARGET_BRANCH == 'triton_v3.4.x' }}
+      - name: FlagTree bdist_wheel
+        if: ${{ env.TARGET_BRANCH == inputs.BRANCH }}
         shell: bash
         run: |
           set -x
-          TRITON_VER="3.4"
-          source ~/env-${TRITON_VER}.sh
           CHIP=""
-          unset FLAGTREE_BACKEND
-          WHL_VER=${{ inputs.WHL_VER }}
-          PYTHON_VER=${{ inputs.PYTHON_VER }}
-          export FLAGTREE_WHEEL_VERSION="${WHL_VER}+${FLAGTREE_BACKEND}${CHIP}${TRITON_VER}"
-
-          RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
-          if python${PYTHON_VER} -m pip download --no-deps "flagtree===${FLAGTREE_WHEEL_VERSION}" -d . $RES >/dev/null 2>&1; then
-            echo "❌ flagtree===${FLAGTREE_WHEEL_VERSION} already exists!"
-            exit 1
-          else
-            echo "✅ flagtree===${FLAGTREE_WHEEL_VERSION} does not exist, proceed to build"
-          fi
-
-          rm -rf ./build ./*.egg-info
-          { export FLAGTREE_PYPI_KEY=${{ inputs.FLAGTREE_PYPI_KEY }}; } 2>/dev/null
-          export TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
-          MAX_JOBS=32 python${PYTHON_VER} setup.py bdist_wheel -d ~/dist-flagtree
-          env | grep -E '^(FLAGTREE_WHEEL_VERSION)=' >> $GITHUB_ENV || true
-
-      - name: FlagTree bdist_wheel on NVidia (triton_v3.5.x branch)
-        if: ${{ env.TARGET_BRANCH == 'triton_v3.5.x' }}
-        shell: bash
-        run: |
-          set -x
-          TRITON_VER="3.5"
+          TRITON_VER=${{ inputs.TRITON }}
           source ~/env-${TRITON_VER}.sh  # nvidia
-          CHIP=""
-          unset FLAGTREE_BACKEND
+          unset FLAGTREE_BACKEND  # nvidia
           WHL_VER=${{ inputs.WHL_VER }}
           PYTHON_VER=${{ inputs.PYTHON_VER }}
-          export FLAGTREE_WHEEL_VERSION="${WHL_VER}+${FLAGTREE_BACKEND}${CHIP}${TRITON_VER}"
+          BACKEND=${{ inputs.BACKEND }}  # nvidia
+          export FLAGTREE_WHEEL_VERSION="${WHL_VER}+${BACKEND}${CHIP}${TRITON_VER}"  # nvidia
 
           RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
           if python${PYTHON_VER} -m pip download --no-deps "flagtree===${FLAGTREE_WHEEL_VERSION}" -d . $RES >/dev/null 2>&1; then
@@ -115,33 +110,7 @@ jobs:
             echo "✅ flagtree===${FLAGTREE_WHEEL_VERSION} does not exist, proceed to build"
           fi
 
-          rm -rf ./build ./*.egg-info
-          { export FLAGTREE_PYPI_KEY=${{ inputs.FLAGTREE_PYPI_KEY }}; } 2>/dev/null
-          export TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
-          MAX_JOBS=32 python${PYTHON_VER} setup.py bdist_wheel -d ~/dist-flagtree
-          env | grep -E '^(FLAGTREE_WHEEL_VERSION)=' >> $GITHUB_ENV || true
-
-      - name: FlagTree bdist_wheel on NVidia (triton_v3.6.x branch)
-        if: ${{ env.TARGET_BRANCH == 'triton_v3.6.x' }}
-        shell: bash
-        run: |
-          set -x
-          TRITON_VER="3.6"
-          source ~/env-${TRITON_VER}.sh
-          CHIP=""
-          unset FLAGTREE_BACKEND
-          WHL_VER=${{ inputs.WHL_VER }}
-          PYTHON_VER=${{ inputs.PYTHON_VER }}
-          export FLAGTREE_WHEEL_VERSION="${WHL_VER}"  # main
-
-          RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
-          if python${PYTHON_VER} -m pip download --no-deps "flagtree===${FLAGTREE_WHEEL_VERSION}" -d . $RES >/dev/null 2>&1; then
-            echo "❌ flagtree===${FLAGTREE_WHEEL_VERSION} already exists!"
-            exit 1
-          else
-            echo "✅ flagtree===${FLAGTREE_WHEEL_VERSION} does not exist, proceed to build"
-          fi
-
+          cd python
           rm -rf ./build ./*.egg-info
           { export FLAGTREE_PYPI_KEY=${{ inputs.FLAGTREE_PYPI_KEY }}; } 2>/dev/null
           export TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
