@@ -8,6 +8,8 @@ spec_path(__path__)
 
 from . import math
 from . import extra
+from ..backends import language_extensions as ext
+
 from .standard import (
     argmax,
     argmin,
@@ -193,6 +195,7 @@ __all__ = [
     "exp2",
     "expand_dims",
     "extra",
+    "ext",
     "fdiv",
     "flip",
     "float16",
