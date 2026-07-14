@@ -43,7 +43,11 @@ def is_ampere_or_newer():
 
 
 def is_blackwell():
-    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+    return is_cuda() and torch.cuda.get_device_capability()[0] in [10, 11]  # Triton 3.7
+
+
+def is_blackwell_ultra():
+    return is_cuda() and torch.cuda.get_device_capability()[0:2] == (10, 3)  # Triton 3.7
 
 
 def is_hopper_or_newer():
@@ -78,6 +82,17 @@ def is_hip_cdna4():
     return target is not None and target.backend == 'hip' and target.arch == 'gfx950'
 
 
+def is_hip_rdna3():  # Triton 3.7
+    target = get_current_target()
+    return target is not None and target.backend == 'hip' and 'gfx11' in target.arch
+
+
+def is_hip_rdna4():  # Triton 3.7
+    target = get_current_target()
+    # check for gfx120 instead of gfx12, to avoid matching gfx1250
+    return target is not None and target.backend == 'hip' and 'gfx120' in target.arch
+
+
 def is_hip_gfx11():
     target = get_current_target()
     return target is not None and target.backend == 'hip' and 'gfx11' in target.arch
@@ -104,6 +119,17 @@ def get_hip_lds_size():
 def is_xpu():
     target = get_current_target()
     return False if target is None else target.backend == "xpu"
+
+
+# flagtree mthreads
+def is_musa():
+    target = get_current_target()
+    return False if target is None else target.backend == "musa"
+
+
+# flagtree mthreads
+def is_musa_ph1():
+    return is_musa() and torch.musa.get_device_capability() == (3, 1)
 
 
 def get_arch():
@@ -156,6 +182,8 @@ def to_triton(x: np.ndarray, device, dst_type=None) -> Union[TensorWrapper, torc
         if dst_type and 'float8' in dst_type:
             return reinterpret(torch.tensor(x, device=device), getattr(tl, dst_type))
         if t == 'float32' and dst_type == 'bfloat16':
+            if is_musa():  # flagtree mthreads
+                return torch.tensor(x, device='cpu').bfloat16().to(device)
             return torch.tensor(x, device=device).bfloat16()
         return torch.tensor(x, device=device)
 
