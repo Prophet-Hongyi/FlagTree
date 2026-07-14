@@ -1,6 +1,8 @@
 """isort:skip_file"""
 __version__ = '3.6.0'
 
+from triton.flagtree_spec import spec
+
 # ---------------------------------------
 # Note: import order is significant here.
 
@@ -19,7 +21,7 @@ from .runtime import (
 )
 from .runtime.jit import constexpr_function, jit
 from .runtime._async_compile import AsyncCompileMode, FutureKernel
-from .compiler import compile, CompilationError, max_shared_mem
+from .compiler import compile, CompilationError
 from .errors import TritonError
 from .runtime._allocation import set_allocator
 
@@ -28,6 +30,9 @@ from . import testing
 from . import tools
 
 must_use_result = language.core.must_use_result
+
+# flagtree backend specialization
+spec("triton_extend_globals", globals())
 
 __all__ = [
     "AsyncCompileMode",
@@ -44,7 +49,6 @@ __all__ = [
     "JITFunction",
     "KernelInterface",
     "language",
-    "max_shared_mem",
     "MockTensor",
     "must_use_result",
     "next_power_of_2",
