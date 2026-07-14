@@ -32,6 +32,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "tle/dialect/include/Analysis/TleMemoryEffectAnalysis.h"
 #include "tle/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
@@ -52,6 +53,24 @@ namespace {
 constexpr StringLiteral kBarrierGroupAttr = "tle.barrier_group";
 
 namespace ttg = mlir::triton::gpu;
+
+struct SharedEffects {
+  bool reads = false;
+  bool writes = false;
+
+  bool merge(const SharedEffects &other) {
+    bool changed = false;
+    if (other.reads && !reads) {
+      reads = true;
+      changed = true;
+    }
+    if (other.writes && !writes) {
+      writes = true;
+      changed = true;
+    }
+    return changed;
+  }
+};
 
 static Value stripConvertLayouts(Value value) {
   Value current = value;
@@ -222,14 +241,55 @@ class InsertLocalPointerBarriersPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
     pointerGroups.clear();
+    functionEffects.clear();
     allowDotOperandBarrierElision = isCudaTargetAtLeast(module, 90);
     collectTrackedPointers(module);
-
-    if (pointerGroups.empty())
-      return;
+    collectFunctionEffects(module);
 
     for (Operation &op : module.getBody()->getOperations())
       processOperation(op);
+  }
+
+  void collectFunctionEffects(ModuleOp module) {
+    SmallVector<triton::FuncOp> functions;
+    module.walk([&](triton::FuncOp func) {
+      functions.push_back(func);
+      SharedEffects effects;
+      func.walk([&](Operation *op) {
+        if (op == func.getOperation() || isa<triton::CallOp>(op) ||
+            op->getNumRegions() != 0 || op->hasTrait<OpTrait::IsTerminator>() ||
+            isa<mlir::gpu::BarrierOp, ttg::LocalBarrierOp,
+                ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
+          return;
+        effects.reads |= mayReadSharedMemory(op);
+        effects.writes |= mayWriteSharedMemory(op);
+      });
+      functionEffects[func.getOperation()] = effects;
+    });
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (triton::FuncOp func : functions) {
+        SharedEffects &effects = functionEffects[func.getOperation()];
+        func.walk([&](triton::CallOp call) {
+          auto callee = module.lookupSymbol<triton::FuncOp>(call.getCallee());
+          if (!callee) {
+            changed |= effects.merge({true, true});
+            return;
+          }
+          changed |= effects.merge(functionEffects.lookup(callee.getOperation()));
+        });
+      }
+    }
+  }
+
+  SharedEffects getCallEffects(triton::CallOp call) const {
+    auto module = call->getParentOfType<ModuleOp>();
+    auto callee = module.lookupSymbol<triton::FuncOp>(call.getCallee());
+    if (!callee)
+      return {true, true};
+    return functionEffects.lookup(callee.getOperation());
   }
 
   void collectTrackedPointers(ModuleOp module) {
@@ -298,26 +358,40 @@ class InsertLocalPointerBarriersPass
 
   void processBlock(Block &block) {
     llvm::DenseMap<int64_t, bool> dirtyGroups;
+    bool untrackedSharedDirty = false;
     for (Operation &op : block) {
-      if (!dirtyGroups.empty() && op.getNumRegions() > 0) {
+      if ((!dirtyGroups.empty() || untrackedSharedDirty) &&
+          op.getNumRegions() > 0) {
         bool handledByIfSpecialization = false;
         if (auto ifOp = dyn_cast<scf::IfOp>(&op))
-          handledByIfSpecialization = tryHandleUniformIf(ifOp, dirtyGroups);
+          handledByIfSpecialization =
+              tryHandleUniformIf(ifOp, dirtyGroups, untrackedSharedDirty);
 
         if (!handledByIfSpecialization &&
-            opHasLoadNeedingBarrier(op, dirtyGroups)) {
+            opHasLoadNeedingBarrier(op, dirtyGroups,
+                                    untrackedSharedDirty)) {
           OpBuilder builder(&op);
           builder.create<mlir::gpu::BarrierOp>(op.getLoc());
           dirtyGroups.clear();
+          untrackedSharedDirty = false;
         }
       }
 
       if (auto store = dyn_cast<triton::StoreOp>(&op)) {
         if (auto group = lookupPointerGroup(store.getPtr()))
           dirtyGroups[*group] = true;
+        else if (classifyPointerAddress(store.getPtr()) ==
+                 PointerAddressClass::Shared)
+          untrackedSharedDirty = true;
       } else if (auto load = dyn_cast<triton::LoadOp>(&op)) {
         auto group = lookupPointerGroup(load.getPtr());
-        if (!group || !dirtyGroups.lookup(*group))
+        bool needsBarrier = untrackedSharedDirty ||
+                            (group && dirtyGroups.lookup(*group)) ||
+                            (!group &&
+                             classifyPointerAddress(load.getPtr()) ==
+                                 PointerAddressClass::Shared &&
+                             !dirtyGroups.empty());
+        if (!needsBarrier)
           continue;
         if (allowDotOperandBarrierElision &&
             isFullViewLoadUsedOnlyByDotOperands(load))
@@ -329,8 +403,20 @@ class InsertLocalPointerBarriersPass
         // redundant back-to-back barriers for consecutive loads from different
         // tracked groups.
         dirtyGroups.clear();
+        untrackedSharedDirty = false;
+      } else if (auto call = dyn_cast<triton::CallOp>(&op)) {
+        SharedEffects effects = getCallEffects(call);
+        if (effects.reads &&
+            (!dirtyGroups.empty() || untrackedSharedDirty)) {
+          OpBuilder builder(call);
+          builder.create<mlir::gpu::BarrierOp>(call.getLoc());
+          dirtyGroups.clear();
+          untrackedSharedDirty = false;
+        }
+        untrackedSharedDirty |= effects.writes;
       } else if (isa<mlir::gpu::BarrierOp>(&op)) {
         dirtyGroups.clear();
+        untrackedSharedDirty = false;
       }
 
       for (Region &nested : op.getRegions())
@@ -339,17 +425,20 @@ class InsertLocalPointerBarriersPass
       // Propagate write hazards from nested regions to the parent block.
       // Without this, a store inside scf.if/scf.for may not mark parent state
       // dirty, so a subsequent outer load can miss the required barrier.
-      markGroupsWrittenByNestedRegions(op, dirtyGroups);
+      markGroupsWrittenByNestedRegions(op, dirtyGroups,
+                                       untrackedSharedDirty);
     }
   }
 
   bool tryHandleUniformIf(scf::IfOp ifOp,
-                          const llvm::DenseMap<int64_t, bool> &dirtyGroups) {
+                          const llvm::DenseMap<int64_t, bool> &dirtyGroups,
+                          bool untrackedSharedDirty) {
     if (!isUniformCondition(ifOp.getCondition()))
       return false;
 
     for (Region &region : ifOp->getRegions()) {
-      if (!regionHasLoadNeedingBarrier(region, dirtyGroups))
+      if (!regionHasLoadNeedingBarrier(region, dirtyGroups,
+                                       untrackedSharedDirty))
         continue;
       if (region.empty() || region.front().empty())
         continue;
@@ -377,18 +466,31 @@ class InsertLocalPointerBarriersPass
   }
 
   bool regionHasLoadNeedingBarrier(
-      Region &region, const llvm::DenseMap<int64_t, bool> &dirtyGroups) const {
+      Region &region, const llvm::DenseMap<int64_t, bool> &dirtyGroups,
+      bool untrackedSharedDirty) const {
     for (Block &block : region) {
       for (Operation &nestedOp : block) {
         if (auto load = dyn_cast<triton::LoadOp>(&nestedOp)) {
-          if (auto group = lookupPointerGroup(load.getPtr());
-              group && dirtyGroups.lookup(*group) &&
+          auto group = lookupPointerGroup(load.getPtr());
+          bool needsBarrier = untrackedSharedDirty ||
+                              (group && dirtyGroups.lookup(*group)) ||
+                              (!group &&
+                               classifyPointerAddress(load.getPtr()) ==
+                                   PointerAddressClass::Shared &&
+                               !dirtyGroups.empty());
+          if (needsBarrier &&
               !(allowDotOperandBarrierElision &&
                 isFullViewLoadUsedOnlyByDotOperands(load)))
             return true;
         }
+        if (auto call = dyn_cast<triton::CallOp>(&nestedOp)) {
+          if (getCallEffects(call).reads &&
+              (!dirtyGroups.empty() || untrackedSharedDirty))
+            return true;
+        }
         if (nestedOp.getNumRegions() > 0 &&
-            opHasLoadNeedingBarrier(nestedOp, dirtyGroups))
+            opHasLoadNeedingBarrier(nestedOp, dirtyGroups,
+                                    untrackedSharedDirty))
           return true;
       }
     }
@@ -396,35 +498,45 @@ class InsertLocalPointerBarriersPass
   }
 
   bool opHasLoadNeedingBarrier(
-      Operation &op, const llvm::DenseMap<int64_t, bool> &dirtyGroups) const {
+      Operation &op, const llvm::DenseMap<int64_t, bool> &dirtyGroups,
+      bool untrackedSharedDirty) const {
     for (Region &region : op.getRegions()) {
-      if (regionHasLoadNeedingBarrier(region, dirtyGroups))
+      if (regionHasLoadNeedingBarrier(region, dirtyGroups,
+                                      untrackedSharedDirty))
         return true;
     }
     return false;
   }
 
   void markGroupsWrittenByNestedRegions(
-      Operation &op, llvm::DenseMap<int64_t, bool> &dirtyGroups) const {
+      Operation &op, llvm::DenseMap<int64_t, bool> &dirtyGroups,
+      bool &untrackedSharedDirty) const {
     if (op.getNumRegions() == 0)
       return;
     llvm::DenseSet<int64_t> writtenGroups;
     for (Region &region : op.getRegions())
-      collectWrittenGroups(region, writtenGroups);
+      collectWrittenGroups(region, writtenGroups, untrackedSharedDirty);
     for (int64_t group : writtenGroups)
       dirtyGroups[group] = true;
   }
 
   void collectWrittenGroups(Region &region,
-                            llvm::DenseSet<int64_t> &writtenGroups) const {
+                            llvm::DenseSet<int64_t> &writtenGroups,
+                            bool &untrackedSharedDirty) const {
     for (Block &block : region) {
       for (Operation &nestedOp : block) {
         if (auto store = dyn_cast<triton::StoreOp>(&nestedOp)) {
           if (auto group = lookupPointerGroup(store.getPtr()))
             writtenGroups.insert(*group);
+          else if (classifyPointerAddress(store.getPtr()) ==
+                   PointerAddressClass::Shared)
+            untrackedSharedDirty = true;
         }
+        if (auto call = dyn_cast<triton::CallOp>(&nestedOp))
+          untrackedSharedDirty |= getCallEffects(call).writes;
         for (Region &deeperRegion : nestedOp.getRegions())
-          collectWrittenGroups(deeperRegion, writtenGroups);
+          collectWrittenGroups(deeperRegion, writtenGroups,
+                               untrackedSharedDirty);
       }
     }
   }
@@ -437,6 +549,7 @@ class InsertLocalPointerBarriersPass
   }
 
   llvm::DenseMap<Value, int64_t> pointerGroups;
+  llvm::DenseMap<Operation *, SharedEffects> functionEffects;
   bool allowDotOperandBarrierElision = false;
 };
 

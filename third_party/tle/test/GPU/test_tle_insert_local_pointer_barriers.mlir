@@ -209,6 +209,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func private @write_memdesc_arg(%buffer: !ttg.memdesc<32xi32, #shared, #smem, mutable>, %values: tensor<32xi32, #blocked>) {
+    %idx = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    %ptr = "tle.local_pointers"(%buffer, %idx) : (!ttg.memdesc<32xi32, #shared, #smem, mutable>, tensor<32xi32, #blocked>) -> tensor<32x!tt.ptr<i32, 3>, #blocked>
+    tt.store %ptr, %values : tensor<32x!tt.ptr<i32, 3>, #blocked>
+    tt.return
+  }
+
+  tt.func private @read_memdesc_arg(%buffer: !ttg.memdesc<32xi32, #shared, #smem, mutable>) -> tensor<32xi32, #blocked> {
+    %idx = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    %ptr = "tle.local_pointers"(%buffer, %idx) : (!ttg.memdesc<32xi32, #shared, #smem, mutable>, tensor<32xi32, #blocked>) -> tensor<32x!tt.ptr<i32, 3>, #blocked>
+    %value = tt.load %ptr : tensor<32x!tt.ptr<i32, 3>, #blocked>
+    tt.return %value : tensor<32xi32, #blocked>
+  }
+
+  // CHECK-LABEL: tt.func @interprocedural_memdesc_alias_barrier
+  tt.func @interprocedural_memdesc_alias_barrier(%values: tensor<32xi32, #blocked>) -> tensor<32xi32, #blocked> {
+    %arena = ttg.local_alloc : () -> !ttg.memdesc<64xi32, #shared, #smem, mutable>
+    %view = tle.memdesc_alias %arena {offset_bytes = 0 : i64} : !ttg.memdesc<64xi32, #shared, #smem, mutable> -> !ttg.memdesc<32xi32, #shared, #smem, mutable>
+    // CHECK: tt.call @write_memdesc_arg
+    tt.call @write_memdesc_arg(%view, %values) : (!ttg.memdesc<32xi32, #shared, #smem, mutable>, tensor<32xi32, #blocked>) -> ()
+    // CHECK-NEXT: gpu.barrier
+    // CHECK-NEXT: %[[VALUE:.*]] = tt.call @read_memdesc_arg
+    %value = tt.call @read_memdesc_arg(%view) : (!ttg.memdesc<32xi32, #shared, #smem, mutable>) -> tensor<32xi32, #blocked>
+    tt.return %value : tensor<32xi32, #blocked>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #dot_a = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
 #dot_b = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
