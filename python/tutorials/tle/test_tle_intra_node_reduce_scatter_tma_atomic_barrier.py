@@ -56,9 +56,7 @@ def scatter_kernel_opt(
 
             in_row = peer * M_per_rank + tile_m * BLOCK_M
             in_col = tile_n * BLOCK_N
-            in_ptrs = (input_ptr
-                       + (in_row + row_offs[:, None]) * N
-                       + (in_col + col_offs[None, :]))
+            in_ptrs = (input_ptr + (in_row + row_offs[:, None]) * N + (in_col + col_offs[None, :]))
 
             in_row_mask = (in_row + row_offs[:, None]) < (peer + 1) * M_per_rank
             in_col_mask = (in_col + col_offs[None, :]) < N
@@ -66,9 +64,7 @@ def scatter_kernel_opt(
 
             out_row_in_peer = tile_m * BLOCK_M
             out_col = tile_n * BLOCK_N
-            out_ptrs = (remote_base
-                        + (out_row_in_peer + row_offs[:, None]) * N
-                        + (out_col + col_offs[None, :]))
+            out_ptrs = (remote_base + (out_row_in_peer + row_offs[:, None]) * N + (out_col + col_offs[None, :]))
             out_row_mask = (out_row_in_peer + row_offs[:, None]) < M_per_rank
             tl.store(out_ptrs, data, mask=out_row_mask & in_col_mask)
 
@@ -165,9 +161,7 @@ def atomic_barrier_kernel(
 def torch_reduce_scatter(input_tensor, group):
     M, N = input_tensor.shape
     world_size = dist.get_world_size(group)
-    output = torch.empty((M // world_size, N),
-                         dtype=input_tensor.dtype,
-                         device=input_tensor.device)
+    output = torch.empty((M // world_size, N), dtype=input_tensor.dtype, device=input_tensor.device)
     dist.reduce_scatter_tensor(output, input_tensor, group=group)
     return output
 
@@ -188,19 +182,13 @@ def tle_reduce_scatter_atomic_barrier(
     num_sms: int = -1,
 ):
     if num_sms == -1:
-        grid_scatter = lambda META: (
-            triton.cdiv(M_per_rank, META["BLOCK_M"])
-            * triton.cdiv(N, META["BLOCK_N"]),
-        )
+        grid_scatter = lambda META: (triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
         scatter_num_warps = 4
     else:
-        grid_scatter = lambda META: (
-            min(
-                triton.cdiv(M_per_rank, META["BLOCK_M"])
-                * triton.cdiv(N, META["BLOCK_N"]),
-                128,
-            ),
-        )
+        grid_scatter = lambda META: (min(
+            triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+            128,
+        ), )
         scatter_num_warps = 8
 
     with torch.cuda.stream(stream):
@@ -223,25 +211,19 @@ def tle_reduce_scatter_atomic_barrier(
     triton.set_allocator(alloc_fn)
 
     if num_sms == -1:
-        grid_reduce = lambda META: (
-            triton.cdiv(M_per_rank, META["BLOCK_M"])
-            * triton.cdiv(N, META["BLOCK_N"]),
-        )
+        grid_reduce = lambda META: (triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
         reduce_block_n = 64
         reduce_num_warps = 4
     else:
-        grid_reduce = lambda META: (
-            min(
-                triton.cdiv(M_per_rank, META["BLOCK_M"])
-                * triton.cdiv(N, META["BLOCK_N"]),
-                num_sms,
-            ),
-        )
+        grid_reduce = lambda META: (min(
+            triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+            num_sms,
+        ), )
         reduce_block_n = 128
         reduce_num_warps = 8
 
     with torch.cuda.stream(stream):
-        atomic_barrier_kernel[(world_size,)](
+        atomic_barrier_kernel[(world_size, )](
             flag_buf,
             flag_dev_mem_ptr,
             LOCAL_RANK=local_rank,
@@ -284,8 +266,8 @@ def main():
         sys.exit(1)
 
     with torch.cuda.use_mem_pool(mem_pool):
-        flag_buf = torch.full((world_size,), 0, dtype=torch.int32, device="cuda")
-        scatter_buf = torch.empty((M * N,), dtype=dtype, device="cuda")
+        flag_buf = torch.full((world_size, ), 0, dtype=torch.int32, device="cuda")
+        scatter_buf = torch.empty((M * N, ), dtype=dtype, device="cuda")
     _, flag_dev_mem_ptr = tle.create_comm_tensor(flag_buf)
     _, scatter_dev_mem_ptr = tle.create_comm_tensor(scatter_buf)
 
