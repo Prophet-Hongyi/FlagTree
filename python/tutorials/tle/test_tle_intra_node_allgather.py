@@ -62,13 +62,13 @@ def _all_gather_push_2d_kernel(
         tl.store(ag_ptr + dst_base + offsets, vals, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["signal_target"])
 def _all_gather_signal_kernel(
     signal_ptr,
     signal_dev_mem,
     dev_comm_dptr,
     mesh: tl.constexpr,
-    SIGNAL_TARGET: tl.constexpr,
+    signal_target,
 ):
     peer = tl.program_id(0)
     local_rank = tle.shard_id(mesh, "device", comm_ptr=dev_comm_dptr)
@@ -81,9 +81,49 @@ def _all_gather_signal_kernel(
             dtype=tl.int32,
             offset=local_rank,
         )
-        tl.store(remote_signal_ptr, SIGNAL_TARGET, cache_modifier=".wt")
+        # Publish completion with system-scope release semantics. The receiver
+        # uses an acquire atomic before consuming the corresponding shard.
+        tl.atomic_xchg(
+            remote_signal_ptr,
+            signal_target,
+            sem="release",
+            scope="sys",
+        )
     else:
-        tl.store(signal_ptr + local_rank, SIGNAL_TARGET)
+        tl.atomic_xchg(
+            signal_ptr + local_rank,
+            signal_target,
+            sem="release",
+            scope="sys",
+        )
+
+
+@triton.jit(do_not_specialize=["signal_target"])
+def _all_gather_wait_kernel(
+    signal_ptr,
+    local_rank,
+    signal_target,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Wait until every remote shard in this rank's output is ready."""
+    peer = tl.program_id(0)
+    if peer < WORLD_SIZE and peer != local_rank:
+        # atomic_add(0) is an acquire load expressed with Triton's public
+        # atomic API. GE is required because a faster peer may already have
+        # published a later epoch.
+        observed = tl.atomic_add(
+            signal_ptr + peer,
+            0,
+            sem="acquire",
+            scope="sys",
+        )
+        while observed < signal_target:
+            observed = tl.atomic_add(
+                signal_ptr + peer,
+                0,
+                sem="acquire",
+                scope="sys",
+            )
 
 
 def _rank_print(rank: int, *items):
@@ -144,6 +184,7 @@ def main():
     copy_grid = (world_size, num_blocks)
     signal_grid = (world_size, )
     mesh = tle.device_mesh(tle.MeshConfig(device=world_size))
+    signal_target = 1
 
     def launch_tle_all_gather():
         _all_gather_push_2d_kernel[copy_grid](
@@ -161,8 +202,15 @@ def main():
             signal_dev_mem,
             dev_comm_dptr,
             mesh,
-            SIGNAL_TARGET=1,
+            signal_target,
             num_warps=4,
+        )
+        _all_gather_wait_kernel[signal_grid](
+            signal,
+            rank,
+            signal_target,
+            WORLD_SIZE=world_size,
+            num_warps=1,
         )
 
     launch_tle_all_gather()
