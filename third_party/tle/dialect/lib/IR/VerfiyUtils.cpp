@@ -17,10 +17,8 @@
 namespace mlir::triton::tle {
 namespace RemotePointers {
 llvm::LogicalResult verifyDeviceSpace(mlir::Value src, mlir::Value result) {
-  // flagcxGetIntraPointerC accept raw device pointers represented as signless
-  // i64 values.
-  if (!src.getType().isSignlessInteger(64))
-    return failure();
+  if (!src)
+    return success();
 
   if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
     auto ptr = dyn_cast<triton::PointerType>(tensorTy.getElementType());
@@ -31,5 +29,22 @@ llvm::LogicalResult verifyDeviceSpace(mlir::Value src, mlir::Value result) {
   return success();
 }
 } // namespace RemotePointers
+
+namespace DistributedBarrier {
+llvm::LogicalResult verifyDeviceSpace(mlir::Operation *op, mlir::Value src) {
+
+  auto kindAttr = op->getAttrOfType<StringAttr>("group_kind");
+  auto barrierTypeAttr = op->getAttrOfType<StringAttr>("barrier_type");
+  auto orderAttr = op->getAttrOfType<StringAttr>("order");
+
+  if (kindAttr && barrierTypeAttr && orderAttr)
+    return success();
+  else
+    return op->emitOpError()
+           << "expects src, group_kind, barrier_type and order attributes to "
+              "be present for device space distributed barrier";
+}
+
+} // namespace DistributedBarrier
 
 } // namespace mlir::triton::tle

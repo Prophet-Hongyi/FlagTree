@@ -1,4 +1,5 @@
 #include "tle/dialect/include/Conversion/TleToLLVM/DistributedBarrierOpToLLVM.h"
+#include "tle/dialect/include/Tools/FlagcxUtils.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -18,6 +19,9 @@ namespace {
 using namespace mlir;
 namespace tle = mlir::triton::tle;
 
+constexpr llvm::StringLiteral kSpaceAttr = "space";
+constexpr llvm::StringLiteral kOrderAttr = "order";
+constexpr llvm::StringLiteral kIndexAttr = "barrier_index";
 constexpr llvm::StringLiteral kGroupKindAttr = "group_kind";
 constexpr llvm::StringLiteral kGroupShapeAttr = "group_shape";
 constexpr llvm::StringLiteral kGroupMaskAttr = "group_mask";
@@ -37,6 +41,16 @@ constexpr int32_t kSubmeshPhaseOffsetBytes = 4;
 constexpr int32_t kGridScratchAlignment = 4;
 constexpr int32_t kGridScratchBytes = 4;
 constexpr int32_t kGridArrivedOffsetBytes = 0;
+
+Value getDistDevicePtr(tle::DistributedBarrierOp op,
+                       SmallVector<Value> &srcElems) {
+  if (!srcElems.empty())
+    return srcElems[0];
+  else {
+    auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
+    return func.getArgument(1);
+  }
+}
 
 FailureOr<int32_t> getOrCreateSubmeshScratchOffset(ModuleOp mod) {
   if (auto existing =
@@ -423,8 +437,60 @@ struct DistributedBarrierOpConversion
   }
 
   LogicalResult
+  lowerDeviceSpaceBarrier(tle::DistributedBarrierOp op, OpAdaptor adaptor,
+                          ConversionPatternRewriter &rewriter) const {
+    auto kindAttr = op->getAttrOfType<StringAttr>(kGroupKindAttr);
+    auto orderAttr = op->getAttrOfType<StringAttr>(kOrderAttr);
+    auto indexAttr = op->getAttrOfType<IntegerAttr>(kIndexAttr);
+    auto loc = op.getLoc();
+    SmallVector<Value> srcElems;
+    auto getCoopKindValue = [](StringRef kind) -> int32_t {
+      return llvm::StringSwitch<int32_t>(kind)
+          .Case("thread", 0)
+          .Case("warp", 1)
+          .Case("block", 2)
+          .Case("grid", 3)
+          .Default(-1);
+    };
+    auto getOrderValue = [](StringRef order) -> int32_t {
+      return llvm::StringSwitch<int32_t>(order)
+          .Case("relaxed", 0)
+          .Case("acquire", 1)
+          .Case("release", 2)
+          .Case("acqrel", 3)
+          .Default(-1);
+    };
+
+    int32_t coopKind = getCoopKindValue(kindAttr.getValue());
+    int32_t order = getOrderValue(orderAttr.getValue());
+    if (coopKind < 0)
+      return rewriter.notifyMatchFailure(op, "invalid coop_kind");
+
+    if (order < 0)
+      return rewriter.notifyMatchFailure(op, "invalid order");
+
+    if (auto src = adaptor.getSrc())
+      srcElems = unpackLLElements(loc, src, rewriter);
+
+    auto comm = getDistDevicePtr(op, srcElems);
+    auto coopKindAttr = rewriter.getI32IntegerAttr(coopKind);
+    auto newOrderAttr = rewriter.getI32IntegerAttr(order);
+    auto barrierTypeAttr = op.getBarrierTypeAttr();
+    auto multimemAttr = rewriter.getBoolAttr(false);
+#ifdef FLAGCX_ENABLED
+    rewriter.replaceOpWithNewOp<tle::DeviceIntraBarrierOp>(
+        op, comm, barrierTypeAttr, coopKindAttr, indexAttr, multimemAttr,
+        newOrderAttr);
+#endif
+    return success();
+  }
+  LogicalResult
   matchAndRewrite(tle::DistributedBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (auto spaceAttr = op->getAttrOfType<StringAttr>(kSpaceAttr))
+      if (spaceAttr.getValue() == "device")
+        return lowerDeviceSpaceBarrier(op, adaptor, rewriter);
+
     if (auto kindAttr = op->getAttrOfType<StringAttr>(kGroupKindAttr)) {
       if (kindAttr.getValue() == "grid")
         return lowerGridBarrier(op, rewriter);

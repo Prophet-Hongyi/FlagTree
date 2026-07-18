@@ -43,6 +43,9 @@ from .distributed import (
     ShardingSpec,
     device_mesh,
     MeshConfig,
+    BarrierKind,
+    MemoryOrder,
+    GroupKind,
     distributed_barrier,
     distributed_dot,
     _infer_submesh_barrier_group,
@@ -56,7 +59,7 @@ from .distributed import (
     sharding,
 )
 from . import communication
-from .communication import get_mem_pool, create_comm_tensor, cleanup_communicator
+from .communication import get_mem_pool, create_dist_tensor, cleanup_communicator
 
 _EXTENSION_APIS = frozenset({
     "make_tensor_view",
@@ -110,8 +113,11 @@ __all__ = [
     "raw",
     "mem_pool",
     "get_mem_pool",
-    "create_comm_tensor",
+    "create_dist_tensor",
     "cleanup_communicator",
+    "BarrierKind",
+    "MemoryOrder",
+    "GroupKind",
 ]
 
 from . import distributed, gpu, raw
