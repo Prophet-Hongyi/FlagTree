@@ -18,14 +18,13 @@ from __future__ import annotations
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-from .cache_key import bind_tle_raw_source_cache_key
-from .cuda import CUDAJITFunction
-
 from typing import Any
 
 from .cache_key import bind_tle_raw_source_cache_key
 
+from typing import Any
+
+from .cache_key import bind_tle_raw_source_cache_key
 
 class RawJITFunction:
     """Shared @dialect state and default LLVM region materialization."""
