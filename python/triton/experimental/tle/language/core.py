@@ -13,6 +13,30 @@ def _tle_pick_sum_dtype(in_dtype, dtype):
     return None
 
 
+@tl.builtin
+def encoding(value, layout, _semantic=None):
+    """
+    Mark a TLE block tensor value with an explicit TritonGPU distributed
+    encoding request.
+    """
+    layout = tl._unwrap_if_constexpr(layout)
+    if not hasattr(layout, "to_ir"):
+        raise ValueError(f"tle.encoding expects a layout with to_ir(), got {type(layout)}")
+    if not isinstance(value, tl.tensor):
+        value = _semantic.to_tensor(value)
+    if not value.type.is_block():
+        raise ValueError("tle.encoding only supports block tensors")
+
+    options = _semantic.builder.options
+    _semantic.builder.ensure_ttg_layout_attrs(
+        int(getattr(options, "num_warps")),
+        int(getattr(options, "warp_size", 32)),
+        int(getattr(options, "num_ctas", 1)),
+    )
+    target_encoding = layout.to_ir(_semantic.builder)
+    return tl.tensor(_semantic.builder.create_tle_encoding(value.handle, target_encoding), value.type)
+
+
 # -----------------------
 # Non-Atomic Memory Operations
 # -----------------------

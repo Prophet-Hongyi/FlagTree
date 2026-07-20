@@ -896,7 +896,9 @@ LogicalResult LocalPointersOp::verify() {
       if (resultEncoding && indexTy.getEncoding() &&
           resultEncoding != indexTy.getEncoding())
         return emitOpError()
-               << "expects indices return tensors to match result encoding";
+               << "expects indices return tensors to match result encoding; "
+               << "result encoding is " << resultEncoding
+               << ", index encoding is " << indexTy.getEncoding();
     }
 
     if (indexShape != resultShape)

@@ -1,6 +1,7 @@
 # flagtree tle
 from .core import (
     cumsum,
+    encoding,
     extract_tile,
     insert_tile,
     load,
@@ -40,6 +41,7 @@ from .distributed import (
 __all__ = [
     "load",
     "cumsum",
+    "encoding",
     "extract_tile",
     "insert_tile",
     "pipe",

@@ -95,9 +95,26 @@ class LayoutPropagation {
 public:
   // Structure to keep track of the layout associated to a value.
   struct LayoutInfo {
-    LayoutInfo(Attribute encoding) { encodings.insert(encoding); }
+    LayoutInfo(Attribute encoding) { add(encoding); }
+#ifdef __TLE__
+    LayoutInfo(Attribute encoding, bool hard) { add(encoding, hard); }
+#endif
     LayoutInfo() {}
+    void add(Attribute encoding) { encodings.insert(encoding); }
+#ifdef __TLE__
+    void add(Attribute encoding, bool hard) {
+      encodings.insert(encoding);
+      if (hard)
+        hardEncodings.insert(encoding);
+    }
+    bool isHard(Attribute encoding) const {
+      return hardEncodings.contains(encoding);
+    }
+#endif
     llvm::SmallSetVector<Attribute, 8> encodings;
+#ifdef __TLE__
+    llvm::SmallSetVector<Attribute, 8> hardEncodings;
+#endif
   };
   LayoutPropagation(FuncOp F) : funcOp(F) {}
   // Find the anchor ops and set their layout in the data structure.
@@ -217,6 +234,10 @@ void LayoutRematerialization::cleanup() {
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
+#ifdef __TLE__
+  if (isTleExplicitConvertLayoutOp(op))
+    return true;
+#endif
   if (isa<DescriptorOpInterface>(op))
     return true;
   if (isa<LoadOp, StoreOp>(op))
@@ -239,9 +260,16 @@ bool isLayoutAnchor(Operation *op) {
 }
 
 void LayoutPropagation::initAnchorLayout() {
-  auto addAnchor = [&](Value v) {
+  auto addAnchor = [&](Value v, Attribute encoding = nullptr,
+                       bool hard = false) {
     if (auto tensorType = dyn_cast<RankedTensorType>(v.getType())) {
-      layouts.insert({v, LayoutInfo(tensorType.getEncoding())});
+      Attribute anchorEncoding = encoding ? encoding : tensorType.getEncoding();
+      auto &info = layouts[v];
+#ifdef __TLE__
+      info.add(anchorEncoding, hard);
+#else
+      info.add(anchorEncoding);
+#endif
     }
   };
 
@@ -255,7 +283,15 @@ void LayoutPropagation::initAnchorLayout() {
   funcOp.walk([&](Operation *op) {
     if (isLayoutAnchor(op)) {
       for (auto result : op->getResults()) {
+#ifdef __TLE__
+        bool hard = isTleExplicitConvertLayoutOp(op);
+        Attribute explicitEncoding =
+            hard ? getTleExplicitResultEncoding(op, result.getResultNumber())
+                 : nullptr;
+        addAnchor(result, explicitEncoding, hard);
+#else
         addAnchor(result);
+#endif
       }
     }
   });
@@ -277,8 +313,14 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
       } else {
         dstEncoding = inferDstEncoding(op, encoding);
       }
-      if (dstEncoding)
-        hasChanged |= layouts[value].encodings.insert(dstEncoding);
+      if (dstEncoding) {
+        auto &layoutInfo = layouts[value];
+        hasChanged |= layoutInfo.encodings.insert(dstEncoding);
+#ifdef __TLE__
+        if (info.isHard(encoding))
+          hasChanged |= layoutInfo.hardEncodings.insert(dstEncoding);
+#endif
+      }
     }
     if (hasChanged)
       changed.push_back(value);
@@ -380,6 +422,16 @@ void LayoutPropagation::resolveConflicts() {
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)
       continue;
+#ifdef __TLE__
+    if (!info.hardEncodings.empty()) {
+      Attribute encoding = *info.hardEncodings.begin();
+      info.encodings.clear();
+      info.encodings.insert(encoding);
+      info.hardEncodings.clear();
+      info.hardEncodings.insert(encoding);
+      continue;
+    }
+#endif
     // Hacky resolve, prefer block encoding.
     // TODO: add a proper heuristic.
     Attribute encoding = *info.encodings.begin();
@@ -406,6 +458,10 @@ void LayoutPropagation::dump() {
     llvm::errs() << " \n encoding:\n";
     for (auto encoding : it.second.encodings) {
       encoding.print(llvm::errs());
+#ifdef __TLE__
+      if (it.second.hardEncodings.contains(encoding))
+        llvm::errs() << " [hard]";
+#endif
       llvm::errs() << "\n";
     }
     llvm::errs() << "--\n";
@@ -756,6 +812,10 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
     auto tensorType = cast<RankedTensorType>(op->getResult(0).getType());
     auto newType = tensorType.cloneWithEncoding(encoding);
     auto cvt = ConvertLayoutOp::create(rewriter, op->getLoc(), newType, src);
+#ifdef __TLE__
+    if (Attribute explicitEncoding = getTleExplicitResultEncoding(op, 0))
+      cvt->setAttr(getTleExplicitEncodingAttrName(0), explicitEncoding);
+#endif
     map(op->getResult(0), cvt.getResult());
     return cvt.getOperation();
   }

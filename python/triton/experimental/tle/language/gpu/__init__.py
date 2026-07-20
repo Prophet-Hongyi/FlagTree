@@ -7,7 +7,8 @@ from .core import (
     local_ptr,
     warp_specialize,
 )
-from .types import (layout, shared_layout, swizzled_shared_layout, tensor_memory_layout, nv_mma_shared_layout, scope,
+from .types import (layout, distributed_encoding, BlockEncoding, MmaEncoding, DotOperandEncoding, SlicedEncoding,
+                    shared_layout, swizzled_shared_layout, tensor_memory_layout, nv_mma_shared_layout, scope,
                     buffered_tensor, buffered_tensor_type, smem, tmem)
 
 # Backward-compat alias expected by existing tests/tutorials.
@@ -21,6 +22,11 @@ __all__ = [
     "warp_specialize",
     "storage_kind",
     "layout",
+    "distributed_encoding",
+    "BlockEncoding",
+    "MmaEncoding",
+    "DotOperandEncoding",
+    "SlicedEncoding",
     "memory_space",
     "shared_layout",
     "swizzled_shared_layout",
