@@ -600,6 +600,26 @@ void init_triton_tle_ir(py::module &&m) {
           py::arg("group_kind"), py::arg("group_shape"), py::arg("group_axes"),
           py::arg("group_mask"))
       .def(
+          "create_put_mem",
+          [](TritonOpBuilder &self, Value comm, Value peer, Value value,
+             std::string teamKind, std::string coopKind,
+             std::string putType) -> void {
+            auto &builder = self.getBuilder();
+            auto *ctx = builder.getContext();
+            auto getOptStrAttr = [&](const std::string &s) -> StringAttr {
+              return s.empty() ? StringAttr() : builder.getStringAttr(s);
+            };
+            auto teamKindAttr = getOptStrAttr(teamKind);
+            auto putTypeAttr = getOptStrAttr(putType);
+            auto coopKindAttr = getOptStrAttr(coopKind);
+
+            self.create<tle::PutMemOrValueOp>(comm, teamKindAttr, peer,
+                                              coopKindAttr, value, putTypeAttr);
+          },
+          py::arg("comm"), py::arg("peer"), py::arg("value"),
+          py::arg("team_kind") = py::none(), py::arg("coop_kind") = py::none(),
+          py::arg("put_type") = py::none())
+      .def(
           "create_remote_pointers",
           [](TritonOpBuilder &self, Type resultTy, std::optional<Value> &src,
              Value shardId, const std::string &space,
