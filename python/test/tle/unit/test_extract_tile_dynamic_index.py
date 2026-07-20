@@ -20,10 +20,7 @@ def simple_extract_kernel(x_ptr, out_ptr, stride_xb, stride_xm, stride_xn, strid
     # 3. Perform extraction based on the layer index
     # Layer 0 extracts from top-left [0, 0], Layer 1 extracts from bottom-right [1, 1]
     # We use a conditional check because 'index' usually requires constant values for TLE hardware
-    if pid_z % 2 == 0:
-        extracted_tile = tle.extract_tile(bg_tile, index=[0, 0], tile_shape=[TILE_M, TILE_N])
-    else:
-        extracted_tile = tle.extract_tile(bg_tile, index=[1, 1], tile_shape=[TILE_M, TILE_N])
+    extracted_tile = tle.extract_tile(bg_tile, index=[pid_z, pid_z], tile_shape=[TILE_M, TILE_N])
 
     # 4. Store the extracted small tile into the corresponding Z layer of the output tensor
     offs_tm = tl.arange(0, TILE_M)
