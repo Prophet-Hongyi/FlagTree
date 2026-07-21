@@ -923,8 +923,7 @@ public:
     // instead of using the legacy explicit-result-type builder.
     auto resultType = cast<RankedTensorType>(op.getType());
     SmallVector<int64_t> strides;
-    if (auto stridesAttr =
-            op->getAttrOfType<DenseI64ArrayAttr>("strides")) {
+    if (auto stridesAttr = op->getAttrOfType<DenseI64ArrayAttr>("strides")) {
       strides.assign(stridesAttr.asArrayRef().begin(),
                      stridesAttr.asArrayRef().end());
     }
@@ -932,7 +931,6 @@ public:
     auto newOp = rewriter.replaceOpWithNewOp<tle::ExtractTileOp>(
         op, adaptor.getSrc(), adaptor.getIndex(), resultType.getShape(),
         strides);
-
 
     addNamedAttrs(newOp, adaptor.getAttributes());
 
@@ -970,8 +968,7 @@ public:
     }
 
     SmallVector<int64_t> strides;
-    if (auto stridesAttr =
-            op->getAttrOfType<DenseI64ArrayAttr>("strides")) {
+    if (auto stridesAttr = op->getAttrOfType<DenseI64ArrayAttr>("strides")) {
       strides.assign(stridesAttr.asArrayRef().begin(),
                      stridesAttr.asArrayRef().end());
     }
