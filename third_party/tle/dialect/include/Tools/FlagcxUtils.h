@@ -8,6 +8,10 @@
 namespace mlir::triton::tle {
 using namespace mlir;
 
+size_t getCoopKindValue(StringRef kind);
+
+size_t getTeamKindValue(StringRef kind);
+
 LLVM::CallOp getLocalPeFuncCall(mlir::Location loc,
                                 ConversionPatternRewriter &rewriter,
                                 Value memPtrInt);

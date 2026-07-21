@@ -22,6 +22,23 @@ static const llvm::StringMap<StringRef> runtimeNames = {
     {"getPutValueFunction", "flagcxDevNetPutValueS"},
     {"_getDeviceNetPtr", "flagcxDevNetGetFromCommS"}};
 
+size_t getCoopKindValue(StringRef kind) {
+  return llvm::StringSwitch<int32_t>(kind)
+      .Case("thread", 0)
+      .Case("warp", 1)
+      .Case("block", 2)
+      .Case("grid", 3)
+      .Default(-1);
+};
+
+size_t getTeamKindValue(StringRef kind) {
+  return llvm::StringSwitch<int32_t>(kind)
+      .Case("intra", 0)
+      .Case("inter", 1)
+      .Case("world", 2)
+      .Default(-1);
+};
+
 static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
                                                   ModuleOp module,
                                                   ArrayRef<Type> argTypes,

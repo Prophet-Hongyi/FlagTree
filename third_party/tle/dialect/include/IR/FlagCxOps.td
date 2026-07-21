@@ -82,7 +82,9 @@ def Tle_PutMemOrValueOp : Tle_Op<"put_mem_op"> {
     TT_Int:$peer,
     OptionalAttr<StrAttr>:$coop_kind,
     Tle_PutValueType:$value,
-    OptionalAttr<StrAttr>:$put_type
+    OptionalAttr<StrAttr>:$put_type,
+    Tle_PutValueType:$dst,
+    TT_Int:$dst_offset
   );
 
 }

@@ -19,6 +19,15 @@ namespace {
 using namespace mlir;
 namespace tle = mlir::triton::tle;
 
+Value getDistDevicePtr(tle::PutMemOrValueOp op, SmallVector<Value> &srcElems) {
+  if (!srcElems.empty())
+    return srcElems[0];
+  else {
+    auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
+    return func.getArgument(1);
+  }
+}
+
 struct PutMemOrValueOpConversion
     : public ConvertOpToLLVMPattern<tle::PutMemOrValueOp> {
   PutMemOrValueOpConversion(LLVMTypeConverter &typeConverter,
@@ -28,7 +37,24 @@ struct PutMemOrValueOpConversion
   LogicalResult
   matchAndRewrite(tle::PutMemOrValueOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    llvm::errs() << "[PutMemOrValueOpConversion]\n";
+
+    SmallVector<Value> srcElems;
+    auto loc = op.getLoc();
+    if (auto comm = op.getComm())
+      srcElems = unpackLLElements(loc, comm, rewriter);
+    auto comm = getDistDevicePtr(op, srcElems);
+    auto peer = unpackLLElements(loc, op.getPeer(), rewriter)[0];
+    auto teamKind = tle::getTeamKindValue(op.getTeamKindAttr());
+    auto coopKind = tle::getTeamKindValue(op.getCoopKindAttr());
+    auto putType = op.getPutTypeAttr();
+    auto value = op.getValue();
+    auto dst = op.getDst();
+    auto dstOffset = op.getDstOffset();
+    llvm::errs() << "[PutMemOrValueOpConversion]" << comm << teamKind << "\n";
+    // tle::getPutsFuncCall(loc, rewriter, comm,
+    //                          teamKind, peer, Value dst,
+    //                          size_t dstOffset, value, coopKind,
+    //                          putType);
     return success();
   }
 };

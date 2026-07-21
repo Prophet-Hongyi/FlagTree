@@ -635,7 +635,8 @@ void init_triton_tle_ir(py::module &&m) {
             auto coopKindAttr = getOptStrAttr(coopKind);
 
             self.create<tle::PutMemOrValueOp>(comm, teamKindAttr, peer,
-                                              coopKindAttr, value, putTypeAttr);
+                                              coopKindAttr, value, putTypeAttr,
+                                              Value(), Value());
           },
           py::arg("comm"), py::arg("peer"), py::arg("value"),
           py::arg("team_kind") = py::none(), py::arg("coop_kind") = py::none(),
