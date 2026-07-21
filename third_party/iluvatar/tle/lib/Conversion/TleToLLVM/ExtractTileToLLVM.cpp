@@ -202,9 +202,9 @@ lowerExtractTileViaSMEM(ExtractTileOp op, ExtractTileOp::Adaptor adaptor,
     Value coord = LLVM::UDivOp::create(rewriter, loc, i32Ty, dynIndex, sv);
     coord = LLVM::URemOp::create(rewriter, loc, i32Ty, coord, gv);
     Value strideV = LLVM::ConstantOp::create(
-        rewriter, loc, i32Ty,
-        rewriter.getI32IntegerAttr((int32_t)strides[d]));
-    tileStartVals[d] = LLVM::MulOp::create(rewriter, loc, i32Ty, coord, strideV);
+        rewriter, loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)strides[d]));
+    tileStartVals[d] =
+        LLVM::MulOp::create(rewriter, loc, i32Ty, coord, strideV);
     tileEndVals[d] =
         LLVM::AddOp::create(rewriter, loc, i32Ty, tileStartVals[d], tv);
   }

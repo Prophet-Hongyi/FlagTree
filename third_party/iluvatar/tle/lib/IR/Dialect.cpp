@@ -74,7 +74,8 @@ LogicalResult ExtractTileOp::verify() {
       return emitOpError("strides must be positive at dimension ") << i;
     if ((srcShape[i] - tileShape[i]) < 0 ||
         (srcShape[i] - tileShape[i]) % strides[i] != 0)
-      return emitOpError("(source - tile) must be divisible by stride at dimension ")
+      return emitOpError(
+                 "(source - tile) must be divisible by stride at dimension ")
              << i << " (source=" << srcShape[i] << ", tile=" << tileShape[i]
              << ", stride=" << strides[i] << ")";
     if (dstShape[i] != tileShape[i])
@@ -204,7 +205,8 @@ LogicalResult InsertTileOp::verify() {
       return emitOpError("strides must be positive at dimension ") << i;
     if ((srcShape[i] - tileShape[i]) < 0 ||
         (srcShape[i] - tileShape[i]) % strides[i] != 0)
-      return emitOpError("(source - tile) must be divisible by stride at dimension ")
+      return emitOpError(
+                 "(source - tile) must be divisible by stride at dimension ")
              << i << " (source=" << srcShape[i] << ", tile=" << tileShape[i]
              << ", stride=" << strides[i] << ")";
     logicalGridShape[i] = (srcShape[i] - tileShape[i]) / strides[i] + 1;
