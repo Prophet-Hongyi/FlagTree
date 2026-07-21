@@ -93,8 +93,9 @@ lowerInsertTileStatic(InsertTileOp op, InsertTileOp::Adaptor adaptor,
   SmallVector<int64_t> logicalTileShape(tileShape.begin(), tileShape.end());
   SmallVector<int64_t> logicalGridShape(srcShape.size(), 0);
   for (size_t i = 0; i < srcShape.size(); ++i) {
-    if (logicalTileShape[i] <= 0 || strides[i] <= 0 ||
-        (srcShape[i] - logicalTileShape[i]) < 0 ||
+    if (logicalTileShape[i] == 0 || strides[i] == 0)
+      return op.emitError("tile shape and strides must be non-zero");
+    if ((srcShape[i] - logicalTileShape[i]) < 0 ||
         (srcShape[i] - logicalTileShape[i]) % strides[i] != 0)
       return op.emitError("(source - tile) must be divisible by stride");
     logicalGridShape[i] = (srcShape[i] - logicalTileShape[i]) / strides[i] + 1;
@@ -356,9 +357,11 @@ struct InsertTileOpConversion : public ConvertOpToLLVMPattern<InsertTileOp> {
       return op.emitError("insert_tile only supports BlockedEncodingAttr");
 
     auto staticIndex = getStaticIndex(op);
-    if (staticIndex.has_value() && isCTATileAligned(op, staticIndex.value()))
-      return lowerInsertTileStatic(
-          op, adaptor, rewriter, this->getTypeConverter(), staticIndex.value());
+    if (staticIndex.has_value() && isCTATileAligned(op, staticIndex.value())) {
+      int64_t index = staticIndex.value();
+      return lowerInsertTileStatic(op, adaptor, rewriter,
+                                   this->getTypeConverter(), index);
+    }
 
     return lowerInsertTileViaSMEMDynamic(op, adaptor, rewriter,
                                          this->getTypeConverter(), targetInfo);

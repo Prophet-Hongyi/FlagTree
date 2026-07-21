@@ -29,11 +29,13 @@ static SmallVector<int64_t> getTileShape(ExtractTileOp op) {
 
 static SmallVector<int64_t> getStrides(ExtractTileOp op) {
   if (auto a = dyn_cast_or_null<DenseI64ArrayAttr>(op->getAttr("strides"))) {
-    SmallVector<int64_t> strides;
+    SmallVector<int64_t> s;
     for (auto v : a.asArrayRef())
-      strides.push_back(v);
-    return strides;
+      s.push_back(v);
+    return s;
   }
+  // Backwards compatibility: fall back to tile_shape when strides attribute is
+  // absent.
   return getTileShape(op);
 }
 
