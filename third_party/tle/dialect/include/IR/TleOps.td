@@ -1,26 +1,3 @@
-/*
- * Copyright 2025-     FlagOS Contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files
- * (the "Software"), to deal in the Software without restriction,
- * including without limitation the rights to use, copy, modify, merge,
- * publish, distribute, sublicense, and/or sell copies of the Software,
- * and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
- * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- */
-
 #ifndef TLE_RAW_OPS
 #define TLE_RAW_OPS
 
@@ -77,6 +54,22 @@ def Tle_InsertTileOp
     $src `[` $index `]` `=` $tile attr-dict `:` qualified(type($src)) `,` qualified(type($index)) `,` qualified(type($tile)) `->` qualified(type($result))
   }];
   let hasVerifier = 1;
+}
+
+def Tle_SetLayoutOp : Tle_Op<"gpu.set_layout", [
+    Pure,
+    SameOperandsAndResultShape,
+    SameOperandsAndResultElementType
+]> {
+  let summary = "Attach a requested distributed encoding to a tensor value";
+  let description = [{
+    Carries a user-requested TritonGPU distributed encoding through the TLE
+    frontend. The op is lowered during Triton-to-TritonGPU conversion, after
+    encoding propagation has selected legal layouts for dependent values.
+  }];
+  let arguments = (ins TT_Tensor:$src, AnyAttr:$target_encoding);
+  let results = (outs TT_Tensor:$result);
+  let assemblyFormat = "$src attr-dict `:` qualified(type($src)) `->` qualified(type($result))";
 }
 
 // End TLE-Lite

@@ -1,23 +1,3 @@
-# Copyright 2025-     FlagOS Contributors
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
 # flagtree tle
 import builtins
 import triton.language.core as tl
@@ -71,6 +51,27 @@ class pipeline(range):
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None):
         super().__init__(arg1, arg2, step, num_stages, loop_unroll_factor)
 
+@tl.builtin
+def set_layout(value, layout, _semantic=None):
+    """标注 TLE block tensor 的显式 TritonGPU 分布式编码,对应 tle.gpu.set_layout op。"""
+    layout = tl._unwrap_if_constexpr(layout)
+    if not hasattr(layout, "to_ir"):
+        raise ValueError(f"tle.gpu.set_layout expects a layout with to_ir(), got {type(layout)}")
+    if not isinstance(value, tl.tensor):
+        value = _semantic.to_tensor(value)
+    if not value.type.is_block():
+        raise ValueError("tle.gpu.set_layout only supports block tensors")
+    options = _semantic.builder.options
+    _semantic.builder.ensure_ttg_layout_attrs(
+        int(getattr(options, "num_warps")),
+        int(getattr(options, "warp_size", 32)),
+        int(getattr(options, "num_ctas", 1)),
+    )
+    target_encoding = layout.to_ir(_semantic.builder)
+    return tl.tensor(
+        _semantic.builder.create_tle_gpu_set_layout(value.handle, target_encoding),
+        value.type,
+    )
 
 class WarpSpecializeCallerContext:
 

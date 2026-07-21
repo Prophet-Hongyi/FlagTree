@@ -1,28 +1,3 @@
-/*
- * Copyright 2018-2020 Philippe Tillet
- * Copyright 2020-2022 OpenAI
- * Copyright 2025-     FlagOS Contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files
- * (the "Software"), to deal in the Software without restriction,
- * including without limitation the rights to use, copy, modify, merge,
- * publish, distribute, sublicense, and/or sell copies of the Software,
- * and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
- * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- */
-
 #if __has_include("flagtree_spec.h")
 #include "flagtree_spec.h"
 #endif
@@ -46,6 +21,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #ifdef __TLE__
 #include "tle/dialect/include/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Twine.h"
 #endif
 #include "llvm/Support/Debug.h"
 
@@ -59,6 +36,103 @@ namespace ttng = mlir::triton::nvidia_gpu;
 namespace mlir {
 
 using namespace triton;
+
+#ifdef __TLE__
+static constexpr const char *kTleExplicitEncodingAttrPrefix =
+    "tle.explicit_encoding.";
+static constexpr const char *kTleExplicitMemoryEncodingAttrName =
+    "tle.explicit_memory_encoding";
+
+std::string getTleExplicitEncodingAttrName(unsigned resultNumber) {
+  return (llvm::Twine(kTleExplicitEncodingAttrPrefix) +
+          llvm::Twine(resultNumber))
+      .str();
+}
+
+const char *getTleExplicitMemoryEncodingAttrName() {
+  return kTleExplicitMemoryEncodingAttrName;
+}
+
+Attribute getTleExplicitResultEncoding(Operation *op, unsigned resultNumber) {
+  return op->getAttr(getTleExplicitEncodingAttrName(resultNumber));
+}
+
+void setTleExplicitResultEncoding(Operation *op, unsigned resultNumber,
+                                  Attribute encoding) {
+  op->setAttr(getTleExplicitEncodingAttrName(resultNumber), encoding);
+}
+
+void setTleExplicitResultEncoding(OpResult result, Attribute encoding) {
+  setTleExplicitResultEncoding(result.getOwner(), result.getResultNumber(),
+                               encoding);
+}
+
+Attribute getTleExplicitMemoryEncoding(Operation *op) {
+  return op->getAttr(kTleExplicitMemoryEncodingAttrName);
+}
+
+void setTleExplicitMemoryEncoding(Operation *op, Attribute encoding) {
+  op->setAttr(kTleExplicitMemoryEncodingAttrName, encoding);
+}
+
+Attribute getTleExplicitValueEncoding(Value value) {
+  if (auto result = dyn_cast<OpResult>(value))
+    return getTleExplicitResultEncoding(result.getOwner(),
+                                        result.getResultNumber());
+  return nullptr;
+}
+
+static LogicalResult mergeTleExplicitMemoryEncoding(Operation *op, Value value,
+                                                    Attribute candidate,
+                                                    Attribute &encoding) {
+  if (!candidate)
+    return success();
+
+  if (auto tensorType = dyn_cast<RankedTensorType>(value.getType())) {
+    if (tensorType.getEncoding() != candidate)
+      return op->emitOpError("has explicit TLE encoding that does not match "
+                             "the tensor type encoding");
+  }
+
+  if (!encoding) {
+    encoding = candidate;
+    return success();
+  }
+
+  if (encoding == candidate)
+    return success();
+
+  op->emitOpError("has conflicting explicit TLE memory encodings:\n  ")
+      << encoding << "\nand\n  " << candidate;
+  return failure();
+}
+
+LogicalResult inferTleExplicitMemoryEncoding(Operation *op,
+                                             Attribute &encoding) {
+  encoding = getTleExplicitMemoryEncoding(op);
+
+  for (OpResult result : op->getResults()) {
+    if (failed(mergeTleExplicitMemoryEncoding(
+            op, result,
+            getTleExplicitResultEncoding(op, result.getResultNumber()),
+            encoding)))
+      return failure();
+  }
+
+  for (OpOperand &operand : op->getOpOperands()) {
+    if (failed(mergeTleExplicitMemoryEncoding(
+            op, operand.get(), getTleExplicitValueEncoding(operand.get()),
+            encoding)))
+      return failure();
+  }
+
+  return success();
+}
+
+bool isTleExplicitConvertLayoutOp(Operation *op) {
+  return isa<ttg::ConvertLayoutOp>(op) && getTleExplicitResultEncoding(op, 0);
+}
+#endif
 
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
@@ -1263,8 +1337,13 @@ Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op) {
   for (size_t i = 0; i < op->getNumResults(); i++) {
     Value newResult = newOp->getResult(i);
     if (newTypes[i] != op->getResultTypes()[i]) {
-      newResult = triton::gpu::ConvertLayoutOp::create(
+      auto convert = triton::gpu::ConvertLayoutOp::create(
           builder, op->getLoc(), op->getResult(i).getType(), newResult);
+      newResult = convert.getResult();
+#ifdef __TLE__
+      if (Attribute explicitEncoding = getTleExplicitResultEncoding(op, i))
+        convert->setAttr(getTleExplicitEncodingAttrName(0), explicitEncoding);
+#endif
     }
     op->getResult(i).replaceAllUsesWith(newResult);
   }

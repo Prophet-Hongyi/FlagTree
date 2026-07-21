@@ -1,28 +1,3 @@
-/*
- * Copyright 2018-2020 Philippe Tillet
- * Copyright 2020-2022 OpenAI
- * Copyright 2025-     FlagOS Contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files
- * (the "Software"), to deal in the Software without restriction,
- * including without limitation the rights to use, copy, modify, merge,
- * publish, distribute, sublicense, and/or sell copies of the Software,
- * and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
- * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- */
-
 #ifndef TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 #define TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 
@@ -33,6 +8,9 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <algorithm>
 #include <numeric>
+#ifdef __TLE__
+#include <string>
+#endif
 
 namespace mlir {
 class DominanceInfo;
@@ -83,6 +61,19 @@ bool isView(Operation *op);
 // Returns whether the op is a "noop op", i.e. has one input and one output
 // and lowers to llvm as the identity function (returns the input)
 bool isNoop(Operation *op);
+
+#ifdef __TLE__
+std::string getTleExplicitEncodingAttrName(unsigned resultNumber);
+const char *getTleExplicitMemoryEncodingAttrName();
+Attribute getTleExplicitResultEncoding(Operation *op, unsigned resultNumber);
+void setTleExplicitResultEncoding(Operation *op, unsigned resultNumber, Attribute encoding);
+void setTleExplicitResultEncoding(OpResult result, Attribute encoding);
+Attribute getTleExplicitMemoryEncoding(Operation *op);
+void setTleExplicitMemoryEncoding(Operation *op, Attribute encoding);
+Attribute getTleExplicitValueEncoding(Value value);
+LogicalResult inferTleExplicitMemoryEncoding(Operation *op, Attribute &encoding);
+bool isTleExplicitConvertLayoutOp(Operation *op);
+#endif
 
 /* Dump Triton IR in graphviz dot format.
  *
