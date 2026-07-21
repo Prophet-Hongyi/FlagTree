@@ -41,6 +41,8 @@ static std::optional<int64_t> getStaticIndex(InsertTileOp op) {
 static bool isCTATileAligned(InsertTileOp op, int64_t linearIndex) {
   auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
   auto tileTy = cast<RankedTensorType>(op.getTile().getType());
+  if (srcTy.getEncoding() != tileTy.getEncoding())
+    return false;
   auto srcShape = srcTy.getShape();
   auto tileShape = tileTy.getShape();
   auto strides = getStrides(op);
