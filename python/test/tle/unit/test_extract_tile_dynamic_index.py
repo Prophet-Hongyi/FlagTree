@@ -79,8 +79,15 @@ def test_simple_extract_kernel_cuda():
 
 @triton.jit
 def extract_tile_stride_dynamic_index_kernel(
-    x_ptr, out_ptr, index_ptr, M: tl.constexpr, N: tl.constexpr,
-    TM: tl.constexpr, TN: tl.constexpr, SM: tl.constexpr, SN: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    index_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    TM: tl.constexpr,
+    TN: tl.constexpr,
+    SM: tl.constexpr,
+    SN: tl.constexpr,
 ):
     offs_m = tl.arange(0, M)
     offs_n = tl.arange(0, N)
@@ -88,9 +95,7 @@ def extract_tile_stride_dynamic_index_kernel(
 
     idx_m = tl.load(index_ptr)
     idx_n = tl.load(index_ptr + 1)
-    tile = tle.extract_tile(
-        x, index=[idx_m, idx_n], tile_shape=[TM, TN], strides=(SM, SN)
-    )
+    tile = tle.extract_tile(x, index=[idx_m, idx_n], tile_shape=[TM, TN], strides=(SM, SN))
 
     tile_m = tl.arange(0, TM)
     tile_n = tl.arange(0, TN)
@@ -110,9 +115,7 @@ def test_extract_tile_with_dynamic_stride_index():
     out = torch.empty((TM, TN), device="cuda", dtype=torch.float32)
     index = torch.tensor([idx_m, idx_n], device="cuda", dtype=torch.int32)
 
-    extract_tile_stride_dynamic_index_kernel[(1, )](
-        x, out, index, M, N, TM, TN, SM, SN
-    )
+    extract_tile_stride_dynamic_index_kernel[(1, )](x, out, index, M, N, TM, TN, SM, SN)
 
     start_m = idx_m * SM
     start_n = idx_n * SN

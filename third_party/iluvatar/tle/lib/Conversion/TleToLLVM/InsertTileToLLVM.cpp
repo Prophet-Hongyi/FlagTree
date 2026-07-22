@@ -307,10 +307,10 @@ lowerInsertTileViaSMEMDynamic(InsertTileOp op, InsertTileOp::Adaptor adaptor,
           rewriter.getI32IntegerAttr((int32_t)tileShape[d]));
       // Convert to a tile-relative coordinate.  globalCoord % tileShape is
       // wrong when an explicit stride places the tile off tile-shape alignment.
-      Value tileRelativeV = LLVM::SubOp::create(
-          rewriter, loc, i32Ty, globalCoordV, tileStartVals[d]);
-      Value tileLocalSafeV = LLVM::URemOp::create(
-          rewriter, loc, i32Ty, tileRelativeV, tileShapeV);
+      Value tileRelativeV = LLVM::SubOp::create(rewriter, loc, i32Ty,
+                                                globalCoordV, tileStartVals[d]);
+      Value tileLocalSafeV =
+          LLVM::URemOp::create(rewriter, loc, i32Ty, tileRelativeV, tileShapeV);
       Value sb = LLVM::ConstantOp::create(
           rewriter, loc, i32Ty,
           rewriter.getI32IntegerAttr((int32_t)(smemStrides[d] * elemBytes)));
