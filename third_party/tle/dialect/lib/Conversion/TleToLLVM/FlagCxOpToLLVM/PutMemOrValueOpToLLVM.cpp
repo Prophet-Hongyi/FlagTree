@@ -18,6 +18,8 @@
 namespace {
 using namespace mlir;
 namespace tle = mlir::triton::tle;
+namespace triton = mlir::triton;
+namespace ttg = mlir::triton::gpu;
 
 Value getDistDevicePtr(tle::PutMemOrValueOp op, SmallVector<Value> &srcElems) {
   if (!srcElems.empty())
@@ -48,9 +50,12 @@ struct PutMemOrValueOpConversion
     auto coopKind = tle::getTeamKindValue(op.getCoopKindAttr());
     auto putType = op.getPutTypeAttr();
     auto value = op.getValue();
-    auto dst = op.getDst();
-    auto dstOffset = op.getDstOffset();
-    llvm::errs() << "[PutMemOrValueOpConversion]" << comm << teamKind << "\n";
+    // auto dst = op.getDst();
+    // auto dstOffset = op.getDstOffset();
+    auto pid = rewriter.create<triton::GetProgramIdOp>(
+        loc, rewriter.getI32Type(), triton::ProgramIDDim::X);
+
+    llvm::errs() << "[PutMemOrValueOpConversion]" << pid << "\n";
     // tle::getPutsFuncCall(loc, rewriter, comm,
     //                          teamKind, peer, Value dst,
     //                          size_t dstOffset, value, coopKind,

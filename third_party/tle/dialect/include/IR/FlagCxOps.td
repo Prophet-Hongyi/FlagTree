@@ -83,8 +83,11 @@ def Tle_PutMemOrValueOp : Tle_Op<"put_mem_op"> {
     OptionalAttr<StrAttr>:$coop_kind,
     Tle_PutValueType:$value,
     OptionalAttr<StrAttr>:$put_type,
-    Tle_PutValueType:$dst,
-    TT_Int:$dst_offset
+    Optional<Tle_PutValueType>:$dst,
+    Optional<TT_Int>:$dst_offset
   );
+  let traits = [
+    AttrSizedOperandSegments
+  ];
 
 }
