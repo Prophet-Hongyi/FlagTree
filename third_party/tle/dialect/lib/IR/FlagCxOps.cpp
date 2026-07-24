@@ -30,6 +30,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringSwitch.h"
 #include <cctype>
 #include <limits>
 
@@ -131,6 +132,44 @@ LogicalResult DeviceIntraBarrierOp::verify() {
           "Relaxed(0), Acquire(1), Release(2), AcqRel(3)");
     }
   }
+
+  return success();
+}
+
+LogicalResult SignalOp::verify() {
+  StringRef signalOp = getSignalOpAttr().getValue();
+  bool validSignalOp = llvm::StringSwitch<bool>(signalOp)
+                           .Case("inc", true)
+                           .Case("add", true)
+                           .Default(false);
+  if (!validSignalOp)
+    return emitOpError("invalid signal_op '")
+           << signalOp << "', expected one of: inc, add";
+
+  switch (static_cast<TeamKind>(getTeamKindAttr().getInt())) {
+  case TeamKind::Intra:
+  case TeamKind::Inter:
+  case TeamKind::World:
+    break;
+  default:
+    return emitOpError("invalid team_kind (")
+           << getTeamKindAttr().getInt()
+           << "), expected one of: Intra(0), Inter(1), World(2)";
+  }
+
+  switch (static_cast<CoopKind>(getCoopKindAttr().getInt())) {
+  case CoopKind::Thread:
+  case CoopKind::Warp:
+  case CoopKind::Block:
+    break;
+  default:
+    return emitOpError("invalid coop_kind (")
+           << getCoopKindAttr().getInt()
+           << "), expected one of: Thread(0), Warp(1), Block(2)";
+  }
+
+  if (getContextIdxAttr().getInt() < 0)
+    return emitOpError("context_idx must be non-negative");
 
   return success();
 }
