@@ -921,10 +921,32 @@ LogicalResult DistributedBarrierOp::verify() {
 
 LogicalResult RemotePointersOp::verify() {
   auto spaceAttr = getSpace();
-  if (spaceAttr == "device") {
+  if (spaceAttr != "cluster" && spaceAttr != "device" &&
+      spaceAttr != "node")
+    return emitOpError() << "expects space to be cluster, device, or node";
+
+  const bool isDevice = spaceAttr == "device";
+  const bool isNode = spaceAttr == "node";
+  const bool hasSrc = getSrc() != nullptr;
+  const bool hasComm = getComm() != nullptr;
+
+  if (isDevice) {
+    if (hasComm)
+      return emitOpError()
+             << "comm is only supported for node space remote pointers";
     if (failed(RemotePointers::verifyDeviceSpace(getSrc(), getResult())))
       return failure();
+  } else if (isNode) {
+    if (failed(RemotePointers::verifyNodeSpace(getOperation(), getSrc(),
+                                                getComm(), getResult())))
+      return failure();
   } else {
+    if (!hasSrc)
+      return emitOpError() << "cluster space remote pointers require src";
+    if (hasComm)
+      return emitOpError()
+             << "comm is only supported for node space remote pointers";
+
     Type srcTy = getSrc().getType();
     Type resultTy = getResult().getType();
     auto getPtrInfo = [&](Type ty, triton::PointerType &ptr, bool &isTensor,
@@ -997,13 +1019,14 @@ LogicalResult RemotePointersOp::verify() {
     return emitOpError() << "expects shard_id to be i32";
 
   bool hasOffset = getOffset() != nullptr;
-  if (spaceAttr == "device") {
+  if (isDevice || isNode) {
     if (!hasOffset)
-      return emitOpError() << "device space remote pointers require an offset";
-  } else {
-    if (hasOffset)
       return emitOpError()
-             << "offset is only supported for device space remote pointers";
+             << "device/node space remote pointers require an offset";
+  } else if (hasOffset) {
+    return emitOpError()
+           << "offset is only supported for device or node space remote "
+              "pointers";
   }
 
   if (hasOffset) {

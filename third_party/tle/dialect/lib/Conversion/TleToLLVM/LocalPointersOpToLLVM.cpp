@@ -106,6 +106,32 @@ static LLVM::LLVMFuncOp getOrInsertGetPeerPointer(ModuleOp module,
   return func;
 }
 
+// Scalar-IR ABI from flagcx_device_scalar_ir.h:
+//   void *flagcxGetPeerPointerS(const void *mem, size_t offset,
+//                               const void *comm, flagcxTeamKind_t teamKind,
+//                               int peer);
+// Keep the enum value local so the compiler does not depend on FlagCX headers.
+constexpr int kFlagcxTeamWorld = 2;
+
+static LLVM::LLVMFuncOp getOrInsertGetPeerPointerS(ModuleOp module,
+                                                   MLIRContext *ctx) {
+  const char *funcName = "flagcxGetPeerPointerS";
+  if (auto func = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName))
+    return func;
+
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto i64Ty = IntegerType::get(ctx, 64);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto funcType = LLVM::LLVMFunctionType::get(
+      ptrTy, {ptrTy, i64Ty, ptrTy, i32Ty, i32Ty}, false);
+
+  OpBuilder builder(module.getBodyRegion());
+  auto func =
+      builder.create<LLVM::LLVMFuncOp>(module.getLoc(), funcName, funcType);
+  func.setLinkage(LLVM::Linkage::External);
+  return func;
+}
+
 struct LocalPointersOpConversion
     : public ConvertOpToLLVMPattern<tle::LocalPointersOp> {
   LocalPointersOpConversion(LLVMTypeConverter &typeConverter,
@@ -468,11 +494,71 @@ LogicalResult lowerDeviceSpace(Location loc, Value mem_ptr,
   return success();
 }
 
-LogicalResult lowerNodeSpace(Location loc, ValueRange srcElems,
-                             ValueRange shardElems,
+LogicalResult lowerNodeSpace(Location loc, Value memPtrInt, Value commPtrInt,
+                             ValueRange shardElems, Value offsetVal,
+                             int elemBytes,
                              ConversionPatternRewriter &rewriter,
                              SmallVectorImpl<Value> &resultPtrs) {
-  return failure(); // Not implemented yet
+  ModuleOp module =
+      rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
+  if (!module)
+    return failure();
+
+  if (shardElems.size() != 1 || !shardElems.front().getType().isInteger(32))
+    return failure();
+  if (!offsetVal)
+    return failure();
+
+  auto memIntTy = dyn_cast<IntegerType>(memPtrInt.getType());
+  auto commIntTy = dyn_cast<IntegerType>(commPtrInt.getType());
+  if (!memIntTy || memIntTy.getWidth() != 64 || !commIntTy ||
+      commIntTy.getWidth() != 64)
+    return failure();
+
+  auto *ctx = rewriter.getContext();
+  auto i64Ty = rewriter.getI64Type();
+  auto genericPtrTy = LLVM::LLVMPointerType::get(ctx);
+  auto globalPtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+
+  Value offsetI64;
+  if (offsetVal.getType() == i64Ty) {
+    offsetI64 = offsetVal;
+  } else if (auto offsetIntTy = dyn_cast<IntegerType>(offsetVal.getType())) {
+    if (offsetIntTy.getWidth() < 64)
+      offsetI64 = rewriter.create<arith::ExtSIOp>(loc, i64Ty, offsetVal);
+    else
+      offsetI64 = rewriter.create<arith::TruncIOp>(loc, i64Ty, offsetVal);
+  } else {
+    return failure();
+  }
+
+  Value byteOffset = offsetI64;
+  if (elemBytes != 1) {
+    Value elemBytesVal =
+        rewriter.create<arith::ConstantIntOp>(loc, elemBytes, 64);
+    byteOffset = rewriter.create<arith::MulIOp>(loc, offsetI64, elemBytesVal);
+  }
+
+  Value memPtr =
+      rewriter.create<LLVM::IntToPtrOp>(loc, genericPtrTy, memPtrInt);
+  Value commPtr =
+      rewriter.create<LLVM::IntToPtrOp>(loc, genericPtrTy, commPtrInt);
+  // `space="node"` uses a world rank, which is already the rank
+  // representation expected by FLAGCX_TEAM_WORLD (stride == 1).
+  Value worldTeamKind = rewriter.create<arith::ConstantIntOp>(
+      loc, kFlagcxTeamWorld, 32);
+
+  auto getPeerPointer = getOrInsertGetPeerPointerS(module, ctx);
+  auto peerCall = rewriter.create<LLVM::CallOp>(
+      loc, TypeRange{getPeerPointer.getFunctionType().getReturnType()},
+      FlatSymbolRefAttr::get(getPeerPointer),
+      ValueRange{memPtr, byteOffset, commPtr, worldTeamKind,
+                 shardElems.front()});
+
+  Value peerPtr = peerCall.getResult();
+  resultPtrs.push_back(
+      rewriter.create<LLVM::AddrSpaceCastOp>(loc, globalPtrTy, peerPtr));
+  return success();
 }
 
 Value getDistDevicePtr(tle::RemotePointersOp op, SmallVector<Value> &srcElems) {
@@ -502,6 +588,10 @@ struct RemotePointersOpConversion
 
     SmallVector<Value> srcElems;
     auto space = adaptor.getSpace();
+
+    SmallVector<Value> commElems;
+    if (auto comm = adaptor.getComm())
+      commElems = unpackLLElements(loc, comm, rewriter);
 
     if (auto src = adaptor.getSrc())
       srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
@@ -550,7 +640,19 @@ struct RemotePointersOpConversion
         return rewriter.notifyMatchFailure(op, "device lowering failed");
       }
     } else if (space == "node") {
-      if (failed(lowerNodeSpace(loc, mem, shardElems, rewriter, mappedPtrs))) {
+      if (commElems.size() != 1)
+        return reportFailure("node lowering requires one communicator handle");
+      if (!offsetVal)
+        return reportFailure("node lowering requires an offset");
+      Type resultPointeeTy = getRemotePointeeType(op.getType());
+      if (!resultPointeeTy)
+        return reportFailure("result must be tt.ptr or tensor<tt.ptr>");
+      auto elemBits = getScalarBitWidth(resultPointeeTy);
+      if (!elemBits.has_value())
+        return reportFailure("result pointee type must be scalar int or float");
+      int elemBytes = elemBits.value() / 8;
+      if (failed(lowerNodeSpace(loc, mem, commElems.front(), shardElems,
+                                offsetVal, elemBytes, rewriter, mappedPtrs))) {
         return rewriter.notifyMatchFailure(op, "node lowering failed");
       }
     } else {

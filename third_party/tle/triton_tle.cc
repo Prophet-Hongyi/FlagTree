@@ -602,7 +602,8 @@ void init_triton_tle_ir(py::module &&m) {
           "create_remote_pointers",
           [](TritonOpBuilder &self, Type resultTy, std::optional<Value> &src,
              Value shardId, const std::string &space,
-             std::optional<Value> &offset) -> OpState {
+             std::optional<Value> &offset,
+             std::optional<Value> &comm) -> OpState {
             auto &builder = self.getBuilder();
             static const std::unordered_set<std::string> valid = {
                 "cluster", "device", "node"};
@@ -615,10 +616,11 @@ void init_triton_tle_ir(py::module &&m) {
 
             return self.create<tle::RemotePointersOp>(
                 resultTy, src.value_or(Value()), shardId, space_attr,
-                offset.value_or(Value()));
+                offset.value_or(Value()), comm.value_or(Value()));
           },
           py::arg("resultTy"), py::arg("src") = py::none(), py::arg("shardId"),
-          py::arg("space"), py::arg("offset") = py::none())
+          py::arg("space"), py::arg("offset") = py::none(),
+          py::arg("comm") = py::none())
       .def("get_device_id",
            [](TritonOpBuilder &self, Type resultTy,
               std::optional<Value> src) -> Value {

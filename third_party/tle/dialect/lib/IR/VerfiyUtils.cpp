@@ -51,6 +51,25 @@ llvm::LogicalResult verifyDeviceSpace(mlir::Value src, mlir::Value result) {
   }
   return success();
 }
+
+llvm::LogicalResult verifyNodeSpace(mlir::Operation *op, mlir::Value src,
+                                    mlir::Value comm, mlir::Value result) {
+  if (!src)
+    return op->emitOpError() << "node space remote pointers require dev_mem";
+  if (!comm)
+    return op->emitOpError() << "node space remote pointers require dev_comm";
+  if (!src.getType().isSignlessInteger(64))
+    return op->emitOpError() << "node space dev_mem must be a scalar i64";
+  if (!comm.getType().isSignlessInteger(64))
+    return op->emitOpError() << "node space dev_comm must be a scalar i64";
+
+  auto resultPtrTy = dyn_cast<triton::PointerType>(result.getType());
+  if (!resultPtrTy || resultPtrTy.getAddressSpace() != 1)
+    return op->emitOpError()
+           << "node space result must be a global tt.ptr (addrspace=1)";
+
+  return success();
+}
 } // namespace RemotePointers
 
 namespace DistributedBarrier {

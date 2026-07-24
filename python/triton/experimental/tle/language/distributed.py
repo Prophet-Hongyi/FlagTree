@@ -837,7 +837,7 @@ def _create_remote_pointers_tensor(
         raise RuntimeError("remote pointer lowering requires TLE remote_pointers support in the active Triton build")
     if not isinstance(space, str):
         space = tl._unwrap_if_constexpr(space)
-    if space == "device":
+    if space in ("device", "node"):
         dtype = dtype
     else:
         dtype = tensor.dtype.element_ty if dtype is None else dtype
@@ -845,35 +845,43 @@ def _create_remote_pointers_tensor(
     remote_ptr_dtype = tl.pointer_type(*{
         "cluster": (dtype, 7),
         "device": (dtype, 1),
+        "node": (dtype, 1),
     }.get(space))
     if space == 'cluster' and tensor and tensor.type.is_block():
         remote_type = tl.block_type(remote_ptr_dtype, list(tensor.shape)).to_ir(builder)
     else:
         remote_type = remote_ptr_dtype.to_ir(builder)
 
-    if space != "device" and offset is not None:
-        raise ValueError(f"offset is only supported for device space remote pointers, got space={space!r}")
+    if space not in ("device", "node") and offset is not None:
+        raise ValueError(
+            f"offset is only supported for device or node space remote pointers, got space={space!r}"
+        )
 
-    if space == "device":
+    if space in ("device", "node"):
         if offset is None:
-            raise ValueError("device space remote pointers require an offset")
+            raise ValueError(f"{space} space remote pointers require an offset")
         offset_tensor = offset if isinstance(offset, tl.tensor) else _semantic.to_tensor(offset)
         if not offset_tensor.dtype.is_int():
             raise TypeError(f"offset must be an integer scalar, got {offset_tensor.dtype}")
-        # flagcxGetIntraPointerC accepts a single int64_t offset, so only
-        # scalar offsets (shape == ()) are allowed. Non-scalar tensor offsets
-        # are rejected here before reaching the C++ builder.
+        # The FlagCX C-path pointer wrappers accept one int64_t element offset.
+        # Non-scalar values are rejected before reaching the IR builder.
         if offset_tensor.shape != ():
             raise ValueError(f"offset must be a scalar integer, got shape {offset_tensor.shape}")
-        # Normalize to i64 to match the MLIR verifier expectation.
-        # Use tl.cast with explicit _semantic because .to() is a builtin and
-        # must receive _semantic when called outside the JIT compiler's
-        # automatic injection (e.g. inside this helper).
         if offset_tensor.dtype != tl.int64:
             offset_tensor = tl.cast(offset_tensor, tl.int64, _semantic=_semantic)
+
         ptr = _parse_src_arg(builder, tensor, 0)
-        remote_op = builder.create_remote_pointers(remote_type, ptr, shard_id_tensor.handle, space,
-                                                   offset_tensor.handle)
+        if space == "node":
+            comm = _parse_src_arg(builder, tensor, 1)
+            if ptr is None or comm is None:
+                raise ValueError("node space remote pointers require initialized dev_mem and dev_comm handles")
+            remote_op = builder.create_remote_pointers(
+                remote_type, ptr, shard_id_tensor.handle, space, offset_tensor.handle, comm
+            )
+        else:
+            remote_op = builder.create_remote_pointers(
+                remote_type, ptr, shard_id_tensor.handle, space, offset_tensor.handle
+            )
     else:
         remote_op = builder.create_remote_pointers(remote_type, tensor.handle, shard_id_tensor.handle, space)
     if space == "cluster" and tensor and tensor.type.is_block():
@@ -909,7 +917,24 @@ def _check_device_remote_pointer(tensor: tl.tensor, shard_id: int | tuple[int, .
 
 def _check_node_remote_pointer(tensor: tl.tensor, shard_id: int | tuple[int, ...] | list[int],
                                scope: device_mesh | None) -> None:
-    ...
+    from triton.runtime import DistributedRtContext
+
+    tensor = tl._unwrap_if_constexpr(tensor)
+    if not isinstance(tensor, DistributedRtContext):
+        raise TypeError(
+            "node space remote pointers require a DistributedRtContext returned by "
+            "tle.create_dist_tensor(buffer)"
+        )
+    if tensor[0] is None or tensor[1] is None:
+        raise ValueError(
+            "node space remote pointers require initialized dev_mem and dev_comm handles"
+        )
+
+    shard_id = tl._unwrap_if_constexpr(shard_id)
+    if isinstance(shard_id, (tuple, list)):
+        raise TypeError(
+            "node space shard_id must be one world-rank scalar, not a coordinate tuple"
+        )
 
 
 def _remote_pointer(
@@ -968,15 +993,19 @@ def remote(
     - tl.tensor shared-memory pointer (scalar or tensor): returns remote
       pointer directly.
 
-    `shard_id` is the target block id inside the current thread block cluster.
-    When `scope` is provided, launch cluster dimensions are inferred from that
-    mesh and this mode requires `num_ctas=1` (one program maps to one block).
+    For cluster access, `shard_id` is the target block id inside the current
+    thread block cluster. When `scope` is provided, launch cluster dimensions
+    are inferred from that mesh and this mode requires `num_ctas=1`.
 
-    `offset` is an optional scalar element offset relative to the target
-    shard's memory base address. It is only supported for `space="device"`
-    and is internally converted to a byte offset before being passed to
-    `flagcxGetIntraPointerC`. It may be a Python `int` (compile-time constant)
-    or a scalar `tl.tensor` (runtime value, shape == ()).
+    `space="device"` interprets `shard_id` as an intra-node rank.
+    `space="node"` requires the `DistributedRtContext` returned by
+    `tle.create_dist_tensor(buffer)`; its `shard_id` is one scalar target
+    world rank, so same-node targets also work through the World team path.
+
+    `offset` is a required scalar element offset for device and node access.
+    It is converted to a byte offset before calling the FlagCX C-path pointer
+    wrapper. It may be a Python `int` (compile-time constant) or a scalar
+    `tl.tensor` (runtime value, shape == ()).
     """
     shard_id = tl._unwrap_if_constexpr(shard_id)
     scope = tl._unwrap_if_constexpr(scope)
