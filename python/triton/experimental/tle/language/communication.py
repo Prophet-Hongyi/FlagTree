@@ -188,20 +188,8 @@ def init_communicator():
     _init_communicator_ = True
 
 
-def create_dist_tensor(buf_tensor, signal_count=0):
-    """Create a distributed context for ``buf_tensor``.
-
-    ``signal_count`` reserves incoming FlagCX signal slots. It must be greater
-    than the largest signal id used by :func:`tle.signal`.
-    """
-
+def create_dist_tensor(buf_tensor):
     global comm, rank, dev_mem, dev_comm, win
-    if isinstance(signal_count, bool) or not isinstance(signal_count, int):
-        raise TypeError(f"signal_count must be int, got {type(signal_count).__name__}")
-    if signal_count < 0:
-        raise ValueError(f"signal_count must be >= 0, got {signal_count}")
-    if signal_count > 0x7FFFFFFF:
-        raise ValueError(f"signal_count must be in int32 range, got {signal_count}")
     buf_ptr = buf_tensor.data_ptr()
     buf_size = buf_tensor.numel() * buf_tensor.element_size()
 
@@ -219,7 +207,7 @@ def create_dist_tensor(buf_tensor, signal_count=0):
     reqs.intraLLA2ASlotCount = 0
     reqs.interForceEnable = False
     reqs.interContextCount = 4
-    reqs.interSignalCount = signal_count
+    reqs.interSignalCount = 0
     reqs.interCounterCount = 0
 
     dev_comm = flagcx.flagcxDevCommCreate(comm, reqs)
