@@ -79,3 +79,26 @@ def Tle_DeviceIntraBarrierOp : Tle_Op<"device intra barrier"> {
 
   let hasVerifier = 1;
 }
+
+def Tle_SignalOp : Tle_Op<"signal", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Atomically update a remote FlagCX signal slot";
+  let description = [{
+    Obtains a pre-allocated FlagCX network context from `comm`, then either
+    increments the selected remote signal slot by one or adds `value` to it.
+    This operation only sends a signal; it does not transfer user data or wait
+    for the remote signal to reach a value.
+  }];
+
+  let arguments = (ins
+    Tle_LocalPointerResultType:$comm,
+    I32:$peer,
+    I32:$signal_id,
+    I64:$value,
+    StrAttr:$signal_op,
+    I32Attr:$team_kind,
+    I32Attr:$coop_kind,
+    I32Attr:$context_idx
+  );
+
+  let hasVerifier = 1;
+}
