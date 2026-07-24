@@ -118,6 +118,7 @@ _SIGNAL_COOP_KINDS = {
     GroupKind.BLOCK.value: 2,
 }
 
+
 # 检查 value 的数据类型和范围
 def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl.tensor:
     value = tl._unwrap_if_constexpr(value)
@@ -155,6 +156,7 @@ def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl
 # scope 表示选择哪个 FlagCX 通信 team，也决定 peer 是在哪个通信范围内解释的
 # 比如 intra_node 单机多卡节点内， inter_node 多机多卡节点间， world 全局参与
 # group_kind 表示由哪个层级的线程组协作执行 signal 操作, 例如 thread、warp、block 等待
+
 
 # _semantic=None，这是 Triton 内建函数内部使用的语义上下文，主要提供
 # _semantic.builder 和
@@ -202,25 +204,19 @@ def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = 
         raise TypeError(f"context_idx must be a compile-time int, got {type(context_idx).__name__}")
     if context_idx < 0 or context_idx > 0x7FFFFFFF:
         raise ValueError(f"context_idx must be in int32 range, got {context_idx}")
-    
+
     # 保证peer、signal_id、value 在这之后被转换成为 对应数据类型 的 tl.tensor 0 维张量
     peer_tensor = _normalize_signal_scalar(peer, "peer", tl.int32, _semantic)
     signal_tensor = _normalize_signal_scalar(signal_id, "signal_id", tl.uint32, _semantic)
     value_tensor = _normalize_signal_scalar(value, "value", tl.uint64, _semantic)
     comm = _parse_src_arg(builder, device_dptr, 1)
-    builder.create_signal(
-        comm,
-        peer_tensor.handle,
-        signal_tensor.handle,
-        value_tensor.handle,
-        signal_op,    #编译期已知
-        _SIGNAL_TEAM_KINDS[signal_scope],  # 编译期已知
-        _SIGNAL_COOP_KINDS[group_kind],    # 编译期已知
-        context_idx,       # 编译期已知
-    )
+    builder.create_signal(comm, peer_tensor.handle, signal_tensor.handle, value_tensor.handle, signal_op,  #编译期已知
+                          _SIGNAL_TEAM_KINDS[signal_scope],  # 编译期已知
+                          _SIGNAL_COOP_KINDS[group_kind],  # 编译期已知
+                          context_idx,  # 编译期已知
+                          )
     return None
 
-    
 
 @dataclass
 class MeshConfig:
