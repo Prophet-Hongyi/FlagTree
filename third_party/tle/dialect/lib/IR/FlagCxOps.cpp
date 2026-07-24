@@ -53,6 +53,12 @@ enum class MemoryOrder : int32_t {
   AcqRel = 3,
 };
 
+enum class TeamKind : int32_t {
+  Intra = 0,
+  Inter = 1,
+  World = 2,
+};
+
 namespace mlir::triton::tle {
 
 LogicalResult GetLocalRankOp::verify() {
