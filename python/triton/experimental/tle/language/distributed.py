@@ -102,6 +102,126 @@ class GroupKind(str, Enum):
     GRID = "grid"
 
 
+# 私有字典
+_SIGNAL_TEAM_KINDS = {
+    "intra": 0,
+    "intra_node": 0,
+    "device": 0,
+    "inter": 1,
+    "inter_node": 1,
+    "world": 2,
+}
+
+_SIGNAL_COOP_KINDS = {
+    GroupKind.THREAD.value: 0,
+    GroupKind.WARP.value: 1,
+    GroupKind.BLOCK.value: 2,
+}
+
+# 检查 value 的数据类型和范围
+def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl.tensor:
+    value = tl._unwrap_if_constexpr(value)
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer scalar, got bool")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+        limits = {
+            tl.int32: 0x7FFFFFFF,
+            tl.uint32: 0xFFFFFFFF,
+            tl.uint64: 0xFFFFFFFFFFFFFFFF,
+        }
+        if value > limits[dtype]:
+            raise ValueError(f"{name} {value} exceeds {dtype} range")
+
+    value_tensor = value if isinstance(value, tl.tensor) else _semantic.to_tensor(value)
+    if not isinstance(value_tensor, tl.tensor) or not value_tensor.dtype.is_int():
+        raise TypeError(f"{name} must be an integer scalar, got {type(value).__name__}")
+    if value_tensor.shape != ():
+        raise ValueError(f"{name} must be a scalar integer, got shape {value_tensor.shape}")
+    if value_tensor.dtype != dtype:
+        value_tensor = tl.cast(value_tensor, dtype, _semantic=_semantic)
+    return value_tensor
+
+
+# 这里有一个 context_idx 选择预分配的 network context
+# device_dptr表示设备侧的分布式通信上下文指针，可以理解为
+# 当前 Triton Kernel 用来访问 FlagCX 通信器的设备端句柄
+# signal_id 表示远端 peer 上要更新哪个 signal 槽位
+# value=1 表示执行 add 操作时要增加的数值
+# op ="inc" 或者 "add"， 是 inc 时 value 固定增加 1，
+# 这时调用者通常不用传 value
+# op = "add" 时 value 明确表示增加量：
+# scope 表示选择哪个 FlagCX 通信 team，也决定 peer 是在哪个通信范围内解释的
+# 比如 intra_node 单机多卡节点内， inter_node 多机多卡节点间， world 全局参与
+# group_kind 表示由哪个层级的线程组协作执行 signal 操作, 例如 thread、warp、block 等待
+
+# _semantic=None，这是 Triton 内建函数内部使用的语义上下文，主要提供
+# _semantic.builder 和
+# _semantic.to_tensor(...)
+@tl.builtin
+def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = "intra_node",
+           group_kind: str | GroupKind = GroupKind.BLOCK, context_idx: int = 0, _semantic=None):
+    """Atomically update a signal slot owned by a remote FlagCX peer.
+
+    ``op="inc"`` increments the selected slot by one. ``op="add"`` adds
+    ``value``. The primitive only sends a signal; it neither transfers data nor
+    waits for completion on the receiving peer.
+
+    ``scope`` selects the FlagCX team (``intra_node``, ``inter_node``, or
+    ``world``), while ``peer`` is a rank within that team. ``context_idx``
+    selects a pre-allocated FlagCX network context. Signal storage must be
+    reserved when creating the distributed context, for example with
+    ``tle.create_dist_tensor(tensor, signal_count=4)`` for signal ids 0..3.
+
+    For ``group_kind="block"`` (the default), every thread in the CTA must
+    execute this operation convergently; the group collectively emits one
+    remote update. FlagCX S-Path signal supports thread, warp, and block groups.
+    """
+    builder = _semantic.builder
+    if not hasattr(builder, "create_signal"):
+        raise NotImplementedError("tle.signal requires rebuilt TLE builder support")
+
+    signal_op = str(tl._unwrap_if_constexpr(op)).lower()
+    if signal_op not in ("inc", "add"):
+        raise ValueError(f"op must be 'inc' or 'add', got {signal_op!r}")
+
+    signal_scope = str(tl._unwrap_if_constexpr(scope)).lower()
+    if signal_scope not in _SIGNAL_TEAM_KINDS:
+        expected = "intra_node, inter_node, or world"
+        raise ValueError(f"scope must be {expected}, got {signal_scope!r}")
+
+    group_kind = tl._unwrap_if_constexpr(group_kind)
+    group_kind = group_kind.value if isinstance(group_kind, GroupKind) else str(group_kind).lower()
+    if group_kind not in _SIGNAL_COOP_KINDS:
+        expected = "thread, warp, or block"
+        raise ValueError(f"group_kind must be {expected}, got {group_kind!r}")
+
+    context_idx = tl._unwrap_if_constexpr(context_idx)
+    if not isinstance(context_idx, int):
+        raise TypeError(f"context_idx must be a compile-time int, got {type(context_idx).__name__}")
+    if context_idx < 0 or context_idx > 0x7FFFFFFF:
+        raise ValueError(f"context_idx must be in int32 range, got {context_idx}")
+    
+    # 保证peer、signal_id、value 在这之后被转换成为 对应数据类型 的 tl.tensor 0 维张量
+    peer_tensor = _normalize_signal_scalar(peer, "peer", tl.int32, _semantic)
+    signal_tensor = _normalize_signal_scalar(signal_id, "signal_id", tl.uint32, _semantic)
+    value_tensor = _normalize_signal_scalar(value, "value", tl.uint64, _semantic)
+    comm = _parse_src_arg(builder, device_dptr, 1)
+    builder.create_signal(
+        comm,
+        peer_tensor.handle,
+        signal_tensor.handle,
+        value_tensor.handle,
+        signal_op,    #编译期已知
+        _SIGNAL_TEAM_KINDS[signal_scope],  # 编译期已知
+        _SIGNAL_COOP_KINDS[group_kind],    # 编译期已知
+        context_idx,       # 编译期已知
+    )
+    return None
+
+    
+
 @dataclass
 class MeshConfig:
     """
