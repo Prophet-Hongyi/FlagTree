@@ -559,6 +559,22 @@ void init_triton_tle_ir(py::module &&m) {
           py::arg("space"), py::arg("group_kind"), py::arg("order"),
           py::arg("barrier_kind"))
       .def(
+          "create_signal",
+          [](TritonOpBuilder &self, Value comm, Value peer, Value signalId,
+             Value value, const std::string &signalOp, int32_t teamKind,
+             int32_t coopKind, int32_t contextIdx) -> void {
+            auto &builder = self.getBuilder();
+            self.create<tle::SignalOp>(comm, peer, signalId, value,
+                                       builder.getStringAttr(signalOp),
+                                       builder.getI32IntegerAttr(teamKind),
+                                       builder.getI32IntegerAttr(coopKind),
+                                       builder.getI32IntegerAttr(contextIdx));
+          },
+          py::arg("comm"), py::arg("peer"), py::arg("signal_id"),
+          py::arg("value"), py::arg("signal_op"), py::arg("team_kind"),
+          py::arg("coop_kind"), py::arg("context_idx"),
+          "Create a standalone remote FlagCX signal operation")
+      .def(
           "create_distributed_barrier",
           [](TritonOpBuilder &self, const std::string &groupKind,
              const std::vector<int32_t> &groupShape,
