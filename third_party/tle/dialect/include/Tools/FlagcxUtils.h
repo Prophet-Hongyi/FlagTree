@@ -44,4 +44,10 @@ LLVM::CallOp getBarrierFuncCall(mlir::Location loc,
                                 size_t barrier_index, size_t coopKind,
                                 size_t order, llvm::StringRef barrierType);
 
+LLVM::CallOp getSignalFuncCall(mlir::Location loc,
+                               ConversionPatternRewriter &rewriter, Value comm,
+                               Value peer, Value signalId, Value value,
+                               int32_t contextIdx, int32_t teamKind,
+                               int32_t coopKind, llvm::StringRef signalOp);
+
 } // namespace mlir::triton::tle
