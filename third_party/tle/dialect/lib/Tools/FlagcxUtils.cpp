@@ -29,6 +29,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace mlir::triton::tle {
 using namespace mlir;
@@ -38,7 +39,10 @@ static const llvm::StringMap<StringRef> runtimeNames = {
     {"getNumPesFunction", "flagcxDevCommGetIntraSize"},
     {"getIntraBarrierArriveSignalFunction", "flagcxIntraBarrierArriveS"},
     {"getIntraBarrierWaitSignalFunction", "flagcxIntraBarrierWaitS"},
-    {"getIntraBarrierSyncSignalFunction", "flagcxIntraBarrierSyncS"}};
+    {"getIntraBarrierSyncSignalFunction", "flagcxIntraBarrierSyncS"},
+    {"getNetFromCommFunction", "flagcxDevNetGetFromCommS"},
+    {"signalSigIncFunction", "flagcxDevNetSignalSigIncS"},
+    {"signalSigAddFunction", "flagcxDevNetSignalSigAddS"}};
 
 static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
                                                   ModuleOp module,
@@ -140,6 +144,58 @@ LLVM::CallOp getLocalPeFuncCall(mlir::Location loc,
   return rewriter.create<LLVM::CallOp>(
       loc, TypeRange{func.getFunctionType().getReturnType()},
       FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
+}
+
+LLVM::CallOp getSignalFuncCall(mlir::Location loc,
+                               ConversionPatternRewriter &rewriter, Value comm,
+                               Value peer, Value signalId, Value value,
+                               int32_t contextIdx, int32_t teamKind,
+                               int32_t coopKind, llvm::StringRef signalOp) {
+  auto ctx = rewriter.getContext();
+  ModuleOp module =
+      rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
+
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto i64Ty = IntegerType::get(ctx, 64);
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  auto commPtr = getFlagcxMemOrCommPtr(loc, rewriter, comm);
+
+  // Category 9: resolve the selected pre-allocated network context.
+  auto getNetFunc =
+      createFuncInstance(runtimeNames.lookup("getNetFromCommFunction").data(),
+                         module, {ptrTy, i32Ty}, ptrTy);
+  auto contextIdxValue = rewriter.create<LLVM::ConstantOp>(
+      loc, i32Ty, rewriter.getI32IntegerAttr(contextIdx));
+  auto netCall = rewriter.create<LLVM::CallOp>(
+      loc, TypeRange{ptrTy}, FlatSymbolRefAttr::get(getNetFunc),
+      ValueRange{commPtr, contextIdxValue});
+  Value netPtr = netCall.getResult();
+
+  auto teamKindValue = rewriter.create<LLVM::ConstantOp>(
+      loc, i32Ty, rewriter.getI32IntegerAttr(teamKind));
+  auto coopKindValue = rewriter.create<LLVM::ConstantOp>(
+      loc, i32Ty, rewriter.getI32IntegerAttr(coopKind));
+  SmallVector<Value> args{netPtr, commPtr,       teamKindValue,
+                          peer,   coopKindValue, signalId};
+
+  // Category 13: emit the standalone remote signal update.
+  StringRef runtimeName;
+  SmallVector<Type> argTypes{ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty};
+  if (signalOp == "inc") {
+    runtimeName = runtimeNames.lookup("signalSigIncFunction");
+  } else if (signalOp == "add") {
+    runtimeName = runtimeNames.lookup("signalSigAddFunction");
+    argTypes.push_back(i64Ty);
+    args.push_back(value);
+  } else {
+    llvm_unreachable("unknown signal operation");
+  }
+
+  auto signalFunc =
+      createFuncInstance(runtimeName.data(), module, argTypes, voidTy);
+  return rewriter.create<LLVM::CallOp>(
+      loc, TypeRange{}, FlatSymbolRefAttr::get(signalFunc), args);
 }
 
 } // namespace mlir::triton::tle
