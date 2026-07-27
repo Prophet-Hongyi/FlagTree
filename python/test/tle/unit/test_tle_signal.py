@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
-
 DEVICE_MESH = tle.device_mesh(tle.MeshConfig(device=2))
 
 
