@@ -172,9 +172,8 @@ def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = 
 
     ``scope`` selects the FlagCX team (``intra_node``, ``inter_node``, or
     ``world``), while ``peer`` is a rank within that team. ``context_idx``
-    selects a pre-allocated FlagCX network context. Signal storage must be
-    reserved when creating the distributed context, for example with
-    ``tle.create_dist_tensor(tensor, signal_count=4)`` for signal ids 0..3.
+    selects a pre-allocated FlagCX network context. ``signal_id`` must refer
+    to a signal slot provisioned by the distributed context.
 
     For ``group_kind="block"`` (the default), every thread in the CTA must
     execute this operation convergently; the group collectively emits one
