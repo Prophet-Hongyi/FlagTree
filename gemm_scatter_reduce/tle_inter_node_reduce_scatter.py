@@ -23,7 +23,6 @@ class TleReduceScatter2DContext:
     dtype: torch.dtype
     with_gemm_output: bool
 
-
     gemm_out_dev_comm_ptr: Optional[int]
     gemm_out_dev_mem_ptr: Optional[int]
     gemm_out_buf: Optional[torch.Tensor]
@@ -40,14 +39,12 @@ class TleReduceScatter2DContext:
     signal_dev_comm_ptr: int
     signal_dev_mem_ptr: int
 
-
     reduction_stream: torch.cuda.Stream
     p2p_stream: torch.cuda.Stream
     num_sync_sms: int
     num_p2p_sms: int
     num_reduction_sms: int
     num_scatter_sms: int
-
 
     scatter_signal_buf: torch.Tensor = dataclasses.field(init=False)
     rs_per_node_signal_buf: torch.Tensor = dataclasses.field(init=False)
@@ -69,9 +66,8 @@ class TleReduceScatter2DContext:
         self.node_id = self.rank // self.local_world_size
         self.nnodes = self.world_size // self.local_world_size
         if self.nnodes != 1:
-            raise NotImplementedError(
-                "TLE has no node-level remote primitive yet; this example only "
-                "implements the nnodes == 1 specialization")
+            raise NotImplementedError("TLE has no node-level remote primitive yet; this example only "
+                                      "implements the nnodes == 1 specialization")
         if self.local_rank != self.rank:
             raise ValueError("single-node rank must equal local_rank")
         if self.signal_buf.numel() < 2 * self.world_size:
@@ -86,13 +82,12 @@ class TleReduceScatter2DContext:
         # rs_per_node_signal_buf for multi-node.
         self.rs_per_node_signal_buf = self.signal_buf[self.world_size:2 * self.world_size]
 
-
     @property
     def num_rs_sms(self) -> int:
         if self.nnodes == 1:
             return self.num_scatter_sms
-        return (self.num_scatter_sms + self.num_sync_sms +
-                self.num_p2p_sms + self.num_reduction_sms)
+        return (self.num_scatter_sms + self.num_sync_sms + self.num_p2p_sms + self.num_reduction_sms)
+
     def finalize(self):
         """Collectively release TLE/FlagCX after the context is no longer used."""
         if self._finalized:
@@ -103,6 +98,7 @@ class TleReduceScatter2DContext:
 
     def reset_barriers(self):
         self.signal_buf.zero_()
+
 
 # Intra-node scatter: write each target shard from this rank to the target rank.
 @triton.jit
@@ -138,8 +134,7 @@ def _scatter_kernel(
         # on the current GPU. Poll until the GEMM data produced by this GPU for
         # target_rank is complete.
         if WAIT_FOR_READY:
-            while tl.atomic_add(ready_ptr + target_rank, 0, sem="acquire",
-                                scope="gpu") == 0:
+            while tl.atomic_add(ready_ptr + target_rank, 0, sem="acquire", scope="gpu") == 0:
                 pass
 
         if target_rank == LOCAL_RANK:
@@ -158,18 +153,13 @@ def _scatter_kernel(
             tile_n = local_tile % num_tiles_n
             input_row = target_rank * M_per_rank + tile_m * BLOCK_M
             input_col = tile_n * BLOCK_N
-            input_ptrs = (input_ptr +
-                          (input_row + row_offs[:, None]) * N +
-                          input_col + col_offs[None, :])
-            row_mask = (input_row + row_offs[:, None]
-                        ) < (target_rank + 1) * M_per_rank
+            input_ptrs = (input_ptr + (input_row + row_offs[:, None]) * N + input_col + col_offs[None, :])
+            row_mask = (input_row + row_offs[:, None]) < (target_rank + 1) * M_per_rank
             col_mask = (input_col + col_offs[None, :]) < N
             values = tl.load(input_ptrs, mask=row_mask & col_mask, other=0.0)
 
             scatter_row = tile_m * BLOCK_M
-            scatter_ptrs = (remote_base +
-                            (scatter_row + row_offs[:, None]) * N +
-                            input_col + col_offs[None, :])
+            scatter_ptrs = (remote_base + (scatter_row + row_offs[:, None]) * N + input_col + col_offs[None, :])
             scatter_row_mask = (scatter_row + row_offs[:, None]) < M_per_rank
             tl.store(scatter_ptrs, values, mask=scatter_row_mask & col_mask)
 
@@ -235,13 +225,10 @@ def _ring_reduce_tma_kernel(
 
 
 # Context factory: allocate and register all communication buffers.
-def create_tle_reduce_scatter_2d_ctx(max_M: int, N: int, rank: int,
-                                      world_size: int, local_world_size: int,
-                                      dtype: torch.dtype,
-                                      with_gemm_output: bool = False,
-                                      reduction_stream: Optional[torch.cuda.Stream] = None,
-                                      num_reduction_sms: int = 15,
-                                      num_scatter_sms: int = 16) -> TleReduceScatter2DContext:
+def create_tle_reduce_scatter_2d_ctx(max_M: int, N: int, rank: int, world_size: int, local_world_size: int,
+                                     dtype: torch.dtype, with_gemm_output: bool = False,
+                                     reduction_stream: Optional[torch.cuda.Stream] = None, num_reduction_sms: int = 15,
+                                     num_scatter_sms: int = 16) -> TleReduceScatter2DContext:
 
     if world_size < 2:
         raise ValueError("TLE reduce-scatter requires at least two GPUs")
@@ -250,21 +237,17 @@ def create_tle_reduce_scatter_2d_ctx(max_M: int, N: int, rank: int,
     if max_M % world_size:
         raise ValueError("max_M must be divisible by world_size")
     if world_size // local_world_size != 1:
-        raise NotImplementedError(
-            "TLE has no node-level remote primitive yet; this example only "
-            "implements the nnodes == 1 specialization")
+        raise NotImplementedError("TLE has no node-level remote primitive yet; this example only "
+                                  "implements the nnodes == 1 specialization")
 
     # Buffer allocation.
     per_node_rows = max_M // local_world_size
     with torch.cuda.use_mem_pool(tle.get_mem_pool()):
-        gemm_out_buf = (torch.empty((max_M, N), dtype=dtype, device="cuda")
-                        if with_gemm_output else None)
+        gemm_out_buf = (torch.empty((max_M, N), dtype=dtype, device="cuda") if with_gemm_output else None)
         scatter_buf = torch.empty((max_M, N), dtype=dtype, device="cuda")
-        rs_per_node_buf = torch.empty((per_node_rows, N), dtype=dtype,
-                                      device="cuda")
+        rs_per_node_buf = torch.empty((per_node_rows, N), dtype=dtype, device="cuda")
         p2p_buf = torch.empty((per_node_rows, N), dtype=dtype, device="cuda")
-        signal_buf = torch.empty((2 * world_size,), dtype=torch.int32,
-                                 device="cuda")
+        signal_buf = torch.empty((2 * world_size, ), dtype=torch.int32, device="cuda")
     signal_buf.zero_()
 
     # Create multiple communication windows.
@@ -276,9 +259,8 @@ def create_tle_reduce_scatter_2d_ctx(max_M: int, N: int, rank: int,
 
     signal_dev_comm_ptr, signal_dev_mem_ptr = tle.create_comm_tensor(signal_buf)
 
-
-    gemm_out_dev_comm_ptr, gemm_out_dev_mem_ptr = ((None, None) if gemm_out_buf is None
-                                                    else tle.create_comm_tensor(gemm_out_buf))
+    gemm_out_dev_comm_ptr, gemm_out_dev_mem_ptr = ((None, None)
+                                                   if gemm_out_buf is None else tle.create_comm_tensor(gemm_out_buf))
     return TleReduceScatter2DContext(
         max_M=max_M,
         N=N,
@@ -302,8 +284,7 @@ def create_tle_reduce_scatter_2d_ctx(max_M: int, N: int, rank: int,
         p2p_dev_mem_ptr=p2p_dev_mem_ptr,
         signal_dev_comm_ptr=signal_dev_comm_ptr,
         signal_dev_mem_ptr=signal_dev_mem_ptr,
-        reduction_stream=(reduction_stream if reduction_stream is not None else
-                          torch.cuda.Stream(priority=-1)),
+        reduction_stream=(reduction_stream if reduction_stream is not None else torch.cuda.Stream(priority=-1)),
         p2p_stream=torch.cuda.Stream(priority=-1),
         num_sync_sms=0,
         num_p2p_sms=1,
@@ -313,20 +294,17 @@ def create_tle_reduce_scatter_2d_ctx(max_M: int, N: int, rank: int,
 
 
 def _set_tma_allocator():
+
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device="cuda", dtype=torch.int8)
 
     triton.set_allocator(alloc_fn)
 
 
-
 # Perform intra-node scatter and partial reduction per target node.
 # Per-target-node local Reduce-Scatter and P2P.
-def reduce_scatter_for_each_node(
-        input_tensor: torch.Tensor,
-        stream: torch.cuda.Stream,
-        ctx: TleReduceScatter2DContext,
-        ready_flags: Optional[torch.Tensor] = None) -> torch.Tensor:
+def reduce_scatter_for_each_node(input_tensor: torch.Tensor, stream: torch.cuda.Stream, ctx: TleReduceScatter2DContext,
+                                 ready_flags: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     # Intra-node Reduce-Scatter and the subsequent inter-node P2P.
     world_size = ctx.world_size
@@ -342,21 +320,17 @@ def reduce_scatter_for_each_node(
     M_per_rank = M // world_size
     M_per_node = M_per_rank * local_world_size
 
-#    Set the number of scatter CTAs.
+    #    Set the number of scatter CTAs.
     scatter_grid = lambda META: (min(
-        triton.cdiv(M_per_rank, META["BLOCK_M"]) *
-        triton.cdiv(N, META["BLOCK_N"]),
+        triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
         ctx.num_scatter_sms,
     ), )
 
     def reduce_launch_config(num_sms: int):
         if num_sms == -1:
-            return (lambda META: (
-                triton.cdiv(M_per_rank, META["BLOCK_M"]) *
-                triton.cdiv(N, META["BLOCK_N"]), )), 64, 4
-        return (lambda META: (min(
-            triton.cdiv(M_per_rank, META["BLOCK_M"]) *
-            triton.cdiv(N, META["BLOCK_N"]), num_sms), )), 128, 8
+            return (lambda META: (triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )), 64, 4
+        return (lambda META:
+                (min(triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), num_sms), )), 128, 8
 
     # Plain RS has no upstream GEMM producer, so it does not wait on a signal;
     # when fused with GEMM, ready_flags[target_rank] indicates the corresponding
@@ -371,17 +345,14 @@ def reduce_scatter_for_each_node(
 
             # Take all rows belonging to the target node; for single-node this is
             # the full input.
-            input_intra_node = input_tensor[
-                cur_node_id * M_per_node:(cur_node_id + 1) * M_per_node]
+            input_intra_node = input_tensor[cur_node_id * M_per_node:(cur_node_id + 1) * M_per_node]
 
             # Buffer where the target node's data will be stored.
-            scatter_for_node = ctx.scatter_buf[
-                cur_node_id * M_per_node:(cur_node_id + 1) * M_per_node]
+            scatter_for_node = ctx.scatter_buf[cur_node_id * M_per_node:(cur_node_id + 1) * M_per_node]
 
             # Buffer holding the partial reduction result computed by this node for
             # the target node.
-            rs_per_node_output = rs_per_node_buf[
-                cur_node_id * M_per_rank:(cur_node_id + 1) * M_per_rank]
+            rs_per_node_output = rs_per_node_buf[cur_node_id * M_per_rank:(cur_node_id + 1) * M_per_rank]
 
             # Signals are ordered by global rank; this round uses only the
             # local-rank segment for the target node.
@@ -391,9 +362,7 @@ def reduce_scatter_for_each_node(
 
             # Flag used when coordinating with GEMM.
             if ready_flags is not None:
-                ready_for_node = ready_flags[
-                    signal_start:signal_start + local_world_size
-                ]
+                ready_for_node = ready_flags[signal_start:signal_start + local_world_size]
             else:
                 ready_for_node = input_tensor
 
@@ -420,16 +389,13 @@ def reduce_scatter_for_each_node(
             )
 
             # Wait for all GPUs' intra-node scatter writes to become visible.
-            _device_barrier_kernel[(local_world_size, )](
-                ctx.scatter_dev_comm_ptr, WORLD_SIZE=local_world_size)
+            _device_barrier_kernel[(local_world_size, )](ctx.scatter_dev_comm_ptr, WORLD_SIZE=local_world_size)
 
             # Limit reduction SMs for non-final nodes; the final node uses the full
             # tile grid.
-            node_reduce_sms = (-1 if n == nnodes - 1 else
-                               num_reduction_sms)
+            node_reduce_sms = (-1 if n == nnodes - 1 else num_reduction_sms)
 
-            reduce_grid, reduce_block_n, reduce_warps = reduce_launch_config(
-                node_reduce_sms)
+            reduce_grid, reduce_block_n, reduce_warps = reduce_launch_config(node_reduce_sms)
 
             if stream is not reduction_stream:
                 reduction_stream.wait_stream(stream)
@@ -449,7 +415,6 @@ def reduce_scatter_for_each_node(
                     num_warps=reduce_warps,
                 )
 
-
                 # TLE node-space remote/P2P primitive is not yet wired up.
                 if nnodes > 1:
                     pass
@@ -461,12 +426,8 @@ def reduce_scatter_for_each_node(
     return p2p_buf[:M_per_rank * nnodes]
 
 
-def reduce_scatter_multi_node(
-        input_tensor: torch.Tensor,
-        stream: torch.cuda.Stream,
-        ctx: TleReduceScatter2DContext,
-        output: torch.Tensor,
-        ready_flags: Optional[torch.Tensor] = None) -> torch.Tensor:
+def reduce_scatter_multi_node(input_tensor: torch.Tensor, stream: torch.cuda.Stream, ctx: TleReduceScatter2DContext,
+                              output: torch.Tensor, ready_flags: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     M, N = input_tensor.shape
     M_per_rank = M // ctx.world_size
@@ -474,13 +435,9 @@ def reduce_scatter_multi_node(
 
     # Intra-node reduce-scatter; returns each node's reduction result. In the
     # single-node case, this step completes the operation.
-    rs_result_per_node = reduce_scatter_for_each_node(
-        input_tensor, stream, ctx, ready_flags)
+    rs_result_per_node = reduce_scatter_for_each_node(input_tensor, stream, ctx, ready_flags)
 
-
-    final_grid = lambda META: (
-        triton.cdiv(M_per_rank, META["BLOCK_M"]) *
-        triton.cdiv(N, META["BLOCK_N"]), )
+    final_grid = lambda META: (triton.cdiv(M_per_rank, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
 
     # In single-node case, pass local_rank=0, world_size=1 to copy
     # rs_result_per_node directly to output.
@@ -500,8 +457,7 @@ def reduce_scatter_multi_node(
 
 
 # Dispatch function that calls reduce_scatter_multi_node.
-def reduce_scatter_2d_op(input_tensor: torch.Tensor,
-                         ctx: TleReduceScatter2DContext,
+def reduce_scatter_2d_op(input_tensor: torch.Tensor, ctx: TleReduceScatter2DContext,
                          output: Optional[torch.Tensor] = None,
                          ready_flags: Optional[torch.Tensor] = None) -> torch.Tensor:
 
@@ -514,8 +470,7 @@ def reduce_scatter_2d_op(input_tensor: torch.Tensor,
     if M_per_rank < 256:
         raise ValueError("M_per_rank must be >= 256 for the TMA reduce kernel")
     if output is None:
-        output = torch.empty((M_per_rank, N), dtype=input_tensor.dtype,
-                             device=input_tensor.device)
+        output = torch.empty((M_per_rank, N), dtype=input_tensor.dtype, device=input_tensor.device)
     if tuple(output.shape) != (M_per_rank, N):
         raise ValueError("output has an invalid reduce-scatter shape")
     if ready_flags is not None and ready_flags.numel() != ctx.world_size:
@@ -527,33 +482,24 @@ def reduce_scatter_2d_op(input_tensor: torch.Tensor,
     if scatter_stream is reduction_stream:
         raise ValueError("scatter_stream and reduction_stream must be distinct")
 
-
     reduction_stream.wait_stream(scatter_stream)
 
     with torch.cuda.stream(scatter_stream):
-        _device_barrier_kernel[(ctx.world_size, )](ctx.scatter_dev_comm_ptr,
-                                                    WORLD_SIZE=ctx.world_size)
+        _device_barrier_kernel[(ctx.world_size, )](ctx.scatter_dev_comm_ptr, WORLD_SIZE=ctx.world_size)
 
-
-    output = reduce_scatter_multi_node(input_tensor, scatter_stream, ctx,
-                                       output, ready_flags)
-
+    output = reduce_scatter_multi_node(input_tensor, scatter_stream, ctx, output, ready_flags)
 
     with torch.cuda.stream(scatter_stream):
         ctx.reset_barriers()
     return output
 
+
 # PyTorch baseline implementation.
 def torch_rs(input_tensor: torch.Tensor, TP_GROUP) -> torch.Tensor:
-    output = torch.empty(
-        (input_tensor.shape[0] // TP_GROUP.size(),
-        input_tensor.shape[1]),
-        dtype=input_tensor.dtype,
-        device=input_tensor.device
-    )
+    output = torch.empty((input_tensor.shape[0] // TP_GROUP.size(), input_tensor.shape[1]), dtype=input_tensor.dtype,
+                         device=input_tensor.device)
     dist.reduce_scatter_tensor(output, input_tensor, group=TP_GROUP)
     return output
-
 
 
 def main():
@@ -565,7 +511,6 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     torch.cuda.set_device(local_rank)
-
 
     if world_size < 2:
         print("This example needs at least two GPUs", file=sys.stderr)
@@ -581,8 +526,7 @@ def main():
 
     M, N = 8192, 16384
     #
-    ctx = create_tle_reduce_scatter_2d_ctx(M, N, rank, world_size,
-                                           local_world_size, dtype)
+    ctx = create_tle_reduce_scatter_2d_ctx(M, N, rank, world_size, local_world_size, dtype)
     input_tensor = torch.rand((M, N), dtype=dtype, device="cuda")
 
     # PyTorch baseline implementation.

@@ -20,7 +20,6 @@ from tle_inter_node_reduce_scatter import (
 )
 
 
-
 @dataclasses.dataclass
 class TleGemmReduceScatterContext:
     """Tutorial-08-style hierarchical GEMM+RS context."""
@@ -53,12 +52,9 @@ class TleGemmReduceScatterContext:
 
 # Create the context: allocate the GEMM output buffer, scatter signal, and
 # Reduce-Scatter buffers.
-def create_gemm_rs_context(max_M: int, N: int, rank: int, world_size: int,
-                           local_world_size: int, output_dtype: torch.dtype,
-                           rs_stream: torch.cuda.Stream,
-                           BLOCK_M: int = 128, BLOCK_N: int = 256,
-                           BLOCK_K: int = 64, GROUP_M: int = 8,
-                           STAGES: int = 3,
+def create_gemm_rs_context(max_M: int, N: int, rank: int, world_size: int, local_world_size: int,
+                           output_dtype: torch.dtype, rs_stream: torch.cuda.Stream, BLOCK_M: int = 128,
+                           BLOCK_N: int = 256, BLOCK_K: int = 64, GROUP_M: int = 8, STAGES: int = 3,
                            num_scatter_sms: int = 16) -> TleGemmReduceScatterContext:
     """Build GEMM+RS state on the caller-owned RS stream."""
     if max_M % world_size:
@@ -66,24 +62,18 @@ def create_gemm_rs_context(max_M: int, N: int, rank: int, world_size: int,
 
     # rs_stream is the scatter stream. The factory creates a separate high
     # priority reduction stream, which consumes each completed scatter stage.
-    rs_ctx = create_tle_reduce_scatter_2d_ctx(
-        max_M, N, rank, world_size, local_world_size, output_dtype,
-        with_gemm_output=True, num_scatter_sms=num_scatter_sms)
+    rs_ctx = create_tle_reduce_scatter_2d_ctx(max_M, N, rank, world_size, local_world_size, output_dtype,
+                                              with_gemm_output=True, num_scatter_sms=num_scatter_sms)
 
     total_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     num_gemm_sms = total_sms - rs_ctx.num_rs_sms
     if num_gemm_sms < 1:
         raise ValueError("reduce-scatter SM reservation leaves no SM for GEMM")
 
-    return TleGemmReduceScatterContext(rs_ctx=rs_ctx,
-                                       output_dtype=output_dtype,
-                                       rs_stream=rs_stream,
-                                       num_gemm_sms=num_gemm_sms,
-                                       BLOCK_M=BLOCK_M,
-                                       BLOCK_N=BLOCK_N,
-                                       BLOCK_K=BLOCK_K,
-                                       GROUP_M=GROUP_M,
-                                       STAGES=STAGES)
+    return TleGemmReduceScatterContext(rs_ctx=rs_ctx, output_dtype=output_dtype, rs_stream=rs_stream,
+                                       num_gemm_sms=num_gemm_sms, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                                       GROUP_M=GROUP_M, STAGES=STAGES)
+
 
 # GEMM computation and completion notification.
 # counter_ptr = workspace
@@ -122,12 +112,9 @@ def kernel_gemm_rs_producer_persistent(
     if start_pid < num_tiles % NUM_SMS:
         tiles_per_sm += 1
 
-    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M, K], strides=[K, 1],
-                                       block_shape=[BLOCK_M, BLOCK_K])
-    b_desc = tl.make_tensor_descriptor(b_ptr, shape=[N, K], strides=[K, 1],
-                                       block_shape=[BLOCK_N, BLOCK_K])
-    c_desc = tl.make_tensor_descriptor(c_ptr, shape=[M, N], strides=[N, 1],
-                                       block_shape=[BLOCK_M, BLOCK_N])
+    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M, K], strides=[K, 1], block_shape=[BLOCK_M, BLOCK_K])
+    b_desc = tl.make_tensor_descriptor(b_ptr, shape=[N, K], strides=[K, 1], block_shape=[BLOCK_N, BLOCK_K])
+    c_desc = tl.make_tensor_descriptor(c_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N])
 
     M_per_rank = M // WORLD_SIZE
     tiles_m_per_rank = M_per_rank // BLOCK_M
@@ -152,15 +139,13 @@ def kernel_gemm_rs_producer_persistent(
             logical_pid_m = first_pid_m + tile_id % group_size_m
             pid_n = (tile_id % tiles_per_group) // group_size_m
 
-
             m_rank = logical_pid_m // tiles_m_per_rank
             pid_m_intra_rank = logical_pid_m - m_rank * tiles_m_per_rank
             m_node_id = m_rank // LOCAL_WORLD_SIZE
             m_local_rank = m_rank % LOCAL_WORLD_SIZE
             swizzle_m_node_id = (m_node_id + node_id + 1) % nnodes
             swizzle_m_local_rank = (m_local_rank + RANK + 1) % LOCAL_WORLD_SIZE
-            swizzle_m_rank = (swizzle_m_node_id * LOCAL_WORLD_SIZE +
-                              swizzle_m_local_rank)
+            swizzle_m_rank = (swizzle_m_node_id * LOCAL_WORLD_SIZE + swizzle_m_local_rank)
             pid_m = swizzle_m_rank * tiles_m_per_rank + pid_m_intra_rank
             offs_am = pid_m * BLOCK_M
             offs_bn = pid_n * BLOCK_N
@@ -189,8 +174,7 @@ def kernel_gemm_rs_producer_persistent(
                 tiled_n = tl.cdiv(N, BLOCK_N)
 
                 # Increment once per completed output tile.
-                prior = tl.atomic_add(counter_ptr + counter_id, 1,
-                                      sem="release", scope="gpu")
+                prior = tl.atomic_add(counter_ptr + counter_id, 1, sem="release", scope="gpu")
 
                 if prior == tiled_m_size * tiled_n - 1:
                     # Tutorial 08's dl.notify(..., signal=1) sets the signal to
@@ -200,25 +184,16 @@ def kernel_gemm_rs_producer_persistent(
                     # wait forever.
                     # old value = ready_ptr[counter_id]
                     # ready_ptr[counter_id] = 1
-                    tl.atomic_xchg(ready_ptr + counter_id, 1,
-                                   sem="release", scope="gpu")
+                    tl.atomic_xchg(ready_ptr + counter_id, 1, sem="release", scope="gpu")
 
             # Reset accumulator to start computing the next assigned output.
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
 
-
-
-def gemm_rs_producer_persistent(a: torch.Tensor, b: torch.Tensor,
-                                c: torch.Tensor, barrier: torch.Tensor,
-                                workspace: torch.Tensor, world_size: int,
-                                local_world_size: int, rank: int,
-                                num_gemm_sms: int,
-                                BLOCK_SIZE_M: int = 128,
-                                BLOCK_SIZE_N: int = 256,
-                                BLOCK_SIZE_K: int = 64,
-                                GROUP_SIZE_M: int = 8,
-                                STAGES: int = 3):
+def gemm_rs_producer_persistent(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, barrier: torch.Tensor,
+                                workspace: torch.Tensor, world_size: int, local_world_size: int, rank: int,
+                                num_gemm_sms: int, BLOCK_SIZE_M: int = 128, BLOCK_SIZE_N: int = 256,
+                                BLOCK_SIZE_K: int = 64, GROUP_SIZE_M: int = 8, STAGES: int = 3):
     """Tutorial-08-style producer wrapper around the TLE Triton kernel."""
     if a.shape[1] != b.shape[1]:
         raise ValueError("incompatible GEMM dimensions")
@@ -238,8 +213,7 @@ def gemm_rs_producer_persistent(a: torch.Tensor, b: torch.Tensor,
     triton.set_allocator(alloc_fn)
     grid = lambda META: (min(
         num_gemm_sms,
-        triton.cdiv(M, META["BLOCK_M"]) *
-        triton.cdiv(N, META["BLOCK_N"]),
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     ), )
 
     # stages: pipeline depth parameter for the Triton kernel launch.
@@ -265,25 +239,21 @@ def gemm_rs_producer_persistent(a: torch.Tensor, b: torch.Tensor,
     )
 
 
-def _pad_to_block_m(input_tensor: torch.Tensor, world_size: int,
-                    block_m: int) -> torch.Tensor:
+def _pad_to_block_m(input_tensor: torch.Tensor, world_size: int, block_m: int) -> torch.Tensor:
     M, K = input_tensor.shape
     M_per_rank = M // world_size
     padded_M_per_rank = triton.cdiv(M_per_rank, block_m) * block_m
     if padded_M_per_rank == M_per_rank:
         return input_tensor
     reshaped = input_tensor.reshape(world_size, M_per_rank, K)
-    padded = torch.empty((world_size, padded_M_per_rank, K),
-                         dtype=input_tensor.dtype, device=input_tensor.device)
+    padded = torch.empty((world_size, padded_M_per_rank, K), dtype=input_tensor.dtype, device=input_tensor.device)
     padded[:, :M_per_rank].copy_(reshaped)
     return padded.reshape(-1, K)
 
 
 # GEMM + Reduce-Scatter combined implementation.
-def gemm_rs_multi_node_persistent_op(
-        input_tensor: torch.Tensor,
-        weight: torch.Tensor,
-        ctx: TleGemmReduceScatterContext) -> torch.Tensor:
+def gemm_rs_multi_node_persistent_op(input_tensor: torch.Tensor, weight: torch.Tensor,
+                                     ctx: TleGemmReduceScatterContext) -> torch.Tensor:
     """Tutorial-08 persistent GEMM + per-rank-ready reduce-scatter path."""
     world_size = ctx.rs_ctx.world_size
     local_world_size = ctx.rs_ctx.local_world_size
@@ -304,15 +274,13 @@ def gemm_rs_multi_node_persistent_op(
     # rank on scatter_signal rather than waiting for the complete GEMM launch.
     rs_stream.wait_stream(current_stream)
 
-    output = torch.empty((M // world_size, N), dtype=ctx.output_dtype,
-                         device="cuda")
+    output = torch.empty((M // world_size, N), dtype=ctx.output_dtype, device="cuda")
 
     # Shape: [world_size]
     # Each workspace[j] counts how many output tiles for rank j have completed.
     # When workspace[j] reaches tiled_m_size * tiled_n - 1,
     # all tiles for rank j are done, so trigger the signal notification.
-    workspace = torch.zeros((world_size,), dtype=torch.int32,
-                            device=input_tensor.device)
+    workspace = torch.zeros((world_size, ), dtype=torch.int32, device=input_tensor.device)
     scatter_signal = ctx.rs_ctx.scatter_signal_buf
     gemm_out = ctx.get_gemm_out_buf(input_tensor)
 
@@ -336,8 +304,7 @@ def gemm_rs_multi_node_persistent_op(
 
     # Launch communication kernel.
     with torch.cuda.stream(rs_stream):
-        reduce_scatter_2d_op(gemm_out, ctx.rs_ctx, output=output,
-                             ready_flags=scatter_signal)
+        reduce_scatter_2d_op(gemm_out, ctx.rs_ctx, output=output, ready_flags=scatter_signal)
     current_stream.wait_stream(rs_stream)
     return output[:original_M_per_rank]
 
@@ -349,23 +316,19 @@ def gemm_rs_multi_node(input_tensor: torch.Tensor, weight: torch.Tensor,
     return gemm_rs_multi_node_persistent_op(input_tensor, weight, ctx)
 
 
-
-
 # PyTorch baseline implementation.
-def torch_gemm_rs(input_tensor: torch.Tensor, weight: torch.Tensor,
-                  TP_GROUP) -> torch.Tensor:
+def torch_gemm_rs(input_tensor: torch.Tensor, weight: torch.Tensor, TP_GROUP) -> torch.Tensor:
     """PyTorch/NCCL baseline"""
     M, _ = input_tensor.shape
     N = weight.shape[0]
     gemm_out = torch.matmul(input_tensor, weight.T)
-    output = torch.empty((M // TP_GROUP.size(), N), dtype=gemm_out.dtype,
-                         device=input_tensor.device)
+    output = torch.empty((M // TP_GROUP.size(), N), dtype=gemm_out.dtype, device=input_tensor.device)
     dist.reduce_scatter_tensor(output, gemm_out, group=TP_GROUP)
     return output
 
+
 # Timing/benchmark code.
-def _time_ms(fn, stream: torch.cuda.Stream, warmup: int = 20,
-             iters: int = 200, clear_l2: bool = True) -> float:
+def _time_ms(fn, stream: torch.cuda.Stream, warmup: int = 20, iters: int = 200, clear_l2: bool = True) -> float:
     """Measure median latency with rank alignment and optional L2 eviction.
 
     Cache eviction occurs before the start event, so it is not included in the
@@ -396,8 +359,6 @@ def _time_ms(fn, stream: torch.cuda.Stream, warmup: int = 20,
     return float(statistics.median(samples))
 
 
-
-
 def main():
 
     # Initialization.
@@ -426,18 +387,15 @@ def main():
     local_K = K // world_size
     dtype = torch.bfloat16
     scale = rank + 1
-    input_tensor = (torch.rand((M, local_K), dtype=dtype, device="cuda") *
-                    (0.02 * scale) - 0.01 * scale)
-    weight = (torch.rand((N, local_K), dtype=dtype, device="cuda") *
-              (0.02 * scale) - 0.01 * scale)
+    input_tensor = (torch.rand((M, local_K), dtype=dtype, device="cuda") * (0.02 * scale) - 0.01 * scale)
+    weight = (torch.rand((N, local_K), dtype=dtype, device="cuda") * (0.02 * scale) - 0.01 * scale)
 
     # Matches the validated TLE path: scatter and intra-node reduction share
     # the caller-provided high-priority RS stream.
     rs_stream = torch.cuda.Stream(priority=-1)
 
     num_scatter_sms = int(os.environ.get("TLE_SCATTER_SMS", "16"))
-    ctx = create_gemm_rs_context(M, N, rank, world_size, local_world_size,
-                                 dtype, rs_stream,
+    ctx = create_gemm_rs_context(M, N, rank, world_size, local_world_size, dtype, rs_stream,
                                  num_scatter_sms=num_scatter_sms)
     if rank == 0:
         print(f"[Rank 0] TLE scatter CTA budget: {num_scatter_sms}; "
@@ -445,25 +403,16 @@ def main():
 
     torch_output = torch_gemm_rs(input_tensor, weight, TP_GROUP)
 
-
-
     tle_output = gemm_rs_multi_node(input_tensor, weight, ctx)
 
-
     torch.cuda.synchronize()
-
 
     torch.testing.assert_close(torch_output, tle_output, atol=6e-2, rtol=6e-2)
     print(f"[Rank {rank}] TLE overlapping GEMM+RS correctness passed")
 
+    tle_ms = _time_ms(lambda: gemm_rs_multi_node(input_tensor, weight, ctx), torch.cuda.current_stream())
 
-
-
-    tle_ms = _time_ms(lambda: gemm_rs_multi_node(input_tensor, weight, ctx),
-                      torch.cuda.current_stream())
-
-    torch_ms = _time_ms(lambda: torch_gemm_rs(input_tensor, weight, TP_GROUP),
-                        torch.cuda.current_stream())
+    torch_ms = _time_ms(lambda: torch_gemm_rs(input_tensor, weight, TP_GROUP), torch.cuda.current_stream())
 
     print(f"[Rank {rank}] TLE GEMM+RS median: {tle_ms:.3f} ms")
     print(f"[Rank {rank}] torch GEMM+RS median: {torch_ms:.3f} ms")
