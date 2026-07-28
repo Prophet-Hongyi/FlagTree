@@ -103,12 +103,13 @@ class GroupKind(str, Enum):
 
 
 # 私有字典
-_SIGNAL_TEAM_KINDS = {
+_SIGNAL_SPACE_TO_TEAM_KIND = {
     "intra": 0,
     "intra_node": 0,
     "device": 0,
     "inter": 1,
     "inter_node": 1,
+    "node": 1,
     "world": 2,
 }
 
@@ -153,7 +154,7 @@ def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl
 # op ="inc" 或者 "add"， 是 inc 时 value 固定增加 1，
 # 这时调用者通常不用传 value
 # op = "add" 时 value 明确表示增加量：
-# scope 表示选择哪个 FlagCX 通信 team，也决定 peer 是在哪个通信范围内解释的
+# space 表示选择哪个 FlagCX 通信 team，也决定 peer 是在哪个通信范围内解释的
 # 比如 intra_node 单机多卡节点内， inter_node 多机多卡节点间， world 全局参与
 # group_kind 表示由哪个层级的线程组协作执行 signal 操作, 例如 thread、warp、block 等待
 
@@ -162,7 +163,7 @@ def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl
 # _semantic.builder 和
 # _semantic.to_tensor(...)
 @tl.builtin
-def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = "intra_node",
+def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", space: str = "intra_node",
            group_kind: str | GroupKind = GroupKind.BLOCK, context_idx: int = 0, _semantic=None):
     """Atomically update a signal slot owned by a remote FlagCX peer.
 
@@ -170,7 +171,7 @@ def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = 
     ``value``. The primitive only sends a signal; it neither transfers data nor
     waits for completion on the receiving peer.
 
-    ``scope`` selects the FlagCX team (``intra_node``, ``inter_node``, or
+    ``space`` selects the FlagCX team (``intra_node``, ``inter_node``, or
     ``world``), while ``peer`` is a rank within that team. ``context_idx``
     selects a pre-allocated FlagCX network context. ``signal_id`` must refer
     to a signal slot provisioned by the distributed context.
@@ -187,10 +188,10 @@ def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = 
     if signal_op not in ("inc", "add"):
         raise ValueError(f"op must be 'inc' or 'add', got {signal_op!r}")
 
-    signal_scope = str(tl._unwrap_if_constexpr(scope)).lower()
-    if signal_scope not in _SIGNAL_TEAM_KINDS:
+    signal_space = str(tl._unwrap_if_constexpr(space)).lower()
+    if signal_space not in _SIGNAL_SPACE_TO_TEAM_KIND:
         expected = "intra_node, inter_node, or world"
-        raise ValueError(f"scope must be {expected}, got {signal_scope!r}")
+        raise ValueError(f"space must be {expected}, got {signal_space!r}")
 
     group_kind = tl._unwrap_if_constexpr(group_kind)
     group_kind = group_kind.value if isinstance(group_kind, GroupKind) else str(group_kind).lower()
@@ -210,7 +211,7 @@ def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", scope: str = 
     value_tensor = _normalize_signal_scalar(value, "value", tl.uint64, _semantic)
     comm = _parse_src_arg(builder, device_dptr, 1)
     builder.create_signal(comm, peer_tensor.handle, signal_tensor.handle, value_tensor.handle, signal_op,  #编译期已知
-                          _SIGNAL_TEAM_KINDS[signal_scope],  # 编译期已知
+                          _SIGNAL_SPACE_TO_TEAM_KIND[signal_space],  # 编译期已知
                           _SIGNAL_COOP_KINDS[group_kind],  # 编译期已知
                           context_idx,  # 编译期已知
                           )
