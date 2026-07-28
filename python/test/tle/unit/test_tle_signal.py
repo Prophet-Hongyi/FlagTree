@@ -20,7 +20,7 @@ def _signal_kernel(device_dptr: tl.constexpr, mesh: tl.constexpr):
         peer,
         signal_id=0,
         op="inc",
-        scope="intra_node",
+        space="intra_node",
         group_kind="block",
         context_idx=0,
     )
@@ -30,7 +30,7 @@ def _signal_kernel(device_dptr: tl.constexpr, mesh: tl.constexpr):
         signal_id=1,
         value=local_rank + 2,
         op="add",
-        scope="intra_node",
+        space="intra_node",
         group_kind="block",
         context_idx=1,
     )
