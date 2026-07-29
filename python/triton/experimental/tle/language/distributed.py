@@ -122,27 +122,29 @@ _SIGNAL_COOP_KINDS = {
 
 # 检查 value 的数据类型和范围
 def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl.tensor:
+    if not dtype.is_int() or dtype.is_bool():
+        raise TypeError(f"{name}: target dtype must be a non-bool integer, got {dtype}")
+
     value = tl._unwrap_if_constexpr(value)
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer scalar, got bool")
     if isinstance(value, int):
         if value < 0:
             raise ValueError(f"{name} must be >= 0, got {value}")
-        limits = {
-            tl.int32: 0x7FFFFFFF,
-            tl.uint32: 0xFFFFFFFF,
-            tl.uint64: 0xFFFFFFFFFFFFFFFF,
-        }
-        if value > limits[dtype]:
-            raise ValueError(f"{name} {value} exceeds {dtype} range")
-
+        max_value = dtype.get_int_max_value()
+        if value > max_value:
+            raise ValueError(f"{name} {value} exceeds {dtype} range [0, {max_value}]")
     value_tensor = value if isinstance(value, tl.tensor) else _semantic.to_tensor(value)
-    if not isinstance(value_tensor, tl.tensor) or not value_tensor.dtype.is_int():
-        raise TypeError(f"{name} must be an integer scalar, got {type(value).__name__}")
+    if not value_tensor.dtype.is_int() or value_tensor.dtype.is_bool():
+        raise TypeError(f"{name} must be an integer scalar, got {value_tensor.dtype}")
     if value_tensor.shape != ():
-        raise ValueError(f"{name} must be a scalar integer, got shape {value_tensor.shape}")
+        raise ValueError(f"{name} must be scalar, got shape {value_tensor.shape}")
     if value_tensor.dtype != dtype:
-        value_tensor = tl.cast(value_tensor, dtype, _semantic=_semantic)
+        value_tensor = tl.cast(
+            value_tensor,
+            dtype,
+            _semantic=_semantic,
+        )
     return value_tensor
 
 
