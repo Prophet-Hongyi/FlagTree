@@ -120,7 +120,6 @@ _SIGNAL_COOP_KINDS = {
 }
 
 
-
 def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl.tensor:
     if not dtype.is_int() or dtype.is_bool():
         raise TypeError(f"{name}: target dtype must be a non-bool integer, got {dtype}")
@@ -146,7 +145,6 @@ def _normalize_signal_scalar(value, name: str, dtype: tl.dtype, _semantic) -> tl
             _semantic=_semantic,
         )
     return value_tensor
-
 
 
 @tl.builtin
@@ -192,16 +190,20 @@ def signal(device_dptr, peer, signal_id, value=1, op: str = "inc", space: str = 
     if context_idx < 0 or context_idx > 0x7FFFFFFF:
         raise ValueError(f"context_idx must be in int32 range, got {context_idx}")
 
-
     peer_tensor = _normalize_signal_scalar(peer, "peer", tl.int32, _semantic)
     signal_tensor = _normalize_signal_scalar(signal_id, "signal_id", tl.uint32, _semantic)
     value_tensor = _normalize_signal_scalar(value, "value", tl.uint64, _semantic)
     comm = _parse_src_arg(builder, device_dptr, 1)
-    builder.create_signal(comm, peer_tensor.handle, signal_tensor.handle, value_tensor.handle, signal_op,  #编译期已知
-                          _SIGNAL_SPACE_TO_TEAM_KIND[signal_space],  
-                          _SIGNAL_COOP_KINDS[group_kind],  
-                          context_idx,  
-                          )
+    builder.create_signal(
+        comm,
+        peer_tensor.handle,
+        signal_tensor.handle,
+        value_tensor.handle,
+        signal_op,  #编译期已知
+        _SIGNAL_SPACE_TO_TEAM_KIND[signal_space],
+        _SIGNAL_COOP_KINDS[group_kind],
+        context_idx,
+    )
     return None
 
 
