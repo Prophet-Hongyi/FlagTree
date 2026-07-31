@@ -15,4 +15,12 @@ module attributes {ttg.target = "cuda:90", "ttg.num-warps" = 4 : i32, "ttg.num-c
     } {tle.explicit_tile_style_pipeline = 1 : i32}
     tt.return
   }
+
+  // CHECK-LABEL: tt.func @preserve_transport_api_wait
+  // CHECK: ttg.async_wait {{.*}} {num = 1 : i32, tle.explicit_async_wait}
+  tt.func @preserve_transport_api_wait() {
+    %tok = ttg.async_commit_group
+    %w = ttg.async_wait %tok {num = 1 : i32, tle.explicit_async_wait}
+    tt.return
+  }
 }

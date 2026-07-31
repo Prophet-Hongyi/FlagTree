@@ -182,8 +182,10 @@ public:
                                          op.getIndices());
 
       // Perform async TMA copy from global to existing shared memory
-      rewriter.create<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(
+      auto tmaLoad =
+          rewriter.create<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(
           op.getLoc(), op.getSrc(), indices, mbarrierAlloc, dstMemDesc, pred);
+      tmaLoad.setEvict(op.getEvict());
 
       // Wait for completion and invalidate barrier
       Value phase = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
@@ -191,6 +193,10 @@ public:
       rewriter.create<InvalBarrierOp>(loc, mbarrierAlloc);
 
     } else {
+      if (op.getEvict() != triton::EvictionPolicy::NORMAL)
+        return op.emitOpError(
+            "eviction policies are supported only for global-to-shared TMA copies");
+
       // Store from shared memory to global memory
       auto dstType = cast<TensorDescType>(op.getDst().getType());
       auto srcType = cast<MemDescType>(op.getSrc().getType());

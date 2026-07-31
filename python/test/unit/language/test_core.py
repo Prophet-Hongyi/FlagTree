@@ -611,6 +611,21 @@ def test_broadcast(dtype, device):
     assert (y_broadcasted_np == to_numpy(y_broadcasted_tri)).all()
 
 
+@pytest.mark.interpreter
+def test_broadcast_to_constexpr_scalar(device):
+
+    @triton.jit
+    def broadcast_to_scalar_kernel(output, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        values = tl.broadcast_to(7, (BLOCK_SIZE, ))
+        tl.store(output + offsets, values)
+
+    block_size = 32
+    output = to_triton(np.empty((block_size, ), dtype=np.int32), device=device)
+    broadcast_to_scalar_kernel[(1, )](output, BLOCK_SIZE=block_size)
+    np.testing.assert_array_equal(to_numpy(output), np.full((block_size, ), 7, dtype=np.int32))
+
+
 # ----------
 # test slice
 # ----------

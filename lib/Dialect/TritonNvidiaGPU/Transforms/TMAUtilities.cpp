@@ -147,21 +147,22 @@ SmallVector<int64_t> getTMABlockShape(ArrayRef<int64_t> shapePerCTA,
 
 std::optional<int> getTMASwizzleMode(Operation *op, TensorDescType ty) {
   auto encoding = ty.getBlockType().getEncoding();
-  auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding);
-  unsigned swizzleBytes = mmaEncoding ? mmaEncoding.getSwizzlingByteWidth() : 0;
-  if (!mmaEncoding) {
-    auto swizzledEnc = dyn_cast<ttg::SwizzledSharedEncodingAttr>(encoding);
-    if (!swizzledEnc || swizzledEnc.getVec() != 1 ||
-        swizzledEnc.getPerPhase() != 1 || swizzledEnc.getMaxPhase() != 1) {
-      if (op)
-        op->emitError("Unhandled encoding type");
-      return std::nullopt;
-    }
-  }
+  std::function<InFlightDiagnostic()> emitError;
+  if (op)
+    emitError = [op]() {
+      return op->emitError("requires a TMA-compatible shared layout: ");
+    };
+  auto info = getTMASharedLayoutInfo(
+      encoding, ty.getBlockType().getElementType(), std::move(emitError));
+  if (failed(info))
+    return std::nullopt;
 
-  bool fp4Padded = isFp4Padded(encoding);
-  assert(!fp4Padded || swizzleBytes == 128 &&
-                           "elem type .b4x16_p64 supports only 128B swizzling");
+  unsigned swizzleBytes = info->swizzlingByteWidth;
+  if (info->fp4Padded && swizzleBytes != 128) {
+    if (op)
+      op->emitError("fp4 padded TMA operands require 128-byte swizzling");
+    return std::nullopt;
+  }
 
   int32_t swizzleMode = 0;
   if (swizzleBytes == 128) {
@@ -198,7 +199,6 @@ enum TMA_ELEMENT_TYPES {
 
 std::optional<int> getTMAElementType(Operation *op, TensorDescType ty) {
   auto encoding = ty.getBlockType().getEncoding();
-  auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding);
   bool fp4Padded = isFp4Padded(encoding);
 
   if (fp4Padded)
@@ -249,9 +249,13 @@ LogicalResult createTMADesc(Value tmaPtr, MakeTensorDescOp op,
   auto elemType = op.getBase().getType().getPointeeType();
   auto elemSize = elemType.getIntOrFloatBitWidth() / 8;
   auto encoding = op.getType().getBlockType().getEncoding();
-  auto mmaEncoding =
-      llvm::dyn_cast_or_null<gpu::NVMMASharedEncodingAttr>(encoding);
-  bool fp4Padded = mmaEncoding && mmaEncoding.getFp4Padded();
+  auto layoutInfo = getTMASharedLayoutInfo(
+      encoding, elemType, [&]() {
+        return op->emitError("requires a TMA-compatible shared layout: ");
+      });
+  if (failed(layoutInfo))
+    return failure();
+  bool fp4Padded = layoutInfo->fp4Padded;
 
   int paddingScale = fp4Padded ? 2 : 1;
   auto shapePerCTA = gpu::getShapePerCTA(encoding, op.getTensorShape());
@@ -267,17 +271,6 @@ LogicalResult createTMADesc(Value tmaPtr, MakeTensorDescOp op,
   boxDim.push_back(mkI32Constant(contigDimSize));
   for (int k = shapePerCTA.size() - 2; k >= 0; --k)
     boxDim.push_back(mkI32Constant(blockShape[k]));
-
-  unsigned swizzleBytes = mmaEncoding ? mmaEncoding.getSwizzlingByteWidth() : 0;
-  if (!mmaEncoding) {
-    auto swizzledEnc = dyn_cast<gpu::SwizzledSharedEncodingAttr>(
-        op.getType().getBlockType().getEncoding());
-    if (!swizzledEnc || swizzledEnc.getVec() != 1 ||
-        swizzledEnc.getPerPhase() != 1 || swizzledEnc.getMaxPhase() != 1) {
-      op->emitError() << "Unhandled encoding type";
-      return failure();
-    }
-  }
 
   auto maybeSwizzleMode = getTMASwizzleMode(op, op.getType());
   if (!maybeSwizzleMode)

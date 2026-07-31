@@ -17,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <limits>
@@ -1110,6 +1111,16 @@ getPipePayloadWindowBegin(PipeWriterCommitOp commit,
 
 static FailureOr<PipeCommitAnalysis>
 analyzePipeCommit(PipeWriterCommitOp commit, PipeDefinition &definition) {
+  // A fieldless one-shot pipe is a pure execution-order edge. There is no
+  // payload window or transport to infer; every writer task participant
+  // arrives at commit and the matching reader waits on the control token.
+  if (commit.getFields().empty()) {
+    if (!definition.oneShot)
+      return commit.emitOpError(
+          "without payload fields requires a one_shot pipe");
+    return PipeCommitAnalysis{};
+  }
+
   FailureOr<Operation *> windowBegin =
       getPipePayloadWindowBegin(commit, definition);
   if (failed(windowBegin))
@@ -1463,6 +1474,11 @@ static PipeState createPipeState(PipeCreateOp op,
   Location loc = op.getLoc();
   MLIRContext *context = op->getContext();
   int64_t capacity = getPipeCapacity(op);
+  // NVWS control state is represented by Triton tensors, so its physical
+  // extent must remain a power of two. Stage arithmetic and payload memdescs
+  // continue to use the logical capacity; padded control slots are unreachable.
+  int64_t physicalControlCapacity =
+      static_cast<int64_t>(llvm::PowerOf2Ceil(capacity));
   bool oneShot = isOneShotPipe(op);
 
   auto sharedMemorySpace = ttg::SharedMemorySpaceAttr::get(context);
@@ -1472,7 +1488,8 @@ static PipeState createPipeState(PipeCreateOp op,
     Attribute closeTagArrayEncoding = getCloseTagEncoding(context, 2);
     Attribute closeTagSlotEncoding = getCloseTagEncoding(context, 1);
     auto closeTagArrayType =
-        ttg::MemDescType::get({capacity, 1}, builder.getI32Type(),
+        ttg::MemDescType::get({physicalControlCapacity, 1},
+                              builder.getI32Type(),
                               closeTagArrayEncoding, sharedMemorySpace,
                               /*mutableMemory=*/true);
     closeTagSlotType =
@@ -1480,7 +1497,7 @@ static PipeState createPipeState(PipeCreateOp op,
                               sharedMemorySpace, /*mutableMemory=*/true);
 
     RankedTensorType closeTagArrayTensorType =
-        getCloseTagTensorType(op, builder, {capacity, 1});
+        getCloseTagTensorType(op, builder, {physicalControlCapacity, 1});
     Value initialCloseTags =
         createCloseTagTensor(builder, loc, closeTagArrayTensorType,
                              /*value=*/false);
@@ -1488,7 +1505,7 @@ static PipeState createPipeState(PipeCreateOp op,
                                           initialCloseTags);
   }
   Value token = ttnvws::CreateTokenOp::create(
-      builder, loc, static_cast<uint32_t>(capacity),
+      builder, loc, static_cast<uint32_t>(physicalControlCapacity),
       ttnvws::TokenLoadType::LocalStoreOp);
 
   SmallVector<std::string> readerNames = getDeclaredReaderNames(op);

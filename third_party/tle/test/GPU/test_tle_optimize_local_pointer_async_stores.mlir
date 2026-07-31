@@ -32,6 +32,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 
 // -----
 
+#load = #ttg.blocked<{sizePerThread = [1, 1, 1, 8], threadsPerWarp = [1, 32, 1, 1], warpsPerCTA = [1, 8, 1, 1], order = [3, 0, 1, 2]}>
+#local = #ttg.blocked<{sizePerThread = [1, 1, 1, 1], threadsPerWarp = [1, 1, 4, 8], warpsPerCTA = [1, 8, 1, 1], order = [3, 2, 1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [3, 2, 1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @async_store_singleton_axis
+  tt.func @async_store_singleton_axis(%gptr: tensor<1x256x4x8x!tt.ptr<bf16>, #load>) {
+    // Canonicalization folds arange(0, 1) and its broadcasts to this splat.
+    %idx0 = arith.constant dense<0> : tensor<1x256x4x8xi32, #local>
+
+    %idx1 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #local}>}>}>>
+    %idx1.1 = tt.expand_dims %idx1 {axis = 0 : i32} : tensor<256xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #local}>}>}>> -> tensor<1x256xi32, #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #local}>}>>
+    %idx1.2 = tt.expand_dims %idx1.1 {axis = 2 : i32} : tensor<1x256xi32, #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #local}>}>> -> tensor<1x256x1xi32, #ttg.slice<{dim = 3, parent = #local}>>
+    %idx1.3 = tt.expand_dims %idx1.2 {axis = 3 : i32} : tensor<1x256x1xi32, #ttg.slice<{dim = 3, parent = #local}>> -> tensor<1x256x1x1xi32, #local>
+    %idx1.full = tt.broadcast %idx1.3 : tensor<1x256x1x1xi32, #local> -> tensor<1x256x4x8xi32, #local>
+
+    %idx2 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 3, parent = #local}>}>}>>
+    %idx2.1 = tt.expand_dims %idx2 {axis = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 3, parent = #local}>}>}>> -> tensor<1x4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 3, parent = #local}>}>>
+    %idx2.2 = tt.expand_dims %idx2.1 {axis = 0 : i32} : tensor<1x4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 3, parent = #local}>}>> -> tensor<1x1x4xi32, #ttg.slice<{dim = 3, parent = #local}>>
+    %idx2.3 = tt.expand_dims %idx2.2 {axis = 3 : i32} : tensor<1x1x4xi32, #ttg.slice<{dim = 3, parent = #local}>> -> tensor<1x1x4x1xi32, #local>
+    %idx2.full = tt.broadcast %idx2.3 : tensor<1x1x4x1xi32, #local> -> tensor<1x256x4x8xi32, #local>
+
+    %idx3 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #local}>}>}>>
+    %idx3.1 = tt.expand_dims %idx3 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #local}>}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #local}>}>>
+    %idx3.2 = tt.expand_dims %idx3.1 {axis = 0 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 0, parent = #local}>}>> -> tensor<1x1x8xi32, #ttg.slice<{dim = 0, parent = #local}>>
+    %idx3.3 = tt.expand_dims %idx3.2 {axis = 0 : i32} : tensor<1x1x8xi32, #ttg.slice<{dim = 0, parent = #local}>> -> tensor<1x1x1x8xi32, #local>
+    %idx3.full = tt.broadcast %idx3.3 : tensor<1x1x1x8xi32, #local> -> tensor<1x256x4x8xi32, #local>
+
+    // CHECK: %[[SMEM:.*]] = ttg.local_alloc
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<1x256x4x8xbf16, #shared, #smem, mutable>
+    %ptr = "tle.local_pointers"(%smem, %idx0, %idx1.full, %idx2.full, %idx3.full) : (!ttg.memdesc<1x256x4x8xbf16, #shared, #smem, mutable>, tensor<1x256x4x8xi32, #local>, tensor<1x256x4x8xi32, #local>, tensor<1x256x4x8xi32, #local>, tensor<1x256x4x8xi32, #local>) -> tensor<1x256x4x8x!tt.ptr<bf16, 3>, #local>
+    %value = tt.load %gptr : tensor<1x256x4x8x!tt.ptr<bf16>, #load>
+    %value.local = ttg.convert_layout %value : tensor<1x256x4x8xbf16, #load> -> tensor<1x256x4x8xbf16, #local>
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: %[[TOK:.*]] = ttg.async_copy_global_to_local %{{.*}}, %[[SMEM]] {tle.local_ptr_async_store}
+    // CHECK: %[[COMMIT:.*]] = ttg.async_commit_group tokens %[[TOK]]
+    // CHECK: ttg.async_wait %[[COMMIT]] {num = 0 : i32}
+    // CHECK-NOT: tt.store
+    tt.store %ptr, %value.local : tensor<1x256x4x8x!tt.ptr<bf16, 3>, #local>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [2, 1], order = [1, 0]}>
 #blocked_alt = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [16, 2], warpsPerCTA = [2, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 1, order = [1, 0]}>

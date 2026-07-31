@@ -212,7 +212,37 @@ class device_mesh:
         )
 
     def __repr__(self):
-        return f"DeviceMesh(shape={self._shape}, names={self._dim_names})"
+        return (
+            f"DeviceMesh(shape={self._shape}, names={self._dim_names}, "
+            f"physical_ids={self._physical_ids}, launch_shape={self._launch_shape}, "
+            f"launch_names={self._launch_dim_names})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, device_mesh):
+            return NotImplemented
+        return (
+            self._shape,
+            self._dim_names,
+            self._physical_ids,
+            self._launch_shape,
+            self._launch_dim_names,
+        ) == (
+            other._shape,
+            other._dim_names,
+            other._physical_ids,
+            other._launch_shape,
+            other._launch_dim_names,
+        )
+
+    def __hash__(self) -> int:
+        return hash((
+            self._shape,
+            self._dim_names,
+            self._physical_ids,
+            self._launch_shape,
+            self._launch_dim_names,
+        ))
 
 
 class _BroadcastSpec:

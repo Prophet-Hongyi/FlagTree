@@ -67,7 +67,13 @@ def elementwise_tma_add_kernel(
     for yoff in range(0, ynumel, YBLOCK):
         # Calculate column offset for current block
         # copy data to shared memory
-        tle.gpu.copy(a_desc, a_smem, [XBLOCK, YBLOCK], [pid * XBLOCK, yoff])
+        tle.gpu.copy(
+            a_desc,
+            a_smem,
+            [XBLOCK, YBLOCK],
+            [pid * XBLOCK, yoff],
+            eviction_policy="evict_first",
+        )
         tle.gpu.copy(b_desc, b_smem, [XBLOCK, YBLOCK], [pid * XBLOCK, yoff])
         # Load data from shared memory
         aval = tl.load(a_smem_ptrs)
@@ -116,11 +122,14 @@ class TestTLETmaCopy:
         b_tma = TensorDescriptor.from_tensor(b, block_shape=[XBLOCK, YBLOCK])
         c_tma = TensorDescriptor.from_tensor(c, block_shape=[XBLOCK, YBLOCK])
         # Execute TLE pipeline computation
-        elementwise_add(a_tma, b_tma, c_tma, XBLOCK, YBLOCK)
+        compiled = elementwise_add(a_tma, b_tma, c_tma, XBLOCK, YBLOCK)
 
         # Verify results
         expected = a + b
         torch.testing.assert_close(c, expected, atol=1e-5, rtol=1e-5)
+        ptx = compiled.asm["ptx"]
+        assert "createpolicy.fractional.L2::evict_first.b64" in ptx
+        assert "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint" in ptx
 
     def test_tma_copy_different_block_sizes(self):
         """Test TMA copy with different block sizes"""

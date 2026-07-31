@@ -103,6 +103,21 @@ def sm_arch_from_capability(capability: int):
     return f"sm_{capability}{suffix}"
 
 
+def parse_ptxas_resource_usage(log: str) -> dict[str, int]:
+    function_resources = re.findall(
+        r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads",
+        log,
+    )
+    if not function_resources:
+        raise RuntimeError("ptxas did not report per-function resource usage")
+    resources = [tuple(map(int, values)) for values in function_resources]
+    return {
+        "ptxas_stack_frame_bytes": max(stack for stack, _, _ in resources),
+        "ptxas_spill_store_bytes": sum(stores for _, stores, _ in resources),
+        "ptxas_spill_load_bytes": sum(loads for _, _, loads in resources),
+    }
+
+
 @dataclass(frozen=True)
 class CUDAOptions:
     num_warps: int = 4
@@ -298,12 +313,6 @@ class CUDABackend(BaseBackend):
         tle.passes.add_lower_extract_tile(pm)
         # flagtree tle: lower tle.insert_tile
         tle.passes.add_lower_insert_tile(pm)
-        # Canonicalize static gmem->local_ptr(shared) chunk copies after TTIR
-        # has been converted to TTGPU encodings, but before local-pointer
-        # lowering obscures the load->store pattern. This rewrites the
-        # source-level chunk staging into direct async copies targeting
-        # memdesc subviews of the final shared operand buffer.
-        tle.passes.add_optimize_local_pointer_async_stores(pm)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_process_shared_memory_hint(pm)  # flagtree hints
@@ -315,7 +324,15 @@ class CUDABackend(BaseBackend):
         tle.passes.add_early_assign_memory_space(pm)
         # begin flagtree tle
         tle.passes.add_select_encodings(pm)
+        # Infer CTA barriers while shared writes are still represented as
+        # local-pointer stores. The async-copy rewrite removes those stores,
+        # so running it first would hide producer/consumer hazards from the
+        # barrier analysis.
         tle.passes.add_insert_local_pointer_barriers(pm)
+        # Canonicalize static gmem->local_ptr(shared) chunk copies after
+        # synchronization has been made explicit, but before local-pointer
+        # lowering obscures the load->store pattern.
+        tle.passes.add_optimize_local_pointer_async_stores(pm)
         tle.passes.add_optimize_local_pointer_loads(pm)
         tle.passes.add_optimize_local_pointer_stores(pm)
         # end flagtree tle
@@ -345,6 +362,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
+            tle.passes.add_lower_pipe_to_nvws(pm)
+            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
@@ -574,9 +593,11 @@ class CUDABackend(BaseBackend):
             ]
             try:
                 subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                with open(flog.name) as log_file:
+                    ptxas_log = log_file.read()
+                metadata.update(parse_ptxas_resource_usage(ptxas_log))
                 if knobs.nvidia.dump_ptxas_log:
-                    with open(flog.name) as log_file:
-                        print(log_file.read())
+                    print(ptxas_log)
 
                 if os.path.exists(fsrc.name):
                     os.remove(fsrc.name)
@@ -632,4 +653,4 @@ please share the reproducer above with Triton project.
     @functools.lru_cache()
     def hash(self):
         version = get_ptxas_version(self.target.arch)
-        return f'{version}-{self.target.arch}'
+        return f'{version}-{self.target.arch}-{file_hash(__file__)}'

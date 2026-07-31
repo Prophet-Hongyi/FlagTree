@@ -294,7 +294,13 @@ struct OptimizePartitionWarps
 
 void OptimizePartitionWarps::runOnOperation() {
   SmallVector<WarpSpecializeOp> wsOps;
-  getOperation().walk([&](WarpSpecializeOp wsOp) { wsOps.push_back(wsOp); });
+  getOperation().walk([&](WarpSpecializeOp wsOp) {
+    // A frontend-provided register budget is part of an explicit partition
+    // contract. Only infer warp and register counts for compiler-created
+    // partitions that do not already carry one.
+    if (!wsOp.getRequestedRegisters())
+      wsOps.push_back(wsOp);
+  });
 
   if (wsOps.empty()) {
     return;

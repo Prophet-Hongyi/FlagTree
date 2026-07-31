@@ -28,14 +28,12 @@ constexpr llvm::StringLiteral kTTGGlobalScratchAlignAttr =
     "ttg.global_scratch_memory_alignment";
 constexpr llvm::StringLiteral kSubmeshScratchOffsetAttr =
     "tle.submesh_barrier_scratch_offset";
-constexpr llvm::StringLiteral kGridScratchOffsetAttr =
-    "tle.grid_barrier_scratch_offset";
+constexpr llvm::StringLiteral kGlobalScratchMemoryOffsetAttr =
+    "ttg.global_scratch_memory_offset";
 constexpr int32_t kSubmeshScratchAlignment = 16;
 constexpr int32_t kSubmeshScratchBytes = 8;
 constexpr int32_t kSubmeshCounterOffsetBytes = 0;
 constexpr int32_t kSubmeshPhaseOffsetBytes = 4;
-constexpr int32_t kGridScratchAlignment = 4;
-constexpr int32_t kGridScratchBytes = 4;
 constexpr int32_t kGridArrivedOffsetBytes = 0;
 
 FailureOr<int32_t> getOrCreateSubmeshScratchOffset(ModuleOp mod) {
@@ -67,49 +65,6 @@ FailureOr<int32_t> getOrCreateSubmeshScratchOffset(ModuleOp mod) {
   return static_cast<int32_t>(offset);
 }
 
-FailureOr<int32_t> getOrCreateGridScratchOffset(ModuleOp mod) {
-  if (auto existing = mod->getAttrOfType<IntegerAttr>(kGridScratchOffsetAttr)) {
-    int64_t value = existing.getInt();
-    if (value < 0 || value > std::numeric_limits<int32_t>::max())
-      return failure();
-    return static_cast<int32_t>(value);
-  }
-
-  auto *ctx = mod.getContext();
-  auto i32Ty = IntegerType::get(ctx, 32);
-
-  int64_t currentSize = 0;
-  if (auto sizeAttr =
-          mod->getAttrOfType<IntegerAttr>(kTTGGlobalScratchSizeAttr)) {
-    currentSize = sizeAttr.getInt();
-    if (currentSize < 0)
-      return failure();
-  } else {
-    mod->setAttr(kTTGGlobalScratchSizeAttr, IntegerAttr::get(i32Ty, 0));
-  }
-
-  int64_t currentAlign = 1;
-  if (auto alignAttr =
-          mod->getAttrOfType<IntegerAttr>(kTTGGlobalScratchAlignAttr)) {
-    currentAlign = alignAttr.getInt();
-    if (currentAlign <= 0)
-      return failure();
-  } else {
-    mod->setAttr(kTTGGlobalScratchAlignAttr, IntegerAttr::get(i32Ty, 1));
-  }
-
-  int64_t offset = llvm::alignTo(currentSize, int64_t{kGridScratchAlignment});
-  int64_t newSize = offset + kGridScratchBytes;
-  if (newSize > std::numeric_limits<int32_t>::max())
-    return failure();
-  int64_t newAlign = std::max(currentAlign, int64_t{kGridScratchAlignment});
-
-  mod->setAttr(kTTGGlobalScratchSizeAttr, IntegerAttr::get(i32Ty, newSize));
-  mod->setAttr(kTTGGlobalScratchAlignAttr, IntegerAttr::get(i32Ty, newAlign));
-  mod->setAttr(kGridScratchOffsetAttr, IntegerAttr::get(i32Ty, offset));
-  return static_cast<int32_t>(offset);
-}
-
 struct DistributedBarrierOpConversion
     : public ConvertOpToLLVMPattern<tle::DistributedBarrierOp> {
   using ConvertOpToLLVMPattern<
@@ -138,16 +93,20 @@ struct DistributedBarrierOpConversion
     auto i8Ty = IntegerType::get(ctx, 8);
     auto i32Ty = IntegerType::get(ctx, 32);
 
-    auto mod = op->getParentOfType<ModuleOp>();
-    if (!mod)
-      return op.emitOpError("cannot find parent module for grid lowering");
-
-    auto scratchOffsetOr = getOrCreateGridScratchOffset(mod);
-    if (failed(scratchOffsetOr)) {
-      return op.emitOpError(
-          "failed to reserve global scratch for grid barrier");
+    auto scratchOffsetAttr =
+        op->getAttrOfType<IntegerAttr>(kGlobalScratchMemoryOffsetAttr);
+    if (!scratchOffsetAttr) {
+      return op.emitOpError()
+             << "grid lowering requires " << kGlobalScratchMemoryOffsetAttr
+             << "; run global scratch allocation before TLE LLVM lowering";
     }
-    int32_t scratchOffset = *scratchOffsetOr;
+
+    int64_t scratchOffsetValue = scratchOffsetAttr.getInt();
+    if (scratchOffsetValue < 0 ||
+        scratchOffsetValue > std::numeric_limits<int32_t>::max()) {
+      return op.emitOpError("grid scratch offset is out of i32 range");
+    }
+    int32_t scratchOffset = static_cast<int32_t>(scratchOffsetValue);
 
     auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
     if (!func) {

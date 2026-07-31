@@ -13,6 +13,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTWARPSPECIALIZETOLLVM
@@ -101,6 +102,227 @@ static void createAllBarrier(TritonLLVMIRRewriter &b, unsigned barIdx) {
                                   "llvm.nvvm.barrier.cta.sync.all",
                                   void_ty(b.getContext()), b.i32_val(barIdx));
 }
+
+namespace {
+
+struct BarrierExecutionScope {
+  enum class Kind {
+    Cta,
+    WarpGroup,
+  };
+
+  Kind kind;
+  unsigned barrierIndex = 0;
+  unsigned numThreads = 0;
+
+  static BarrierExecutionScope cta() {
+    return {Kind::Cta, /*barrierIndex=*/0, /*numThreads=*/0};
+  }
+
+  static BarrierExecutionScope warpGroup(unsigned barrierIndex,
+                                         unsigned numThreads) {
+    return {Kind::WarpGroup, barrierIndex, numThreads};
+  }
+
+  bool isEquivalentTo(const BarrierExecutionScope &other) const {
+    if (kind != other.kind)
+      return false;
+    if (kind == Kind::Cta)
+      return true;
+    // One-warp barriers lower to `bar.warp.sync`; their hardware barrier ID is
+    // therefore not part of the execution contract.
+    if (numThreads == 32 && other.numThreads == 32)
+      return true;
+    return barrierIndex == other.barrierIndex &&
+           numThreads == other.numThreads;
+  }
+};
+
+using BarrierScopeMap =
+    llvm::DenseMap<Operation *, SmallVector<BarrierExecutionScope, 2>>;
+
+struct ScopedFunction {
+  LLVM::LLVMFuncOp function;
+  BarrierExecutionScope scope;
+};
+
+static bool addBarrierScope(BarrierScopeMap &scopes, LLVM::LLVMFuncOp function,
+                            BarrierExecutionScope scope) {
+  auto &functionScopes = scopes[function.getOperation()];
+  if (llvm::any_of(functionScopes, [&](const BarrierExecutionScope &existing) {
+        return existing.isEquivalentTo(scope);
+      }))
+    return false;
+  functionScopes.push_back(scope);
+  return true;
+}
+
+static LogicalResult
+enqueueScopedCallee(LLVM::CallOp call, BarrierExecutionScope scope,
+                    ModuleOp module, BarrierScopeMap &scopes,
+                    SmallVectorImpl<ScopedFunction> &worklist) {
+  std::optional<StringRef> calleeName = call.getCallee();
+  if (!calleeName &&
+      scope.kind == BarrierExecutionScope::Kind::WarpGroup)
+    return call.emitError(
+        "cannot determine warp-group barrier scope across an indirect call");
+  if (!calleeName)
+    return success();
+
+  auto callee = module.lookupSymbol<LLVM::LLVMFuncOp>(*calleeName);
+  // External functions have no body in which a CTA barrier can occur.
+  if (!callee || callee.getBody().empty())
+    return success();
+
+  bool containsWarpSpecialize = false;
+  callee.walk([&](WarpSpecializeOp) { containsWarpSpecialize = true; });
+  if (containsWarpSpecialize)
+    return call.emitError("a warp-specialized callee is unsupported; "
+                          "warp specialization must be rooted at a kernel");
+
+  if (addBarrierScope(scopes, callee, scope))
+    worklist.push_back({callee, scope});
+  return success();
+}
+
+static LogicalResult
+enqueueCallsInDefaultWarpGroup(LLVM::LLVMFuncOp kernel,
+                               BarrierExecutionScope scope, ModuleOp module,
+                               BarrierScopeMap &scopes,
+                               SmallVectorImpl<ScopedFunction> &worklist) {
+  LogicalResult result = success();
+  kernel.walk<mlir::WalkOrder::PreOrder>([&](Operation *op) {
+    // Partition regions execute under their own barrier scopes.
+    if (isa<WarpSpecializePartitionsOp>(op))
+      return WalkResult::skip();
+    if (auto call = dyn_cast<LLVM::CallOp>(op)) {
+      if (failed(
+              enqueueScopedCallee(call, scope, module, scopes, worklist))) {
+        result = failure();
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return result;
+}
+
+static LogicalResult
+collectTransitiveBarrierScopes(ModuleOp module,
+                               ArrayRef<LLVM::LLVMFuncOp> kernels,
+                               unsigned threadsPerWarp,
+                               BarrierScopeMap &scopes) {
+  SmallVector<ScopedFunction> worklist;
+
+  for (LLVM::LLVMFuncOp kernel : kernels) {
+    SmallVector<WarpSpecializeOp> wsOps;
+    kernel.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+
+    if (wsOps.empty()) {
+      if (failed(enqueueCallsInDefaultWarpGroup(
+              kernel, BarrierExecutionScope::cta(), module, scopes, worklist)))
+        return failure();
+      continue;
+    }
+
+    unsigned defaultWarpGroupSize =
+        threadsPerWarp * lookupNumWarps(kernel);
+    if (failed(enqueueCallsInDefaultWarpGroup(
+            kernel,
+            BarrierExecutionScope::warpGroup(
+                kDefaultWarpGroupBarrierIdx, defaultWarpGroupSize),
+            module, scopes, worklist)))
+      return failure();
+
+    for (WarpSpecializeOp wsOp : wsOps) {
+      for (auto [idx, partition] :
+           llvm::enumerate(wsOp.getPartitionRegions())) {
+        unsigned barrierIndex = idx + kNumReservedBarriers;
+        if (barrierIndex >= kNumBarriers)
+          return kernel.emitError("cannot support more than ")
+                 << (kNumBarriers - kNumReservedBarriers)
+                 << " warp group partitions";
+        unsigned partitionSize =
+            threadsPerWarp * wsOp.getPartitionNumWarps()[idx];
+        BarrierExecutionScope scope =
+            BarrierExecutionScope::warpGroup(barrierIndex, partitionSize);
+        LogicalResult result = success();
+        partition->walk([&](LLVM::CallOp call) {
+          if (failed(
+                  enqueueScopedCallee(call, scope, module, scopes, worklist)))
+            result = failure();
+        });
+        if (failed(result))
+          return failure();
+      }
+    }
+  }
+
+  while (!worklist.empty()) {
+    ScopedFunction scopedFunction = worklist.pop_back_val();
+    LogicalResult result = success();
+    scopedFunction.function.walk([&](LLVM::CallOp call) {
+      if (failed(enqueueScopedCallee(call, scopedFunction.scope, module, scopes,
+                                     worklist)))
+        result = failure();
+    });
+    if (failed(result))
+      return failure();
+  }
+
+  return success();
+}
+
+static LogicalResult
+rewriteTransitiveWarpGroupBarriers(ModuleOp module,
+                                   ArrayRef<LLVM::LLVMFuncOp> kernels,
+                                   unsigned threadsPerWarp) {
+  BarrierScopeMap scopes;
+  if (failed(collectTransitiveBarrierScopes(module, kernels, threadsPerWarp,
+                                            scopes)))
+    return failure();
+
+  for (auto &[operation, functionScopes] : scopes) {
+    auto function = cast<LLVM::LLVMFuncOp>(operation);
+    SmallVector<NVVM::Barrier0Op> barriers;
+    function.walk([&](NVVM::Barrier0Op barrier) {
+      barriers.push_back(barrier);
+    });
+    if (barriers.empty())
+      continue;
+
+    if (functionScopes.size() != 1) {
+      InFlightDiagnostic diagnostic = function.emitError(
+          "barrier-bearing function is called from incompatible execution "
+          "scopes");
+      for (const BarrierExecutionScope &scope : functionScopes) {
+        if (scope.kind == BarrierExecutionScope::Kind::Cta) {
+          diagnostic.attachNote(function.getLoc()) << "called from CTA scope";
+        } else {
+          diagnostic.attachNote(function.getLoc())
+              << "called from warp-group scope with barrier "
+              << scope.barrierIndex << " and " << scope.numThreads
+              << " participating threads";
+        }
+      }
+      return failure();
+    }
+
+    const BarrierExecutionScope &scope = functionScopes.front();
+    if (scope.kind == BarrierExecutionScope::Kind::Cta)
+      continue;
+
+    for (NVVM::Barrier0Op barrier : barriers) {
+      TritonLLVMIRRewriter rewriter(barrier.getLoc(), barrier);
+      createBarrier(rewriter, scope.barrierIndex, scope.numThreads);
+      barrier.erase();
+    }
+  }
+
+  return success();
+}
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // elideTrivialCaptures
@@ -658,6 +880,10 @@ struct ConvertWarpSpecializeToLLVM
       if (func.isPublic())
         kernels.push_back(func);
     }
+    unsigned threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
+    if (failed(
+            rewriteTransitiveWarpGroupBarriers(mod, kernels, threadsPerWarp)))
+      return signalPassFailure();
     for (LLVM::LLVMFuncOp kernel : kernels)
       if (failed(lowerWarpSpecialize(kernel, targetInfo)))
         return signalPassFailure();

@@ -138,6 +138,14 @@ static bool matchFullIndexTensorForAxis(Value index, size_t axis,
     return false;
 
   Value current = stripIndexValueWrappers(index);
+  // Canonicalization folds a full index tensor for a unit-extent axis into a
+  // splat constant. It is still a complete static view of that axis.
+  if (shape[axis] == 1) {
+    if (std::optional<int64_t> cst = getConstantIntLike(current)) {
+      offset = *cst;
+      return true;
+    }
+  }
   if (shape.size() == 1)
     return matchRangeWithStaticOffset(current, shape.front(), offset);
 

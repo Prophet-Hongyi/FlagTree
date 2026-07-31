@@ -13,6 +13,39 @@ import triton.language as tl
 import triton.experimental.tle.language as tle
 
 BLOCK_SIZE = 64
+EXPLICIT_LOCAL_POINTER_LAYOUT = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 1, 8],
+        [1, 32, 1],
+        [2, 1, 4],
+        [2, 1, 0],
+    )
+)
+EXPLICIT_GEMV_ACCUMULATOR_LAYOUT = tl.constexpr(
+    tle.gpu.SlicedEncoding(1, EXPLICIT_LOCAL_POINTER_LAYOUT.value)
+)
+EXPLICIT_2D_VECTOR_LOAD_LAYOUT = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 8],
+        [8, 4],
+        [8, 1],
+        [1, 0],
+    )
+)
+EXPLICIT_2D_VECTOR_LOAD_K_LAYOUT = tl.constexpr(
+    tle.gpu.SlicedEncoding(0, EXPLICIT_2D_VECTOR_LOAD_LAYOUT.value)
+)
+EXPLICIT_2D_VECTOR_LOAD_N_LAYOUT = tl.constexpr(
+    tle.gpu.SlicedEncoding(1, EXPLICIT_2D_VECTOR_LOAD_LAYOUT.value)
+)
+EXPLICIT_PACKED_GEMV_LAYOUT = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 2, 1, 8],
+        [1, 32, 1, 1],
+        [2, 1, 4, 1],
+        [3, 2, 1, 0],
+    )
+)
 
 
 def _is_enflame_backend():
@@ -134,6 +167,219 @@ def _local_pointer_full_view_2d_copy_kernel(
 
     out_tile = out_ptr + rows * stride_om + cols * stride_on
     tl.store(out_tile, vals)
+
+
+@triton.jit
+def _local_pointer_explicit_consumer_encoding_kernel(x_ptr, out_ptr):
+    groups: tl.constexpr = 2
+    reduction: tl.constexpr = 8
+    lanes: tl.constexpr = 32
+    shape: tl.constexpr = (groups, reduction, lanes)
+
+    smem = tle.gpu.alloc(
+        [groups, reduction, lanes],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    group = tl.arange(0, groups)[:, None, None]
+    k = tl.arange(0, reduction)[None, :, None]
+    lane = tl.arange(0, lanes)[None, None, :]
+    offsets = (group * reduction + k) * lanes + lane
+    tle.gpu.copy(x_ptr + offsets, smem, [groups, reduction, lanes])
+
+    smem_ptrs = tle.gpu.local_ptr(
+        smem,
+        (
+            tl.broadcast_to(group, shape),
+            tl.broadcast_to(k, shape),
+            tl.broadcast_to(lane, shape),
+        ),
+    )
+    values = tle.encoding(tl.load(smem_ptrs), EXPLICIT_LOCAL_POINTER_LAYOUT)
+    tl.store(out_ptr + offsets, values)
+
+
+@triton.jit
+def _local_pointer_2d_vectorized_load_kernel(x_ptr, out_ptr):
+    block_n: tl.constexpr = 64
+    reduction: tl.constexpr = 32
+    shared_rows: tl.constexpr = 32
+    shared_cols: tl.constexpr = 128
+    n_vector: tl.constexpr = 8
+    k_atom: tl.constexpr = 16
+
+    shared_layout: tl.constexpr = tle.gpu.swizzled_shared_layout(
+        vectorSize=8,
+        perPhase=2,
+        maxPhase=8,
+        order=[1, 0],
+        numCTAs=[1, 1],
+        numCTAsPerCGA=[1, 1],
+        numCTASplit=[1, 1],
+        numCTAOrder=[1, 0],
+    )
+    smem = tle.gpu.alloc(
+        [shared_rows, shared_cols],
+        dtype=tl.bfloat16,
+        layout=shared_layout,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    physical_row = tle.encoding(
+        tle.encoding(
+            tl.arange(0, shared_rows),
+            EXPLICIT_2D_VECTOR_LOAD_N_LAYOUT,
+        )[:, None],
+        EXPLICIT_2D_VECTOR_LOAD_LAYOUT,
+    )
+    physical_col = tle.encoding(
+        tle.encoding(
+            tl.arange(0, shared_cols),
+            EXPLICIT_2D_VECTOR_LOAD_K_LAYOUT,
+        )[None, :],
+        EXPLICIT_2D_VECTOR_LOAD_LAYOUT,
+    )
+    staging_ptrs = tle.gpu.local_ptr(
+        smem,
+        (physical_row, physical_col),
+        shape=(shared_rows, shared_cols),
+    )
+    staging_ptrs = tl.max_contiguous(staging_ptrs, [1, 8])
+    staging_ptrs = tl.multiple_of(staging_ptrs, [1, 16])
+    tl.store(
+        staging_ptrs,
+        tl.load(x_ptr + physical_row * shared_cols + physical_col),
+    )
+    tl.debug_barrier()
+
+    local_n = tle.encoding(
+        tle.encoding(
+            tl.arange(0, block_n),
+            EXPLICIT_2D_VECTOR_LOAD_N_LAYOUT,
+        )[:, None],
+        EXPLICIT_2D_VECTOR_LOAD_LAYOUT,
+    )
+    local_k_vector = tle.encoding(
+        tl.arange(0, reduction),
+        EXPLICIT_2D_VECTOR_LOAD_K_LAYOUT,
+    )
+    local_k = tle.encoding(
+        local_k_vector[None, :],
+        EXPLICIT_2D_VECTOR_LOAD_LAYOUT,
+    )
+    shared_row = local_k // k_atom * (block_n // n_vector) + local_n // n_vector
+    shared_col = local_n % n_vector * k_atom + local_k % k_atom
+    smem_ptrs = tle.gpu.local_ptr(
+        smem,
+        (shared_row, shared_col),
+        shape=(block_n, reduction),
+    )
+    smem_ptrs = tl.max_contiguous(smem_ptrs, [1, 8])
+    smem_ptrs = tl.multiple_of(smem_ptrs, [1, 16])
+    values = tle.encoding(
+        tl.load(smem_ptrs),
+        EXPLICIT_2D_VECTOR_LOAD_LAYOUT,
+    )
+    tl.store(out_ptr + local_n * reduction + local_k, values)
+
+
+@triton.jit
+def _local_pointer_explicit_accumulator_reshape_store_kernel(out_ptr):
+    groups: tl.constexpr = 2
+    lanes: tl.constexpr = 32
+    numel: tl.constexpr = groups * lanes
+
+    flat = tl.arange(0, numel)
+    accumulator = tl.reshape(flat, (groups, lanes)).to(tl.float32)
+    accumulator = tle.encoding(accumulator, EXPLICIT_GEMV_ACCUMULATOR_LAYOUT)
+    stored = tl.reshape(accumulator, (groups, 4, 8))
+
+    smem = tle.gpu.alloc(
+        [numel],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    group = tl.arange(0, groups)[:, None, None]
+    lane0 = tl.arange(0, 4)[None, :, None]
+    lane1 = tl.arange(0, 8)[None, None, :]
+    linear = group * lanes + lane0 * 8 + lane1
+    smem_ptrs = tle.gpu.local_ptr(
+        smem, (linear, ), shape=(groups, 4, 8)
+    )
+    tl.store(smem_ptrs, stored)
+    tl.debug_barrier()
+
+    values = tl.load(smem_ptrs)
+    tl.store(out_ptr + linear, values)
+
+
+@triton.jit
+def _masked_packed_global_to_shared_staging_kernel(
+    x_ptr,
+    out_ptr,
+    valid_groups,
+):
+    groups: tl.constexpr = 2
+    reduction: tl.constexpr = 64
+    lanes: tl.constexpr = 32
+    packed_shape: tl.constexpr = (groups, reduction, 4, 8)
+    packed_lanes: tl.constexpr = 4
+    vector_lanes: tl.constexpr = 8
+    consumer_shape: tl.constexpr = (
+        groups,
+        reduction,
+        packed_lanes,
+        vector_lanes,
+    )
+
+    smem = tle.gpu.alloc(
+        [groups, reduction, packed_lanes, vector_lanes],
+        dtype=tl.bfloat16,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    group = tl.arange(0, groups)[:, None, None, None]
+    k = tl.arange(0, reduction)[None, :, None, None]
+    lane0 = tl.arange(0, 4)[None, None, :, None]
+    lane1 = tl.arange(0, 8)[None, None, None, :]
+    packed_offset = ((group * reduction + k) * 4 + lane0) * 8 + lane1
+    packed_mask = group < valid_groups
+    values = tl.load(x_ptr + packed_offset, mask=packed_mask)
+    staged_ptrs = tle.gpu.local_ptr(
+        smem,
+        (group, k, lane0, lane1),
+        shape=packed_shape,
+    )
+    tl.store(staged_ptrs, values, mask=packed_mask)
+    tl.debug_barrier()
+
+    consumer_group = tl.arange(0, groups)[:, None, None, None]
+    consumer_k = tl.arange(0, reduction)[None, :, None, None]
+    consumer_lane0 = tl.arange(0, packed_lanes)[None, None, :, None]
+    consumer_lane1 = tl.arange(0, vector_lanes)[None, None, None, :]
+    consumer_ptrs = tle.gpu.local_ptr(
+        smem,
+        (
+            tl.broadcast_to(consumer_group, consumer_shape),
+            tl.broadcast_to(consumer_k, consumer_shape),
+            tl.broadcast_to(consumer_lane0, consumer_shape),
+            tl.broadcast_to(consumer_lane1, consumer_shape),
+        ),
+    )
+    consumer_mask = consumer_group < valid_groups
+    staged = tl.load(consumer_ptrs, mask=consumer_mask, other=0.0)
+    staged = tle.encoding(staged, EXPLICIT_PACKED_GEMV_LAYOUT)
+    output_offset = (
+        ((consumer_group * reduction + consumer_k) * packed_lanes + consumer_lane0)
+        * vector_lanes
+        + consumer_lane1
+    )
+    tl.store(out_ptr + output_offset, staged, mask=consumer_mask)
 
 
 @triton.jit
@@ -285,6 +531,68 @@ def _local_pointer_axis_gather_kernel(
 
     out_tile = out_ptr + offs_m * stride_om + tl.arange(0, SLICE)[None, :] * stride_on
     tl.store(out_tile, vals)
+
+
+@triton.jit
+def _local_pointer_shape_broadcast_kernel(
+    x_ptr,
+    out_ptr,
+    stride_xm,
+    stride_xn,
+    stride_om,
+    stride_on,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    smem = tle.gpu.alloc(
+        [3, ROWS, COLS],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    rows = tl.arange(0, ROWS)[:, None]
+    cols = tl.arange(0, COLS)[None, :]
+    ptrs = tle.gpu.local_ptr(
+        smem,
+        (2, rows, cols),
+        shape=(ROWS, COLS),
+    )
+    values = tl.load(x_ptr + rows * stride_xm + cols * stride_xn)
+    tl.store(ptrs, values)
+    staged = tl.load(ptrs)
+    tl.store(out_ptr + rows * stride_om + cols * stride_on, staged)
+
+
+@triton.jit
+def _local_pointer_non_power_of_two_full_view_kernel(out_ptr):
+    smem = tle.gpu.alloc(
+        [3, 64],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    ptrs = tle.gpu.local_ptr(smem)
+    tl.store(out_ptr + tl.arange(0, 64), tl.load(ptrs)[0, :])
+
+
+@triton.jit
+def _local_pointer_non_power_of_two_result_shape_kernel(out_ptr):
+    smem = tle.gpu.alloc(
+        [3, 64],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    offsets = tl.arange(0, 64)
+    ptrs = tle.gpu.local_ptr(
+        smem,
+        (0, offsets),
+        shape=(3, 64),
+    )
+    tl.store(out_ptr + offsets, tl.load(ptrs)[0, :])
 
 
 @triton.jit
@@ -453,6 +761,142 @@ class TestTLELocalPointerKernel:
         expected = torch.arange(block, device="cuda", dtype=torch.int32) + 5
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
+    def test_explicit_consumer_encoding_rematerializes_shared_address_dag(self):
+        if _is_enflame_backend():
+            pytest.skip("Explicit TritonGPU encodings are CUDA-specific")
+
+        numel = 2 * 8 * 32
+        x = torch.arange(numel, device="cuda", dtype=torch.float32)
+        out = torch.empty_like(x)
+        compiled = _local_pointer_explicit_consumer_encoding_kernel.warmup(
+            x,
+            out,
+            grid=(1, ),
+            num_warps=8,
+        )
+        ttgir = compiled.asm["ttgir"]
+        assert "sizePerThread = [1, 1, 8]" in ttgir
+        assert "threadsPerWarp = [1, 32, 1]" in ttgir
+        assert "warpsPerCTA = [2, 1, 4]" in ttgir
+        assert "ttg.async_copy_global_to_local" in ttgir
+        assert "ttg.convert_layout" not in ttgir
+        assert compiled.metadata.shared == numel * x.element_size()
+
+        _local_pointer_explicit_consumer_encoding_kernel[(1, )](
+            x,
+            out,
+            num_warps=8,
+        )
+        torch.testing.assert_close(out, x, atol=0, rtol=0)
+
+    def test_2d_local_pointer_load_vectorizes_from_axis_hints(self):
+        if _is_enflame_backend():
+            pytest.skip("Explicit TritonGPU encodings are CUDA-specific")
+
+        shared_rows = 32
+        shared_cols = 128
+        block_n = 64
+        reduction = 32
+        x = torch.arange(
+            shared_rows * shared_cols,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).reshape(shared_rows, shared_cols)
+        out = torch.empty(
+            (block_n, reduction),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        compiled = _local_pointer_2d_vectorized_load_kernel.warmup(
+            x,
+            out,
+            grid=(1, ),
+            num_warps=8,
+        )
+        ptx = compiled.asm["ptx"]
+        assert "ld.shared.v4.b32" in ptx
+        assert "ld.shared.b16" not in ptx
+
+        _local_pointer_2d_vectorized_load_kernel[(1, )](
+            x,
+            out,
+            num_warps=8,
+        )
+        n = torch.arange(block_n, device="cuda")[:, None]
+        k = torch.arange(reduction, device="cuda")[None, :]
+        expected = x[
+            k // 16 * (block_n // 8) + n // 8,
+            n % 8 * 16 + k % 16,
+        ]
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    def test_explicit_accumulator_reshape_preserves_layout_for_shared_store(self):
+        if _is_enflame_backend():
+            pytest.skip("Explicit TritonGPU encodings are CUDA-specific")
+
+        numel = 2 * 32
+        out = torch.empty((numel, ), device="cuda", dtype=torch.float32)
+        compiled = _local_pointer_explicit_accumulator_reshape_store_kernel.warmup(
+            out,
+            grid=(1, ),
+            num_warps=8,
+        )
+        ttgir = compiled.asm["ttgir"]
+        assert "tt.reshape" in ttgir
+        assert "ttg.convert_layout" not in ttgir
+        assert compiled.metadata.shared == numel * out.element_size()
+
+        _local_pointer_explicit_accumulator_reshape_store_kernel[(1, )](
+            out,
+            num_warps=8,
+        )
+        expected = torch.arange(numel, device="cuda", dtype=torch.float32)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    def test_masked_packed_global_to_shared_staging_avoids_value_exchange(self):
+        if _is_enflame_backend():
+            pytest.skip("Explicit TritonGPU encodings are CUDA-specific")
+
+        groups = 2
+        reduction = 64
+        lanes = 32
+        valid_groups = 1
+        x = torch.arange(
+            groups * reduction * lanes,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).reshape(groups, reduction, 4, 8)
+        out = torch.full(
+            (groups, reduction, 4, 8),
+            -1,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        compiled = _masked_packed_global_to_shared_staging_kernel.warmup(
+            x,
+            out,
+            valid_groups,
+            grid=(1, ),
+            num_warps=8,
+        )
+        ttgir = compiled.asm["ttgir"]
+        assert "ttg.async_copy_global_to_local" in ttgir
+        assert "ttg.convert_layout" not in ttgir
+
+        _masked_packed_global_to_shared_staging_kernel[(1, )](
+            x,
+            out,
+            valid_groups,
+            num_warps=8,
+        )
+        torch.testing.assert_close(
+            out[0],
+            x[0],
+            atol=0,
+            rtol=0,
+        )
+        assert torch.all(out[1] == -1)
+
     def test_local_pointer_conditional_mask_store_compiles(self):
         block = 512
         numel = block - 7
@@ -553,6 +997,72 @@ class TestTLELocalPointerKernel:
 
         expected = x[:, 1:1 + slice_width]
         torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
+
+    def test_local_pointer_shape_broadcasts_scalar_and_singleton_axes(self):
+        rows = 8
+        cols = 16
+        x = torch.arange(
+            rows * cols,
+            device="cuda",
+            dtype=torch.float32,
+        ).reshape(rows, cols)
+        out = torch.empty_like(x)
+
+        compiled = _local_pointer_shape_broadcast_kernel.warmup(
+            x,
+            out,
+            x.stride(0),
+            x.stride(1),
+            out.stride(0),
+            out.stride(1),
+            ROWS=rows,
+            COLS=cols,
+            grid=(1, ),
+            num_warps=4,
+        )
+        ttgir = compiled.asm["ttgir"]
+        assert "!ttg.memdesc<3x8x16xf32" in ttgir
+        assert "ttg.memdesc_index" in ttgir
+
+        _local_pointer_shape_broadcast_kernel[(1, )](
+            x,
+            out,
+            x.stride(0),
+            x.stride(1),
+            out.stride(0),
+            out.stride(1),
+            ROWS=rows,
+            COLS=cols,
+            num_warps=4,
+        )
+
+        torch.testing.assert_close(out, x, atol=0, rtol=0)
+
+    def test_local_pointer_rejects_non_power_of_two_full_view_tensor(self):
+        out = torch.empty((64, ), device="cuda", dtype=torch.float32)
+
+        with pytest.raises(
+            triton.CompilationError,
+            match="cannot materialize a full-view tensor for a non-power-of-two buffer shape",
+        ):
+            _local_pointer_non_power_of_two_full_view_kernel.warmup(
+                out,
+                grid=(1, ),
+                num_warps=4,
+            )
+
+    def test_local_pointer_rejects_explicit_non_power_of_two_result_shape(self):
+        out = torch.empty((64, ), device="cuda", dtype=torch.float32)
+
+        with pytest.raises(
+            triton.CompilationError,
+            match="result tensor shape must contain only powers of two",
+        ):
+            _local_pointer_non_power_of_two_result_shape_kernel.warmup(
+                out,
+                grid=(1, ),
+                num_warps=4,
+            )
 
     def test_local_pointer_scalar_dynamic_index_inserts_barrier(self):
         block = 64

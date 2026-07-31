@@ -1100,14 +1100,30 @@ Value getStackPointer(RewriterBase &rewriter, FunctionOpInterface funcOp) {
   return LLVM::AddressOfOp::create(rewriter, funcOp.getLoc(), globalBase);
 }
 
+Value getGlobalScratchBase(Location loc, RewriterBase &rewriter,
+                           FunctionOpInterface funcOp, Value frameOffset) {
+  // See NOTE: [Additional Function Arguments]
+  auto gmemBase =
+      funcOp.getArgument(funcOp.getNumArguments() + kGlobalScratchBufferOffset);
+  if (!frameOffset) {
+    return gmemBase;
+  }
+
+  auto ptrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext(), 1);
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  return b.gep(ptrTy, i8_ty, gmemBase, frameOffset);
+}
+
 Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
                           const TargetInfoBase &targetInfo,
                           FunctionOpInterface funcOp, Value allocOffset = {}) {
   // See NOTE: [Additional Function Arguments]
-  if (!isKernel(funcOp)) {
-    // Base for this function
-    auto gmemBase = funcOp.getArgument(funcOp.getNumArguments() +
-                                       kGlobalScratchBufferOffset);
+  auto gmemBase = getGlobalScratchBase(loc, rewriter, funcOp);
+
+  ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
+  auto allocSizeAttr = mod.getOperation()->getAttrOfType<mlir::IntegerAttr>(
+      "ttg.global_scratch_memory_size");
+  if (!allocSizeAttr) {
     if (!allocOffset) {
       return gmemBase;
     }
@@ -1115,17 +1131,6 @@ Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
     auto ptrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext(), 1);
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     return b.gep(ptrTy, i8_ty, gmemBase, allocOffset);
-  }
-
-  // Base for entire kernel
-  auto gmemBase =
-      funcOp.getArgument(funcOp.getNumArguments() + kGlobalScratchBufferOffset);
-
-  ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
-  auto allocSizeAttr = mod.getOperation()->getAttrOfType<mlir::IntegerAttr>(
-      "ttg.global_scratch_memory_size");
-  if (!allocSizeAttr) {
-    return gmemBase;
   }
 
   Value gridIdx[3];

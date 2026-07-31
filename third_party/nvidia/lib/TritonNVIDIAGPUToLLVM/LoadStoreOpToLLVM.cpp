@@ -4,6 +4,7 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #ifdef __TLE__
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #endif
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
@@ -14,7 +15,6 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "Utility.h"
 #ifdef __TLE__
-#include "tle/dialect/include/Conversion/TleToLLVM/RemotePointerUtils.h"
 #include "tle/dialect/include/Transforms/TransformAttrs.h"
 #endif
 #include "triton/Analysis/AxisInfo.h"
@@ -212,6 +212,25 @@ struct LoadStoreConversionBase {
     return ptrElemTy && isSharedFamilyAddressSpace(ptrElemTy.getAddressSpace());
   }
 
+  unsigned getMaxVectorSizeByDivisibility(
+      RankedTensorType tensorTy,
+      ArrayRef<int64_t> divisibility) const {
+    auto linAttr = ttg::toLinearEncoding(tensorTy);
+    auto order = linAttr.getOrder();
+    if (order.empty() || order[0] >= divisibility.size())
+      return 1;
+
+    unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+    if (pointeeBitWidth == 0)
+      return 1;
+    unsigned elemBytes = std::max<unsigned>(pointeeBitWidth / 8, 1);
+    int64_t maxMultipleBytes = std::max<int64_t>(divisibility[order[0]], 1);
+    unsigned maxMultiple = static_cast<unsigned>(
+        std::max<int64_t>(maxMultipleBytes / elemBytes, 1));
+
+    return std::min(128 / pointeeBitWidth, maxMultiple);
+  }
+
   unsigned getMaxVectorSizeByAlignment(Value ptr) const {
     auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
     if (!tensorTy)
@@ -220,31 +239,78 @@ struct LoadStoreConversionBase {
     if (!axisInfo || axisInfo->getRank() == 0)
       return 1;
 
+    return getMaxVectorSizeByDivisibility(tensorTy,
+                                         axisInfo->getDivisibility());
+  }
+
+  Attribute findExplicitAxisInfoHint(Value ptr, StringRef name) const {
+    Value current = ptr;
+    while (Operation *definingOp = current.getDefiningOp()) {
+      Attribute hint = definingOp->getDiscardableAttr(name);
+      if (hint)
+        return hint;
+      auto cast = dyn_cast<UnrealizedConversionCastOp>(definingOp);
+      if (!cast || cast->getNumOperands() != 1)
+        break;
+      current = cast->getOperand(0);
+    }
+    return Attribute();
+  }
+
+  unsigned getMaxVectorSizeByExplicitContiguity(Value ptr) const {
+    auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    if (!tensorTy)
+      return 1;
+    Attribute hint = findExplicitAxisInfoHint(ptr, "tt.contiguity");
+    if (!hint)
+      return 1;
+
+    AxisInfo::DimVectorT contiguity(tensorTy.getRank(), 1);
+    AxisInfo::initDimVectorFromHint(hint, &contiguity);
     auto linAttr = ttg::toLinearEncoding(tensorTy);
     auto order = linAttr.getOrder();
-    if (order.empty() || order[0] >= axisInfo->getRank())
+    if (order.empty() || order[0] >= contiguity.size())
       return 1;
 
     unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
     if (pointeeBitWidth == 0)
       return 1;
-    unsigned elemBytes = std::max<unsigned>(pointeeBitWidth / 8, 1);
-    unsigned maxMultipleBytes = axisInfo->getDivisibility(order[0]);
-    unsigned maxMultiple = std::max<unsigned>(maxMultipleBytes / elemBytes, 1);
+    unsigned maxByType = std::max<unsigned>(128 / pointeeBitWidth, 1);
+    unsigned maxByElements =
+        std::max<unsigned>(getTotalElemsPerThread(tensorTy), 1);
+    unsigned explicitContiguity =
+        static_cast<unsigned>(std::max<int64_t>(contiguity[order[0]], 1));
+    return std::min({maxByType, maxByElements, explicitContiguity});
+  }
 
-    return std::min<unsigned>(128 / pointeeBitWidth, maxMultiple);
+  unsigned getMaxVectorSizeByExplicitAlignment(Value ptr) const {
+    auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    if (!tensorTy)
+      return 1;
+    Attribute hint = findExplicitAxisInfoHint(ptr, "tt.divisibility");
+    if (!hint)
+      return 1;
+
+    AxisInfo::DimVectorT divisibility(tensorTy.getRank(), 1);
+    AxisInfo::initDimVectorFromHint(hint, &divisibility);
+    return getMaxVectorSizeByDivisibility(tensorTy, divisibility);
   }
 
   unsigned getTleSharedPointerVectorSize(Value ptr, unsigned vec) const {
     if (!isTleSharedTensorPtr(ptr))
       return vec;
 
-    // AxisInfo contiguity and TLE layout hints may both propose vectorized
-    // shared-memory accesses. They are legal only up to the width whose first
-    // element alignment is proven by AxisInfo divisibility.
-    unsigned hint = tte::inferTlePointerLayoutVectorHint(ptr);
-    unsigned alignmentBound = getMaxVectorSizeByAlignment(ptr);
-    return std::min(std::max(vec, hint), alignmentBound);
+    // TLE pointer conversion may replace the analyzed value before load/store
+    // lowering. Preserve and consume the original contiguity and divisibility
+    // proofs instead of inferring contiguity from the tensor layout alone.
+    unsigned explicitContiguity =
+        getMaxVectorSizeByExplicitContiguity(ptr);
+    unsigned contiguityBound = std::max(vec, explicitContiguity);
+    unsigned analyzedAlignment = getMaxVectorSizeByAlignment(ptr);
+    unsigned explicitAlignment = getMaxVectorSizeByExplicitAlignment(ptr);
+    unsigned alignmentBound =
+        std::max(analyzedAlignment, explicitAlignment);
+    return std::min(contiguityBound, alignmentBound);
   }
 #endif
 
@@ -1593,7 +1659,11 @@ getMsgToUnpackedOffsetLayout(const LinearLayout &packedLayout,
 struct AsyncTMACopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  AsyncTMACopyGlobalToLocalOpConversion(LLVMTypeConverter &converter,
+                                        int computeCapability,
+                                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        computeCapability(computeCapability) {}
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp op,
@@ -1601,8 +1671,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     if (op.getCache() != triton::CacheModifier::NONE)
       return op.emitError("cache modifiers not supported yet");
-    if (op.getEvict() != triton::EvictionPolicy::NORMAL)
-      return op.emitError("eviction policy not supported yet");
     if (op.getIsVolatile())
       return op.emitError("volatile not supported yet");
 
@@ -1647,6 +1715,9 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
     auto zero = b.i32_val(0);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    Value l2PolicyReg =
+        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    const bool hasL2CacheHint = l2PolicyReg != Value();
 
     // The bounding box inner dimension must be less than or equal to the
     // swizzle size.
@@ -1673,7 +1744,10 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           ptxBuilderTMA.newOperand(adaptor.getDesc(), "l")};
       std::string tmaInst =
           "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
-          "d.shared::cluster.global.mbarrier::complete_tx::bytes [$1], [$2, {";
+          "d.shared::cluster.global.mbarrier::complete_tx::bytes";
+      if (hasL2CacheHint)
+        tmaInst += ".L2::cache_hint";
+      tmaInst += " [$1], [$2, {";
 
       auto offsets = applyLinearLayout(loc, rewriter, msgToOffset,
                                        {{kMsg, copyIdxVal}, {kBlock, ctaId}});
@@ -1689,7 +1763,12 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       }
       operands.push_back(
           ptxBuilderTMA.newOperand(barrierMemObj.getBase(), "r"));
-      tmaInst += "}], [$" + std::to_string(operandIdx++) + "];";
+      tmaInst += "}], [$" + std::to_string(operandIdx++) + "]";
+      if (hasL2CacheHint) {
+        operands.push_back(ptxBuilderTMA.newOperand(l2PolicyReg, "l"));
+        tmaInst += ", $" + std::to_string(operandIdx++);
+      }
+      tmaInst += ";";
 
       auto &tma = *ptxBuilderTMA.create(tmaInst);
       tma(operands, /*onlyAttachMLIRArgs=*/true);
@@ -1698,6 +1777,9 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  int computeCapability;
 };
 
 LogicalResult convertTMAStoreLikeOp(Operation *op,
@@ -2168,8 +2250,9 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
       typeConverter, targetInfo, computeCapability, axisInfoAnalysis, benefit);
   patterns.add<AsyncCommitGroupOpConversion, AsyncWaitOpConversion,
                AsyncCopyMbarrierArriveOpConversion>(typeConverter, benefit);
-  patterns.add<AsyncTMACopyGlobalToLocalOpConversion,
-               AsyncTMACopyLocalToGlobalOpConversion,
+  patterns.add<AsyncTMACopyGlobalToLocalOpConversion>(
+      typeConverter, computeCapability, benefit);
+  patterns.add<AsyncTMACopyLocalToGlobalOpConversion,
                AsyncTMAReduceOpConversion, AsyncTMAGatherOpConversion,
                AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion>(
       typeConverter, benefit);

@@ -41,6 +41,111 @@ def _slot_local_ptr_store_kernel(out_ptr, BLOCK: tl.constexpr):
     tl.store(out_ptr + idx, vals)
 
 
+@triton.jit
+def _three_stage_pipe_producer(writer, src, BLOCK: tl.constexpr, TILES: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    for sequence in tl.range(0, TILES):
+        slot = writer.acquire(sequence)
+        tle.gpu.copy(
+            src + sequence * BLOCK + offsets,
+            slot.value,
+            [BLOCK],
+        )
+        writer.commit(sequence)
+
+
+@triton.jit
+def _three_stage_pipe_consumer(reader, dst, BLOCK: tl.constexpr, TILES: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    for sequence in tl.range(0, TILES):
+        ready = reader.wait(sequence)
+        ptrs = tle.gpu.local_ptr(ready.slot.value, (offsets, ))
+        tl.store(dst + sequence * BLOCK + offsets, tl.load(ptrs))
+        reader.release(sequence)
+
+
+@triton.jit
+def _three_stage_pipe_copy_kernel(src, dst, BLOCK: tl.constexpr, TILES: tl.constexpr):
+    stages: tl.constexpr = 3
+    values = tle.gpu.alloc(
+        [stages, BLOCK],
+        dtype=src.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    pipe = tle.pipe(
+        capacity=stages,
+        scope="cta",
+        name="three_stage_copy",
+        value=values,
+    )
+    tle.gpu.warp_specialize(
+        [
+            (_three_stage_pipe_consumer, (pipe.reader(), dst, BLOCK, TILES)),
+            (_three_stage_pipe_producer, (pipe.writer(), src, BLOCK, TILES)),
+        ],
+        [1],
+        [48],
+    )
+
+
+@triton.jit
+def _one_shot_handoff_owner(writer, owned_storage, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    pointers = tle.gpu.local_ptr(owned_storage, (offsets, ))
+    tl.store(pointers, offsets + 11)
+    writer.commit(0)
+
+
+@triton.jit
+def _one_shot_handoff_next(reader, owned_storage, dst, BLOCK: tl.constexpr):
+    reader.wait(0)
+    offsets = tl.arange(0, BLOCK)
+    pointers = tle.gpu.local_ptr(owned_storage, (offsets, ))
+    tl.store(dst + offsets, tl.load(pointers))
+
+
+@triton.jit
+def _one_shot_shared_alias_handoff_kernel(dst, BLOCK: tl.constexpr):
+    arena = tle.gpu.alloc(
+        [BLOCK],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    owned_storage = tle.gpu.alloc(
+        [BLOCK],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        alias=arena,
+        alias_offset_bytes=0,
+        nv_mma_shared_layout=False,
+    )
+    handoff = tle.pipe(
+        capacity=1,
+        scope="cta",
+        name="one_shot_shared_alias_handoff",
+        one_shot=True,
+    )
+    tle.gpu.warp_specialize(
+        [
+            (
+                _one_shot_handoff_owner,
+                (handoff.writer(), owned_storage, BLOCK),
+            ),
+            (
+                _one_shot_handoff_next,
+                (handoff.reader(), owned_storage, dst, BLOCK),
+            ),
+        ],
+        [1],
+        [48],
+    )
+
+
 def test_buffered_tensor_slot_lowers_to_memdesc_index_and_executes():
     block = 64
     out = torch.empty((block, ), device="cuda", dtype=torch.int32)
@@ -54,3 +159,56 @@ def test_buffered_tensor_slot_lowers_to_memdesc_index_and_executes():
     _slot_local_ptr_store_kernel[(1, )](out, BLOCK=block, num_warps=4)
     expected = torch.arange(0, block, device="cuda", dtype=torch.int32) + 7
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_three_stage_pipe_uses_non_power_of_two_payload_and_padded_control_state():
+    block = 64
+    tiles = 6
+    src = torch.arange(block * tiles, device="cuda", dtype=torch.int32)
+    dst = torch.empty_like(src)
+
+    compiled = _three_stage_pipe_copy_kernel.warmup(
+        src,
+        dst,
+        BLOCK=block,
+        TILES=tiles,
+        grid=(1, ),
+        num_warps=8,
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "!ttg.memdesc<3x64xi32" in ttgir
+    assert "!ttg.memdesc<4x1xi64" in ttgir
+
+    _three_stage_pipe_copy_kernel[(1, )](
+        src,
+        dst,
+        BLOCK=block,
+        TILES=tiles,
+        num_warps=8,
+    )
+    torch.testing.assert_close(dst, src, atol=0, rtol=0)
+
+
+def test_one_shot_pipe_hands_aliased_shared_storage_to_next_task():
+    block = 64
+    dst = torch.empty((block, ), device="cuda", dtype=torch.int32)
+
+    compiled = _one_shot_shared_alias_handoff_kernel.warmup(
+        dst,
+        BLOCK=block,
+        grid=(1, ),
+        num_warps=8,
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "ttng.arrive_barrier" in ttgir
+    assert "ttng.wait_barrier" in ttgir
+    assert "nvws.producer_acquire" not in ttgir
+    assert "nvws.consumer_release" not in ttgir
+
+    _one_shot_shared_alias_handoff_kernel[(1, )](
+        dst,
+        BLOCK=block,
+        num_warps=8,
+    )
+    expected = torch.arange(0, block, device="cuda", dtype=torch.int32) + 11
+    torch.testing.assert_close(dst, expected, atol=0, rtol=0)

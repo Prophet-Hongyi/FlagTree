@@ -2,6 +2,8 @@
 from .core import (
     pipeline,
     alloc,
+    async_commit_group,
+    async_wait_group,
     copy,
     memory_space,
     local_ptr,
@@ -17,6 +19,8 @@ storage_kind = memory_space
 __all__ = [
     "pipeline",
     "alloc",
+    "async_commit_group",
+    "async_wait_group",
     "copy",
     "local_ptr",
     "warp_specialize",

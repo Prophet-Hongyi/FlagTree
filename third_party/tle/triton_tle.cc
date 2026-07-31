@@ -43,6 +43,7 @@
 #include "pybind11/stl.h"
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/Passes.h"
+#include "tle/dialect/include/Transforms/TransformAttrs.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -56,6 +57,7 @@
 
 namespace py = pybind11;
 using namespace mlir;
+namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tle = triton::tle;
@@ -167,13 +169,32 @@ void init_triton_tle_ir(py::module &&m) {
              return self.create<ttg::LocalAllocOp>(memDesc);
            })
       .def("create_local_alloc",
+           [](TritonOpBuilder &self, std::vector<int64_t> shape,
+              Type &elementType, Attribute &encoding,
+              int32_t alignment) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             auto memDesc =
+                 ttg::MemDescType::get(shape, elementType, encoding,
+                                       memorySpace, /*mutableMemory=*/true);
+             return self.create<ttg::LocalAllocOp>(
+                 memDesc, Value(), alignment);
+           })
+      .def("create_local_alloc",
            [](TritonOpBuilder &self, Type resultTy, Value value) -> Value {
              return self.create<ttg::LocalAllocOp>(resultTy, value);
            })
+      .def("create_local_alloc",
+           [](TritonOpBuilder &self, Type resultTy, Value value,
+              int32_t alignment) -> Value {
+             return self.create<ttg::LocalAllocOp>(
+                 resultTy, value, alignment);
+           })
       .def("create_tma_copy",
            [](TritonOpBuilder &self, Value src, Value dst,
-              std::vector<Value> &indices) {
-             self.create<ttg::TMACopyOp>(src, dst, indices);
+              std::vector<Value> &indices, tt::EvictionPolicy evictionPolicy) {
+             auto copy = self.create<ttg::TMACopyOp>(src, dst, indices);
+             copy.setEvict(evictionPolicy);
              return;
            })
       .def("create_local_load",
@@ -183,6 +204,28 @@ void init_triton_tle_ir(py::module &&m) {
       .def("create_local_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
+           })
+      .def("create_async_copy_global_to_local",
+           [](TritonOpBuilder &self, Value smem, Value pointer, Value mask,
+              Value other, tt::CacheModifier cacheModifier,
+              tt::EvictionPolicy evictionPolicy, bool isVolatile) {
+             auto copy = self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                 pointer, smem, mask, other, cacheModifier, evictionPolicy,
+                 isVolatile);
+             copy->setAttr(triton::tle::kTleRequiredAsyncCopyAttr,
+                           self.getBuilder().getUnitAttr());
+           })
+      .def("create_async_commit_group",
+           [](TritonOpBuilder &self) {
+             ValueRange tokens;
+             self.create<ttg::AsyncCommitGroupOp>(tokens);
+           })
+      .def("create_async_wait_group",
+           [](TritonOpBuilder &self, int maxPending) {
+             ValueRange tokens;
+             auto wait = self.create<ttg::AsyncWaitOp>(tokens, maxPending);
+             wait->setAttr("tle.explicit_async_wait",
+                           self.getBuilder().getUnitAttr());
            })
       .def("create_local_pointers",
            [](TritonOpBuilder &self, Type resultTy, Value memDesc,

@@ -32,3 +32,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %0, %1 : !tt.ptr<i8>, !tt.ptr<i8>
   }
 }
+
+// -----
+
+// CHECK: module attributes {ttg.global_scratch_memory_alignment = 4 : i32, ttg.global_scratch_memory_size = 4 : i32{{.*}}}
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK: @helper_barrier{{.*}}ttg.global_scratch_memory_alignment = 4 : i32, ttg.global_scratch_memory_size = 4 : i32
+  tt.func private @helper_barrier() {
+    // CHECK: tle.distributed_barrier {group_kind = "grid", ttg.global_scratch_memory_offset = 0 : i32}
+    tle.distributed_barrier {group_kind = "grid"}
+    tt.return
+  }
+
+// CHECK: @test_barrier_call{{.*}}ttg.global_scratch_memory_alignment = 4 : i32, ttg.global_scratch_memory_size = 4 : i32
+  tt.func public @test_barrier_call() {
+    // CHECK: tt.call @helper_barrier() {ttg.global_scratch_memory_offset = 0 : i32}
+    tt.call @helper_barrier() : () -> ()
+    tt.return
+  }
+}

@@ -465,9 +465,18 @@ class CompiledKernel:
                 raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))
         if knobs.runtime.kernel_load_start_hook is not None:
             knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
-        # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
-        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
+        self.module, self.function, self.n_regs, self.n_local_bytes, self.n_max_threads = driver.active.utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
+        if self.metadata.target.backend == "cuda":
+            self.n_spill_stores = int(self.metadata.ptxas_spill_store_bytes)
+            self.n_spill_loads = int(self.metadata.ptxas_spill_load_bytes)
+            self.n_spills = self.n_spill_stores + self.n_spill_loads
+            self.n_stack_bytes = int(self.metadata.ptxas_stack_frame_bytes)
+        else:
+            self.n_spill_stores = self.n_local_bytes
+            self.n_spill_loads = self.n_local_bytes
+            self.n_spills = self.n_local_bytes
+            self.n_stack_bytes = 0
         warp_size = driver.active.get_current_target().warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))

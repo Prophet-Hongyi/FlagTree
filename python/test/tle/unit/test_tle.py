@@ -18,7 +18,7 @@ import triton.experimental.tle.language as tle
 import triton.experimental.tle.mega as tlem
 from triton._filecheck import run_parser
 from triton.backends.compiler import GPUTarget
-from triton.language.core import base_value
+from triton.language.core import base_type, base_value
 from triton.experimental.tle.language.gpu.core import _deduplicate_warp_specialize_captures
 from triton.experimental.tle.language.gpu.semantic import TLESemanticError, TLESemantic
 
@@ -233,6 +233,7 @@ class TestBufferedTensor:
             self.memdesc_index_args = None
             self.memdesc_subslice_args = None
             self.memdesc_alias_args = None
+            self.local_alloc_args = None
             self.swizzled_encoding_args = None
             self.pipe_create_args = None
             self.pipe_ops = []
@@ -271,6 +272,10 @@ class TestBufferedTensor:
         def create_memdesc_alias(self, result_ty, src, offset_bytes):
             self.memdesc_alias_args = (result_ty, src, offset_bytes)
             return "alias_handle"
+
+        def create_local_alloc(self, *args):
+            self.local_alloc_args = args
+            return "alloc_handle"
 
         def create_pipe_create(self, fields, capacity, scope, pipe_name, field_names, reader_names, one_shot):
             self.pipe_create_args = (list(fields), capacity, scope, pipe_name, list(field_names), list(reader_names),
@@ -349,11 +354,21 @@ class TestBufferedTensor:
         assert hasattr(tle.gpu.buffered_tensor, 'slot')
         assert hasattr(tle.gpu.buffered_tensor, 'subslice')
 
+    def test_buffered_tensor_type_accepts_non_power_of_two_stage_count(self):
+        """Memory descriptors are not Triton value tensors."""
+        buffer, _ = self._make_buffer([3, 16, 32])
+
+        assert isinstance(buffer.type, base_type)
+        assert not isinstance(buffer.type, tl.block_type)
+        assert buffer.type.shape == (3, 16, 32)
+        assert buffer.type.numel == 3 * 16 * 32
+        assert buffer.type.nbytes == 3 * 16 * 32 * 2
+
     def test_buffered_tensor_slot_indexes_leading_dimension(self):
         """slot(stage) returns a typed view with the leading stage dimension removed."""
-        buffer, semantic = self._make_buffer([4, 16, 32])
+        buffer, semantic = self._make_buffer([3, 16, 32])
 
-        slot = buffer.slot(1, _semantic=semantic)
+        slot = buffer.slot(2, _semantic=semantic)
 
         assert isinstance(slot, tle.gpu.buffered_tensor)
         assert slot.handle == "slot_handle"
@@ -361,11 +376,11 @@ class TestBufferedTensor:
         assert slot.dtype == tl.float16
         assert slot.type.storage is tle.gpu.smem
         assert semantic.builder.swizzled_encoding_args == (1, 1, 1, [1, 0], [1, 1], [1, 1], [1, 0])
-        assert semantic.builder.memdesc_type_args == ([16, 32], "fp16", "fake_layout", "smem", [16, 32])
+        assert semantic.builder.memdesc_type_args == ([16, 32], "fp16", "fake_layout", "smem", (16, 32))
         assert semantic.builder.memdesc_index_args == (
             ("memdesc", (16, 32), "fp16", "fake_layout", "smem", (16, 32)),
             "base",
-            "stage_1",
+            "stage_2",
         )
 
     def test_buffered_tensor_subslice_creates_typed_view(self):
@@ -379,7 +394,7 @@ class TestBufferedTensor:
         assert sub.shape == [2, 16, 16]
         assert sub.dtype == tl.float16
         assert sub.type.storage is tle.gpu.smem
-        assert semantic.builder.memdesc_type_args == ([2, 16, 16], "fp16", "fake_layout", "smem", [4, 16, 32])
+        assert semantic.builder.memdesc_type_args == ([2, 16, 16], "fp16", "fake_layout", "smem", (4, 16, 32))
         assert semantic.builder.memdesc_subslice_args == (
             ("memdesc", (2, 16, 16), "fp16", "fake_layout", "smem", (4, 16, 32)),
             "base",
@@ -422,6 +437,36 @@ class TestBufferedTensor:
             "base",
             64,
         )
+
+    def test_alloc_preserves_explicit_alignment(self):
+        buffer, semantic = self._make_buffer([64])
+        allocation = tle.gpu.alloc(
+            (64,),
+            tl.float16,
+            layout=buffer.type.layout,
+            alignment=1024,
+            _semantic=semantic,
+        )
+
+        assert allocation.handle == "alloc_handle"
+        assert semantic.builder.local_alloc_args == (
+            [64],
+            "fp16",
+            "fake_layout",
+            1024,
+        )
+
+    @pytest.mark.parametrize("alignment", [0, 3, -16, True])
+    def test_alloc_rejects_invalid_alignment(self, alignment):
+        buffer, semantic = self._make_buffer([64])
+        with pytest.raises(ValueError, match="positive power-of-two"):
+            tle.gpu.alloc(
+                (64,),
+                tl.float16,
+                layout=buffer.type.layout,
+                alignment=alignment,
+                _semantic=semantic,
+            )
 
     def test_alloc_alias_rejects_init_value(self):
         buffer, semantic = self._make_buffer([4, 16, 32])
@@ -513,7 +558,7 @@ class TestPipeFrontend:
         wrong_capacity, _ = self._make_buffer([2, 16])
         rank_one, _ = self._make_buffer([4])
 
-        with pytest.raises(ValueError, match="at least one"):
+        with pytest.raises(ValueError, match="one_shot=True"):
             tle.pipe(capacity=4, _semantic=semantic)
         with pytest.raises(ValueError, match="reserved"):
             tle.pipe(capacity=4, fields=a, _semantic=semantic)
@@ -655,6 +700,39 @@ class TestPipeFrontend:
             writer.close(0, _semantic=semantic)
         with pytest.raises(ValueError, match="one_shot"):
             pipe.wait_drained(_semantic=semantic)
+
+    def test_fieldless_one_shot_pipe_is_a_named_control_edge(self):
+        semantic = TestBufferedTensor._FakeSemantic()
+        pipe = tle.pipe(
+            capacity=1,
+            name="handoff",
+            one_shot=True,
+            _semantic=semantic,
+        )
+        writer = pipe.writer(_semantic=semantic)
+        reader = pipe.reader(_semantic=semantic)
+
+        writer.commit(0, _semantic=semantic)
+        reader.wait(0, _semantic=semantic)
+
+        assert pipe.fields == {}
+        assert semantic.builder.pipe_create_args == (
+            [],
+            1,
+            "cta",
+            "handoff",
+            [],
+            [],
+            True,
+        )
+        assert [op[0] for op in semantic.builder.pipe_ops] == [
+            "writer_commit",
+            "reader_wait",
+        ]
+        with pytest.raises(ValueError, match="explicit name"):
+            tle.pipe(capacity=1, one_shot=True, _semantic=semantic)
+        with pytest.raises(ValueError, match="one_shot=True"):
+            tle.pipe(capacity=1, name="cyclic", _semantic=semantic)
 
 
 class TestTaskGridFrontend:

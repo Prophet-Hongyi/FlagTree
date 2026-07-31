@@ -151,7 +151,8 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
 #ifdef __TLE__
   // flagtree tle raw
   addDynamicallyLegalOp<triton::gpu::LocalAllocOp, triton::gpu::LocalStoreOp,
-                        triton::gpu::LocalLoadOp>(
+                        triton::gpu::LocalLoadOp,
+                        triton::gpu::AsyncCopyGlobalToLocalOp>(
       [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
 #endif
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
@@ -174,15 +175,11 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       return true;
     return false;
   });
-  addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
-    for (auto arg : funcOp.getArguments()) {
-      if (auto tensor = dyn_cast<RankedTensorType>(arg.getType())) {
-        if (!tensor.getEncoding())
-          return false;
-      }
-    }
-    return true;
-  });
+  addDynamicallyLegalOp<triton::FuncOp>(
+      [&](triton::FuncOp funcOp) -> bool {
+        return typeConverter.isSignatureLegal(funcOp.getFunctionType()) &&
+               typeConverter.isLegal(&funcOp.getBody());
+      });
 
 #ifdef __TLE__
   // flagtree tle raw

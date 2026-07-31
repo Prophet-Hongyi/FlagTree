@@ -49,10 +49,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK: [[BARRIER1:%.+]] = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1
       // CHECK: ttng.init_barrier [[BARRIER1]], 1
       // CHECK: ttng.barrier_expect [[BARRIER1]], 8192, %true
-      // CHECK: ttng.async_tma_copy_global_to_local {{.+}}[{{.+}}] {{.+}} [[BARRIER1]], %true
+      // CHECK: ttng.async_tma_copy_global_to_local {{.+}}[{{.+}}] {{.+}} [[BARRIER1]], %true evictionPolicy = evict_first
       // CHECK: ttng.wait_barrier [[BARRIER1]], %c0_i32
       // CHECK: ttng.inval_barrier [[BARRIER1]]
-      ttg.tma_copy %a_desc, %a_smem, [%0, %yoff] : !tt.tensordesc<tensor<32x64xf32, #shared>>, !ttg.memdesc<32x64xf32, #shared, #smem, mutable>
+      ttg.tma_copy %a_desc, %a_smem, [%0, %yoff] evictionPolicy = evict_first : !tt.tensordesc<tensor<32x64xf32, #shared>>, !ttg.memdesc<32x64xf32, #shared, #smem, mutable>
 
       // CHECK: [[BARRIER2:%.+]] = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1
       // CHECK: ttng.init_barrier [[BARRIER2]], 1

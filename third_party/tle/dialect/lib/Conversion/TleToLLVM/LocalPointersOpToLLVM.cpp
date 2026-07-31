@@ -20,6 +20,18 @@ using namespace mlir;
 namespace ttg = mlir::triton::gpu;
 namespace tle = mlir::triton::tle;
 
+void propagateAxisInfoHints(Operation *source, Value target) {
+  Operation *targetOp = target.getDefiningOp();
+  if (!targetOp)
+    return;
+
+  for (StringRef name :
+       {"tt.contiguity", "tt.divisibility", "tt.constancy"}) {
+    if (Attribute value = source->getDiscardableAttr(name))
+      targetOp->setDiscardableAttr(name, value);
+  }
+}
+
 Value mapSharedToClusterPointer(ConversionPatternRewriter &rewriter,
                                 Location loc, Value ptr, Value ctaId) {
   auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -269,6 +281,7 @@ struct LocalPointersOpConversion
     if (resultTensorTy) {
       Value result =
           packLLElements(loc, typeConverter, outVals, rewriter, resultTensorTy);
+      propagateAxisInfoHints(op, result);
       rewriter.replaceOp(op, result);
     } else {
       rewriter.replaceOp(op, outVals.front());
@@ -341,6 +354,7 @@ struct RemotePointersOpConversion
 
     Value packed =
         packLLElements(loc, typeConverter, mappedPtrs, rewriter, op.getType());
+    propagateAxisInfoHints(op, packed);
     rewriter.replaceOp(op, packed);
     return success();
   }

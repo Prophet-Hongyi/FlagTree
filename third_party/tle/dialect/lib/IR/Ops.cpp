@@ -314,7 +314,8 @@ static LogicalResult verifyPipeAttrs(Operation *op, OperandRange fields) {
   if (fieldNamesAttr.size() != fields.size())
     return op->emitOpError("expects field_names size to match field operands");
 
-  if (failed(verifyPipeNameArray(op, fieldNamesAttr, "field", false)))
+  if (failed(
+          verifyPipeNameArray(op, fieldNamesAttr, "field", fields.empty())))
     return failure();
 
   if (auto readersAttr = op->getAttrOfType<ArrayAttr>("readers")) {
@@ -327,8 +328,13 @@ static LogicalResult verifyPipeAttrs(Operation *op, OperandRange fields) {
       return op->emitOpError("expects valid public pipe reader_name");
   }
 
-  if (fields.empty())
-    return op->emitOpError("expects at least one pipe field");
+  if (fields.empty()) {
+    auto pipeNameAttr = op->getAttrOfType<StringAttr>("pipe_name");
+    if (!pipeNameAttr || !isValidPublicPipeName(pipeNameAttr.getValue()))
+      return op->emitOpError(
+          "without payload fields requires a valid explicit pipe_name");
+    return success();
+  }
   for (Value field : fields) {
     auto type = cast<triton::gpu::MemDescType>(field.getType());
     if (!isa<triton::gpu::SharedMemorySpaceAttr>(type.getMemorySpace()))
@@ -358,7 +364,15 @@ static LogicalResult verifyPipeStage(Operation *op, Value stage) {
 }
 
 LogicalResult PipeCreateOp::verify() {
-  return verifyPipeAttrs(getOperation(), getFields());
+  if (failed(verifyPipeAttrs(getOperation(), getFields())))
+    return failure();
+  if (getFields().empty()) {
+    auto oneShotAttr = getOperation()->getAttrOfType<BoolAttr>("one_shot");
+    if (!oneShotAttr || !oneShotAttr.getValue())
+      return emitOpError(
+          "without payload fields requires one_shot = true");
+  }
+  return success();
 }
 
 LogicalResult PipeWriterAcquireOp::verify() {

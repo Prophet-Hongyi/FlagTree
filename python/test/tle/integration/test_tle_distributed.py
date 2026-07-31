@@ -390,6 +390,20 @@ def _distributed_barrier_grid_counter_kernel(counter_ptr, out_ptr, mesh: tl.cons
 
 
 @triton.jit
+def _distributed_barrier_grid_counter_helper(counter_ptr, out_ptr, mesh: tl.constexpr):
+    pid = tl.program_id(0)
+    tl.atomic_add(counter_ptr, 1)
+    tle.distributed_barrier(mesh)
+    seen = tl.load(counter_ptr)
+    tl.store(out_ptr + pid, seen)
+
+
+@triton.jit
+def _distributed_barrier_grid_counter_device_function_kernel(counter_ptr, out_ptr, mesh: tl.constexpr):
+    _distributed_barrier_grid_counter_helper(counter_ptr, out_ptr, mesh)
+
+
+@triton.jit
 def _submesh_row_group_barrier_kernel(
     counter_row0_ptr,
     counter_row1_ptr,
@@ -1343,6 +1357,38 @@ class TestTLEDistributed:
             counter,
             out,
             mesh=BLOCK_GRID_MESH_8,
+            num_ctas=1,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        expected = torch.full_like(out, grid)
+        torch.testing.assert_close(counter, torch.tensor([grid], device="cuda", dtype=torch.int32), atol=0, rtol=0)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    def test_distributed_barrier_grid_counter_device_function(self, with_allocator):
+        grid = 3
+        mesh = tle.device_mesh({"block": [("block_x", grid)]})
+        counter = torch.zeros((1, ), device="cuda", dtype=torch.int32)
+        out = torch.empty((grid, ), device="cuda", dtype=torch.int32)
+
+        compiled = _distributed_barrier_grid_counter_device_function_kernel.warmup(
+            counter,
+            out,
+            mesh=mesh,
+            grid=(grid, ),
+            num_ctas=1,
+            num_warps=4,
+        )
+        assert compiled.metadata.cluster_dims == (1, 1, 1)
+        assert compiled.metadata.launch_cooperative_grid is True
+        assert compiled.metadata.global_scratch_size >= 4
+        assert 'group_kind = "grid"' in compiled.asm["ttgir"]
+
+        _distributed_barrier_grid_counter_device_function_kernel[(grid, )](
+            counter,
+            out,
+            mesh=mesh,
             num_ctas=1,
             num_warps=4,
         )

@@ -4,6 +4,25 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32} 
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
+// CHECK-LABEL: llvm.func internal @default_barrier_leaf
+// CHECK: nvvm.barrier id = {{.*}} number_of_threads = {{.*}}
+llvm.func internal @default_barrier_leaf() attributes {sym_visibility = "private"} {
+  nvvm.barrier0
+  llvm.return
+}
+
+llvm.func internal @default_barrier_helper() attributes {sym_visibility = "private"} {
+  llvm.call @default_barrier_leaf() : () -> ()
+  llvm.return
+}
+
+// CHECK-LABEL: llvm.func internal @partition_barrier_helper
+// CHECK: nvvm.bar.warp.sync
+llvm.func internal @partition_barrier_helper() attributes {sym_visibility = "private"} {
+  nvvm.barrier0
+  llvm.return
+}
+
 // CHECK-LABEL: @rewrite_barriers
 llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // CHECK-DAG: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
@@ -22,6 +41,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   nvvm.barrier0
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
   default {
+    llvm.call @default_barrier_helper() : () -> ()
     // CHECK: nvvm.barrier id = [[C0]] number_of_threads = [[C128]]
     nvvm.barrier0
     ttg.warp_yield
@@ -35,6 +55,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
     ttg.warp_return
   }
   partition2() num_warps(1) {
+    llvm.call @partition_barrier_helper() : () -> ()
     nvvm.barrier0
     ttg.warp_return
   } : () -> ()

@@ -397,7 +397,11 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
 
   let description = [{
     Represent blocked shared memory matching MMAv3/MMAv5 shared memory input.
-    This is meant to represent 2d tiled blocked layout.
+    This is also the canonical NVIDIA TMA shared-memory encoding because it
+    carries the swizzle, element width, FP4 padding, and allocation alignment
+    required by TensorMap transfers. Using this storage encoding does not
+    require its consumers to issue MMA instructions. This is meant to
+    represent 2d tiled blocked layout.
     The full layout representation is described here:
     https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout
     When the memdesc has more than 2 dimensions the tiling is applied to 8 rows even if the first outer dimension is smaller than 8.

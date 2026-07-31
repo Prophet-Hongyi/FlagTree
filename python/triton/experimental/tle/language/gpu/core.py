@@ -5,6 +5,8 @@ from typing import Optional, Sequence
 from enum import Enum
 from . import types as tle
 from .mthreads import copy as mthreads_copy
+from triton._C.libtriton import ir
+from triton._utils import is_power_of_two
 from triton.compiler.code_generator import flatten_values_to_ir, unflatten_ir_values
 
 from triton.language.core import (
@@ -193,19 +195,25 @@ def alloc(
     alias: Optional[tle.buffered_tensor] = None,
     alias_offset_bytes: int = 0,
     nv_mma_shared_layout=True,
+    alignment: Optional[int] = None,
     _semantic=None,
 ) -> tle.buffered_tensor:
     """
     Allocate local memory buffer
 
     Args:
-        shape: Buffer shape
+        shape: Physical buffer shape. A leading multibuffer dimension may be
+            non-power-of-two; unlike ``tl.tensor``, ``buffered_tensor`` is a
+            memory descriptor rather than a register value.
         dtype: Data type
         layout: Memory layout encoding (optional)
         scope: Storage type (default to shared memory)
         init_value: Optional initial register tensor for a new allocation
         alias: Optional source shared-memory buffer to alias instead of allocating
         alias_offset_bytes: Static byte offset from alias source view base
+        alignment: Optional power-of-two allocation alignment in bytes. This
+            applies only to a new shared-memory allocation; alias views inherit
+            their backing allocation alignment.
         _semantic: Semantic analyzer (internal use)
 
     Returns:
@@ -231,9 +239,18 @@ def alloc(
 
     alias = tl._unwrap_if_constexpr(alias)
     alias_offset_bytes = tl._unwrap_if_constexpr(alias_offset_bytes)
+    alignment = tl._unwrap_if_constexpr(alignment)
+    if alignment is not None:
+        if (isinstance(alignment, builtins.bool) or
+                not isinstance(alignment, builtins.int) or
+                alignment <= 0 or not is_power_of_two(alignment)):
+            raise ValueError(
+                f"alignment must be a positive power-of-two compile-time integer, got {alignment!r}")
     if alias is not None:
         if init_value is not None:
             raise ValueError("alloc alias mode cannot be combined with init_value")
+        if alignment is not None:
+            raise ValueError("alloc alias mode cannot specify allocation alignment")
         if not isinstance(alias, tle.buffered_tensor):
             raise ValueError(f"alias must be a tle.buffered_tensor, but got {type(alias)}")
         if scope is not tle.smem or alias.type.storage is not tle.smem:
@@ -316,9 +333,21 @@ def alloc(
                     alias_ty, alias.handle, alias_offset_bytes)
             elif init_value is not None:
                 mutable_ty = _semantic.builder.get_memdesc_type(full_shape, elem_type, layout_handle, "smem")
-                tensor_handle = _semantic.builder.create_local_alloc(mutable_ty, init_value.handle)
+                tensor_handle = (
+                    _semantic.builder.create_local_alloc(
+                        mutable_ty, init_value.handle, alignment)
+                    if alignment is not None
+                    else _semantic.builder.create_local_alloc(
+                        mutable_ty, init_value.handle)
+                )
             else:
-                tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle)
+                tensor_handle = (
+                    _semantic.builder.create_local_alloc(
+                        full_shape, elem_type, layout_handle, alignment)
+                    if alignment is not None
+                    else _semantic.builder.create_local_alloc(
+                        full_shape, elem_type, layout_handle)
+                )
         else:
             raise ValueError(f"Storage type {storage} not yet supported")
 
@@ -340,6 +369,8 @@ def copy(
     dst,
     shape,
     offsets: Sequence[constexpr | tensor] = None,
+    is_async: bool = False,
+    eviction_policy: str = "",
     _semantic=None,
 ) -> None:
     """
@@ -370,6 +401,15 @@ def copy(
         shape: Tuple specifying the dimensions of the data to copy
         offsets: Sequence of offsets for multi-dimensional addressing. Used with TMA operations
             to specify the starting coordinates within the tensor. Required for TMA copy.
+        is_async: Emit a transport-level global-to-shared asynchronous copy.
+            The copy is not implicitly committed or waited. Call
+            :func:`async_commit_group` after issuing a group and
+            :func:`async_wait_group` before consuming its destination.
+            Only a tensor of global pointers copied to a shared-memory
+            ``buffered_tensor`` is supported. Defaults to ``False`` so the
+            existing synchronous behavior is unchanged.
+        eviction_policy: L2 eviction policy for global-memory reads. Supported
+            values are ``""``, ``"evict_first"``, and ``"evict_last"``.
         _semantic: Internal semantic analyzer for validation and compilation (user-provided)
 
     Raises:
@@ -385,6 +425,9 @@ def copy(
             tle.copy(tma_desc, local_buf, [64, 64], [x_offset, y_offset])
     """
     mthreads_enabled = mthreads_copy.enabled()
+    is_async = tl._unwrap_if_constexpr(is_async)
+    if not isinstance(is_async, builtins.bool):
+        raise ValueError(f"copy is_async must be a compile-time bool, got {type(is_async).__name__}")
 
     def normcopy(
         src: tl.tensor,
@@ -411,17 +454,27 @@ def copy(
         boundary_check = ()
         padding_option = ""
         cache_modifier = ""
-        eviction_policy = ""
         volatile = False
 
         try:
             if direction == CopyDirection.GM_TO_LOCAL:
-                # None fills the FlagTree hints slot; TLE copy has no hints to pass.
-                load_extra_args = () if mthreads_enabled else (None, )
-                tt_load = _semantic.load(src, mask, other, boundary_check, padding_option, cache_modifier,
-                                         eviction_policy, volatile, *load_extra_args)
-                local_ptrs = local_ptr(dst, _make_full_indices(dst, _semantic), _semantic=_semantic)
-                _semantic.store(local_ptrs, tt_load, mask, boundary_check, cache_modifier, eviction_policy)
+                if is_async:
+                    _semantic.builder.create_async_copy_global_to_local(
+                        dst.handle,
+                        src.handle,
+                        ir.value(),
+                        ir.value(),
+                        _semantic._str_to_load_cache_modifier(cache_modifier),
+                        _semantic._str_to_eviction_policy(eviction_policy),
+                        volatile,
+                    )
+                else:
+                    # None fills the FlagTree hints slot; TLE copy has no hints to pass.
+                    load_extra_args = () if mthreads_enabled else (None, )
+                    tt_load = _semantic.load(src, mask, other, boundary_check, padding_option, cache_modifier,
+                                             eviction_policy, volatile, *load_extra_args)
+                    local_ptrs = local_ptr(dst, _make_full_indices(dst, _semantic), _semantic=_semantic)
+                    _semantic.store(local_ptrs, tt_load, mask, boundary_check, cache_modifier, eviction_policy)
             else:
                 local_ptrs = local_ptr(src, _make_full_indices(src, _semantic), _semantic=_semantic)
                 load = tl.load(local_ptrs, _semantic=_semantic)
@@ -479,7 +532,12 @@ def copy(
         # assert desc.shape == shape, "Shape mismatch between descriptor and provided shape"
         assert len(offsets) == len(desc.shape), "Offsets and shape must have the same length"
         offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
-        _semantic.builder.create_tma_copy(src.handle, dst.handle, offsets)
+        _semantic.builder.create_tma_copy(
+            src.handle,
+            dst.handle,
+            offsets,
+            _semantic._str_to_eviction_policy(eviction_policy),
+        )
         return
 
     # Parameter validation
@@ -513,6 +571,42 @@ def copy(
             f"Invalid copy combination: src={type(src).__name__}, dst={type(dst).__name__}. "
             "One operand must be tl.tensor (global memory) and the other must be tle.buffered_tensor (local memory)")
 
+    if is_async:
+        if not is_normcopy or direction != CopyDirection.GM_TO_LOCAL:
+            raise ValueError(
+                "copy(is_async=True) supports only a tl.tensor of global pointers copied to a shared-memory "
+                "tle.buffered_tensor")
+        if dst.type.storage is not tle.smem:
+            raise ValueError("copy(is_async=True) destination must use tle.gpu.smem storage")
+        if offsets is not None:
+            raise ValueError("copy(is_async=True) does not accept descriptor offsets")
+        if not src.type.is_block() or not src.type.element_ty.is_ptr():
+            raise ValueError("copy(is_async=True) source must be a tensor of global pointers")
+        pointer_type = src.type.element_ty
+        if pointer_type.address_space != 1:
+            raise ValueError(
+                f"copy(is_async=True) source pointer must use global address space 1, got {pointer_type.address_space}")
+        if pointer_type.element_ty != dst.dtype:
+            raise ValueError(
+                f"copy(is_async=True) element type mismatch: source points to {pointer_type.element_ty}, "
+                f"destination stores {dst.dtype}")
+
+        async_shape = tl._unwrap_if_constexpr(shape)
+        if isinstance(async_shape, tl.tuple):
+            async_shape = tuple(async_shape.values)
+        if not isinstance(async_shape, (tuple, list)):
+            raise ValueError("copy(is_async=True) shape must be a tuple/list of positive static integers")
+        async_shape = tuple(tl._unwrap_if_constexpr(dim) for dim in async_shape)
+        if any(isinstance(dim, builtins.bool) or not isinstance(dim, builtins.int) or dim <= 0
+               for dim in async_shape):
+            raise ValueError("copy(is_async=True) shape must contain only positive static integers")
+        src_shape = tuple(src.type.shape)
+        dst_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in dst.type.shape)
+        if async_shape != src_shape or async_shape != dst_shape:
+            raise ValueError(
+                "copy(is_async=True) requires shape to exactly match both operands: "
+                f"shape={async_shape}, source={src_shape}, destination={dst_shape}")
+
     if not isinstance(shape, (tuple, list)):
         # Try to handle Triton tuple-like objects
         if hasattr(shape, '__iter__'):
@@ -522,9 +616,37 @@ def copy(
     if is_normcopy:
         return normcopy(src, dst, shape, direction, _semantic)
     if mthreads_enabled:
+        if eviction_policy:
+            raise ValueError("TMA eviction policies are not supported by the mthreads backend")
         return mthreads_copy.tmacopy(src, dst, direction, shape, offsets, _semantic)
     else:
         return tmacopy(src, dst, direction, shape, offsets, _semantic)
+
+
+@tl.builtin
+def async_commit_group(_semantic=None) -> None:
+    """Commit all transport-level asynchronous copies issued since the previous commit."""
+    _semantic.builder.create_async_commit_group()
+
+
+@tl.builtin
+def async_wait_group(max_pending: int = 0, _semantic=None) -> None:
+    """
+    Wait until at most ``max_pending`` committed asynchronous-copy groups remain.
+
+    ``max_pending`` must be a compile-time integer in the NVIDIA cp.async
+    wait-group range ``[0, 7]``. Use ``0`` before consuming the newest group;
+    larger values permit older groups to remain in flight in a software
+    pipeline.
+    """
+    max_pending = tl._unwrap_if_constexpr(max_pending)
+    if isinstance(max_pending, builtins.bool) or not isinstance(max_pending, builtins.int):
+        raise ValueError(
+            f"async_wait_group max_pending must be a compile-time integer in [0, 7], "
+            f"got {type(max_pending).__name__}")
+    if max_pending < 0 or max_pending > 7:
+        raise ValueError(f"async_wait_group max_pending must be in [0, 7], got {max_pending}")
+    _semantic.builder.create_async_wait_group(max_pending)
 
 
 def _expand_index_to_shape(index: tl.tensor, shape: Sequence[int], axis: int, _semantic) -> tl.tensor:
@@ -550,6 +672,7 @@ def _make_full_indices(buffer: tle.buffered_tensor, _semantic) -> tuple[tl.tenso
 def local_ptr(
     buffer: tle.buffered_tensor,
     indices: Optional[Sequence] = None,
+    shape: Optional[Sequence] = None,
     _semantic=None,
     _generator=None,
 ) -> tl.tensor:
@@ -562,6 +685,11 @@ def local_ptr(
             length must equal ``rank(buffer)`` and every tensor must have the
             same shape. If ``None``, emit a full-view pointer tensor over
             ``buffer`` shape (or scalar pointer for rank-0 buffer).
+        shape: Optional static result shape. When provided, every index is
+            broadcast to this shape before the local pointer is materialized.
+            Scalar and singleton-axis indices may therefore be mixed. This
+            requires explicit ``indices``. The result is a Triton tensor, so
+            every result dimension must be a power of two.
         _semantic: Semantic analyzer (internal use).
         _generator: Triton code generator (internal use).
 
@@ -582,6 +710,7 @@ def local_ptr(
 
     buffer_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
     indices = tl._unwrap_if_constexpr(indices)
+    shape = tl._unwrap_if_constexpr(shape)
     no_indices = indices is None
     if no_indices:
         indices_tuple = tuple()
@@ -594,6 +723,46 @@ def local_ptr(
     if not no_indices and len(indices_tuple) != len(buffer_shape):
         raise ValueError(f"local_ptr indices must provide {len(buffer_shape)} tensors, got {len(indices_tuple)}")
 
+    if shape is None:
+        broadcast_shape = None
+    elif no_indices:
+        raise ValueError("local_ptr shape requires explicit indices")
+    elif isinstance(shape, tl.tuple):
+        broadcast_shape = tuple(tl._unwrap_if_constexpr(dim) for dim in shape.values)
+    elif isinstance(shape, (tuple, list)):
+        broadcast_shape = tuple(tl._unwrap_if_constexpr(dim) for dim in shape)
+    else:
+        raise ValueError("local_ptr shape must be a tuple/list of positive static integers or None")
+    if broadcast_shape is not None:
+        if not broadcast_shape:
+            raise ValueError("local_ptr shape cannot be empty")
+        if any(not isinstance(dim, builtins.int) or isinstance(dim, builtins.bool) or dim <= 0
+               for dim in broadcast_shape):
+            raise ValueError("local_ptr shape must contain only positive static integers")
+        if any(not is_power_of_two(dim) for dim in broadcast_shape):
+            raise ValueError(
+                f"local_ptr result tensor shape must contain only powers of two, got {broadcast_shape}")
+
+    if no_indices and any(not is_power_of_two(dim) for dim in buffer_shape):
+        raise ValueError(
+            "local_ptr cannot materialize a full-view tensor for a non-power-of-two buffer shape; "
+            "provide explicit indices whose result shape is power-of-two")
+
+    # A non-power-of-two leading dimension is the physical multibuffer axis,
+    # not a Triton value-tensor axis. Canonicalize a scalar stage selection to
+    # memdesc_index before materializing the power-of-two pointer tensor.
+    if not no_indices and buffer_shape and not is_power_of_two(buffer_shape[0]):
+        stage = indices_tuple[0]
+        stage_tensor = stage if isinstance(stage, tensor) else _semantic.to_tensor(stage)
+        if stage_tensor.type.is_block():
+            raise ValueError(
+                "local_ptr requires a scalar index for a non-power-of-two leading buffer dimension")
+        if not stage_tensor.dtype.is_int():
+            raise ValueError("local_ptr indices must use integer dtypes")
+        buffer = buffer.slot(stage_tensor, _semantic=_semantic)
+        buffer_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
+        indices_tuple = indices_tuple[1:]
+
     idx_tensors: list[tensor] = []
     view_shape: Optional[tuple[int, ...]] = None
     scalar_index_flags: list[bool] = []
@@ -602,6 +771,8 @@ def local_ptr(
             idx_tensor = idx if isinstance(idx, tensor) else _semantic.to_tensor(idx)
             if not idx_tensor.dtype.is_int():
                 raise ValueError("local_ptr indices must use integer dtypes")
+            if broadcast_shape is not None:
+                idx_tensor = tl.broadcast_to(idx_tensor, broadcast_shape, _semantic=_semantic)
             is_scalar_index = not idx_tensor.type.is_block()
             scalar_index_flags.append(is_scalar_index)
             if is_scalar_index:

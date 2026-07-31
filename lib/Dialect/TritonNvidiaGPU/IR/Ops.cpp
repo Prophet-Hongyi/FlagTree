@@ -34,6 +34,7 @@
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/TMAEncodingUtils.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #ifdef __TLE__
@@ -333,8 +334,14 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
     return emitOpError("TMA copies must have between 1 and 5 coordinates");
   if (!getResult().getType().getMutableMemory())
     return emitOpError("Cannot store into immutable memory");
-  if (!isa<NVMMASharedEncodingAttr>(getResult().getType().getEncoding()))
-    return emitOpError("TMA result must have NVMMA shared layout");
+  auto resultType = getResult().getType();
+  if (failed(getTMASharedLayoutInfo(
+          resultType.getEncoding(), resultType.getElementType(),
+          [&]() {
+            return emitOpError(
+                "result must have a TMA-compatible shared layout: ");
+          })))
+    return failure();
   return success();
 }
 

@@ -21,7 +21,9 @@ namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 
 struct StaticAccessView {
-  Value root;
+  Value coordinateRoot;
+  Value allocationRoot;
+  size_t baseOffsetBytes = 0;
   SmallVector<int64_t> offsets;
   SmallVector<int64_t> sizes;
   int64_t rank = 0;
@@ -131,6 +133,60 @@ matchStaticIndexCoverage(Value index) {
   return matchRangeWithStaticOffset(current);
 }
 
+static std::optional<unsigned> getElementByteWidth(Type type) {
+  if (auto intTy = dyn_cast<IntegerType>(type))
+    return llvm::divideCeil(intTy.getWidth(), 8);
+  if (auto floatTy = dyn_cast<FloatType>(type))
+    return llvm::divideCeil(floatTy.getWidth(), 8);
+  if (isa<tt::PointerType>(type))
+    return 8;
+  return std::nullopt;
+}
+
+static size_t linearizeStatic(ArrayRef<int64_t> coord, ArrayRef<unsigned> shape,
+                              ArrayRef<unsigned> order) {
+  size_t linear = 0;
+  for (unsigned dim : llvm::reverse(order))
+    linear = linear * shape[dim] + coord[dim];
+  return linear;
+}
+
+static std::optional<size_t>
+getStaticViewOriginByteOffset(const StaticAccessView &view) {
+  auto rootTy = dyn_cast<ttg::MemDescType>(view.coordinateRoot.getType());
+  if (!rootTy)
+    return std::nullopt;
+  auto elemBytes = getElementByteWidth(rootTy.getElementType());
+  if (!elemBytes)
+    return std::nullopt;
+
+  SmallVector<unsigned> shape;
+  ArrayRef<int64_t> typeShape = rootTy.getAllocShape();
+  if (typeShape.empty())
+    typeShape = rootTy.getShape();
+  shape.reserve(typeShape.size());
+  for (int64_t dim : typeShape) {
+    if (dim <= 0)
+      return std::nullopt;
+    shape.push_back(static_cast<unsigned>(dim));
+  }
+  if (shape.size() != view.offsets.size())
+    return std::nullopt;
+  for (auto [offset, dim] : llvm::zip_equal(view.offsets, shape)) {
+    if (offset < 0 || offset >= static_cast<int64_t>(dim))
+      return std::nullopt;
+  }
+
+  auto order = ttg::getOrder(rootTy);
+  if (order.size() != shape.size())
+    return std::nullopt;
+  size_t linearOffset = linearizeStatic(view.offsets, shape, order);
+  if (linearOffset >
+      (std::numeric_limits<size_t>::max() - view.baseOffsetBytes) / *elemBytes)
+    return std::nullopt;
+  return view.baseOffsetBytes + linearOffset * *elemBytes;
+}
+
 static std::optional<StaticAccessView> getStaticMemDescView(Value value) {
   auto memDescTy = dyn_cast<ttg::MemDescType>(value.getType());
   if (!memDescTy)
@@ -181,9 +237,32 @@ static std::optional<StaticAccessView> getStaticMemDescView(Value value) {
     return srcView;
   }
 
+  if (auto alias = value.getDefiningOp<tt::tle::MemDescAliasOp>()) {
+    auto srcView = getStaticMemDescView(alias.getSrc());
+    if (!srcView)
+      return std::nullopt;
+    auto srcOriginBytes = getStaticViewOriginByteOffset(*srcView);
+    if (!srcOriginBytes)
+      return std::nullopt;
+    int64_t aliasOffsetBytes = alias.getOffsetBytesAttr().getInt();
+    if (aliasOffsetBytes < 0 ||
+        static_cast<uint64_t>(aliasOffsetBytes) >
+            std::numeric_limits<size_t>::max() - *srcOriginBytes)
+      return std::nullopt;
+
+    SmallVector<int64_t> shape(memDescTy.getShape().begin(),
+                               memDescTy.getShape().end());
+    return StaticAccessView{
+        value, srcView->allocationRoot,
+        *srcOriginBytes + static_cast<size_t>(aliasOffsetBytes),
+        SmallVector<int64_t>(shape.size(), 0), std::move(shape),
+        memDescTy.getRank()};
+  }
+
   SmallVector<int64_t> shape(memDescTy.getShape().begin(),
                              memDescTy.getShape().end());
-  return StaticAccessView{value, SmallVector<int64_t>(shape.size(), 0),
+  return StaticAccessView{value, value, 0,
+                          SmallVector<int64_t>(shape.size(), 0),
                           std::move(shape), memDescTy.getRank()};
 }
 
@@ -225,24 +304,6 @@ static std::optional<StaticAccessView> getStaticAccessView(Value value) {
   return getStaticLocalPointerView(value);
 }
 
-static std::optional<unsigned> getElementByteWidth(Type type) {
-  if (auto intTy = dyn_cast<IntegerType>(type))
-    return llvm::divideCeil(intTy.getWidth(), 8);
-  if (auto floatTy = dyn_cast<FloatType>(type))
-    return llvm::divideCeil(floatTy.getWidth(), 8);
-  if (isa<tt::PointerType>(type))
-    return 8;
-  return std::nullopt;
-}
-
-static size_t linearizeStatic(ArrayRef<int64_t> coord, ArrayRef<unsigned> shape,
-                              ArrayRef<unsigned> order) {
-  size_t linear = 0;
-  for (unsigned dim : llvm::reverse(order))
-    linear = linear * shape[dim] + coord[dim];
-  return linear;
-}
-
 static bool containsBufferId(const Allocation::BufferIdSetT &bufferIds,
                              Allocation::BufferId bufferId) {
   return llvm::any_of(bufferIds,
@@ -255,10 +316,11 @@ getStaticAccessIntervals(const Allocation *allocation, Value value,
   auto view = getStaticAccessView(value);
   if (!view)
     return std::nullopt;
-  if (!containsBufferId(allocation->getBufferIds(view->root), bufferId))
+  if (!containsBufferId(allocation->getBufferIds(view->allocationRoot),
+                        bufferId))
     return std::nullopt;
 
-  auto rootTy = dyn_cast<ttg::MemDescType>(view->root.getType());
+  auto rootTy = dyn_cast<ttg::MemDescType>(view->coordinateRoot.getType());
   if (!rootTy)
     return std::nullopt;
   auto elemBytes = getElementByteWidth(rootTy.getElementType());
@@ -306,7 +368,11 @@ getStaticAccessIntervals(const Allocation *allocation, Value value,
 
   SmallVector<Interval<size_t>> intervals;
   intervals.reserve(std::max<size_t>(outerCount, 1));
-  size_t base = allocation->getAllocatedInterval(bufferId).start();
+  auto allocatedInterval = allocation->getAllocatedInterval(bufferId);
+  if (view->baseOffsetBytes >
+      allocatedInterval.end() - allocatedInterval.start())
+    return std::nullopt;
+  size_t base = allocatedInterval.start() + view->baseOffsetBytes;
   for (size_t linearOuter = 0; linearOuter < std::max<size_t>(outerCount, 1);
        ++linearOuter) {
     size_t residue = linearOuter;
@@ -322,7 +388,8 @@ getStaticAccessIntervals(const Allocation *allocation, Value value,
     end[fastestDim] = start[fastestDim] + view->sizes[fastestDim] - 1;
     size_t startElem = linearizeStatic(start, shape, order);
     size_t endElem = linearizeStatic(end, shape, order) + 1;
-    if (startElem > endElem)
+    if (startElem > endElem ||
+        endElem > (allocatedInterval.end() - base) / *elemBytes)
       return std::nullopt;
     intervals.emplace_back(base + startElem * *elemBytes,
                            base + endElem * *elemBytes);
@@ -337,6 +404,12 @@ static void addEffectIntervals(const Allocation *allocation, Value value,
     if (bufferId == Allocation::InvalidBufferId)
       continue;
     auto intervals = getStaticAccessIntervals(allocation, value, bufferId);
+    if (!intervals) {
+      Value ptr = stripConvertLayouts(value);
+      if (auto localPointers = ptr.getDefiningOp<tt::tle::LocalPointersOp>())
+        intervals = getStaticAccessIntervals(allocation, localPointers.getSrc(),
+                                             bufferId);
+    }
     if (!intervals)
       intervals = SmallVector<Interval<size_t>, 1>{
           allocation->getAllocatedInterval(bufferId)};

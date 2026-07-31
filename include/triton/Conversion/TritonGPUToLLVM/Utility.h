@@ -444,6 +444,9 @@ Value addStringToModule(Location loc, RewriterBase &rewriter, StringRef key,
 
 Value getStackPointer(RewriterBase &rewriter, FunctionOpInterface funcOp);
 
+Value getGlobalScratchBase(Location loc, RewriterBase &rewriter,
+                           FunctionOpInterface funcOp, Value frameOffset = {});
+
 Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
                           const TargetInfoBase &targetInfo,
                           FunctionOpInterface funcOp, Value allocOffset);

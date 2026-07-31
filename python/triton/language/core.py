@@ -1721,6 +1721,9 @@ def broadcast_to(input, *shape, _semantic=None):
         broadcast_to(x, (32, 32))
         broadcast_to(x, 32, 32)
     """
+    input = _unwrap_if_constexpr(input)
+    if not isinstance(input, tensor):
+        input = _semantic.to_tensor(input)
     shape = _shape_check_impl(_unwrap_iterable(shape))
     return _semantic.broadcast_impl_shape(input, shape)
 

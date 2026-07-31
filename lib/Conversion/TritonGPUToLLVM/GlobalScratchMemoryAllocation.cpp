@@ -16,6 +16,15 @@ static int32_t roundUp(int32_t val, int32_t step) {
   return t - (t % step);
 }
 
+static bool isGridDistributedBarrier(Operation *op) {
+  if (op->getName().getStringRef() != "tle.distributed_barrier") {
+    return false;
+  }
+
+  auto kind = op->getAttrOfType<StringAttr>("group_kind");
+  return kind && kind.getValue() == "grid";
+}
+
 static void allocateGMem(Operation *parentOp,
                          llvm::SetVector<Operation *> &callStack) {
   // Recursively visit any dependency functions
@@ -43,6 +52,9 @@ static void allocateGMem(Operation *parentOp,
     if (auto alloc = dyn_cast<triton::gpu::GlobalScratchAllocOp>(op)) {
       nbytes = alloc.getNbytes();
       align = alloc.getAlignment();
+    } else if (isGridDistributedBarrier(op)) {
+      nbytes = 4;
+      align = 4;
     } else if (auto callOp = dyn_cast<triton::CallOp>(op)) {
       auto callable = callOp.resolveCallable();
       auto nbytes_attr = callable->getAttrOfType<IntegerAttr>(

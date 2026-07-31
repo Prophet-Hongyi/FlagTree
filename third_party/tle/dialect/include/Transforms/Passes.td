@@ -194,15 +194,16 @@ def TritonTleMaterializeTileStylePipeline
 def TritonTleDowngradeInvalidAsyncCopy
     : Pass<"triton-tle-downgrade-invalid-async-copy", "mlir::ModuleOp"> {
   let summary =
-      "downgrade TLE async copies that cannot be lowered to cp.async";
+      "legalize required TLE cp.async copies and downgrade optional ones";
 
   let description = [{
     This pass is TLE-owned because it repairs async copies created or exposed
-    by TLE staging/pipeline transforms. For ``ttg.async_copy_global_to_local``
-    operations whose final vector width is not a legal cp.async transaction
-    size, it replaces the async copy and its simple token chain with a
-    synchronous ``tt.load`` plus ``ttg.local_store`` before software
-    pipelining.
+    by TLE staging/pipeline transforms. For explicit required copies, it first
+    redistributes a provably contiguous blocked source layout so each active
+    thread owns a legal 4/8/16-byte transaction while preserving the async op
+    and token chain. A required copy fails when no such layout can be proven.
+    Other invalid async copies are replaced with a synchronous ``tt.load`` plus
+    ``ttg.local_store`` before software pipelining.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",

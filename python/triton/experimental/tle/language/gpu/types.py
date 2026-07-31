@@ -3,6 +3,7 @@
 import triton.language.core as tl
 from typing import Optional, List, Tuple
 from abc import abstractmethod
+from math import prod
 from triton._C.libtriton import ir
 from triton.language.semantic import TritonSemantic
 
@@ -531,19 +532,58 @@ class buffered_tensor(tl.base_value):
         )
 
 
-class buffered_tensor_type(tl.block_type):
+class buffered_tensor_type(tl.base_type):
 
     def __init__(self, element_ty: tl.dtype, shape: List, storage: scope, layout: Optional[shared_layout] = None,
                  semantic: TritonSemantic = None, alloc_shape: List = None):
-        super().__init__(element_ty, shape)
-        # Storage
+        if not isinstance(element_ty, tl.dtype):
+            raise TypeError(f"buffered_tensor element type must be tl.dtype, got {type(element_ty).__name__}")
+        self.element_ty = element_ty
+        self.shape = self._validate_shape(shape, "shape")
+        self.alloc_shape = self._validate_shape(
+            self.shape if alloc_shape is None else alloc_shape,
+            "alloc_shape",
+        )
+        if len(self.alloc_shape) < len(self.shape):
+            raise ValueError(
+                "buffered_tensor alloc_shape must have at least as many dimensions as shape")
+        alloc_view = self.alloc_shape[-len(self.shape):]
+        if any(dim > alloc_dim for dim, alloc_dim in zip(self.shape, alloc_view)):
+            raise ValueError(
+                f"buffered_tensor shape {self.shape} must fit within alloc_shape {self.alloc_shape}")
+        self.numel = prod(self.shape)
         self.storage = storage
-        # layout encoding
         self.layout = layout
-        self.alloc_shape = list(shape if alloc_shape is None else alloc_shape)
-        # Buffer number. 0 means a single buffer, 1+ means a buffer array.
-        assert semantic, "buffered_tensor array must be created with a builder"
+        if semantic is None:
+            raise ValueError("buffered_tensor must be created with a semantic builder")
         self.semantic = semantic
+
+    @staticmethod
+    def _validate_shape(shape, name) -> Tuple[int, ...]:
+        if not isinstance(shape, (tuple, list)):
+            raise TypeError(f"buffered_tensor {name} must be a tuple/list, got {type(shape).__name__}")
+        if not shape:
+            raise ValueError(f"buffered_tensor {name} cannot be empty")
+        normalized = []
+        for axis, dim in enumerate(shape):
+            dim = tl._unwrap_if_constexpr(dim)
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                raise TypeError(
+                    f"buffered_tensor {name} dimension {axis} must be a static integer, "
+                    f"got {type(dim).__name__}")
+            if dim <= 0:
+                raise ValueError(
+                    f"buffered_tensor {name} dimension {axis} must be positive, got {dim}")
+            normalized.append(dim)
+        return tuple(normalized)
+
+    @property
+    def scalar(self):
+        return self.element_ty
+
+    @property
+    def nbytes(self):
+        return self.numel * (self.element_ty.primitive_bitwidth // 8)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
         value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.storage, self.layout, self.semantic,
@@ -577,7 +617,8 @@ class buffered_tensor_type(tl.block_type):
         return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.alloc_shape}, >"
 
     def __eq__(self, other) -> bool:
-        if not (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
+        if not (type(self) is type(other) and self.element_ty == other.element_ty and self.shape == other.shape
+                and self.storage is other.storage and self.layout == other.layout
                 and self.alloc_shape == other.alloc_shape):
             return False
         self_shard = getattr(self, "_tle_remote_shard_id", None)
@@ -607,19 +648,14 @@ class buffered_tensor_type(tl.block_type):
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
 
-    def to_ir(self, builder: ir.builder) -> None:
-        shape = self.shape
-        builder = self.semantic.builder
+    def to_ir(self, builder: ir.builder) -> ir.type:
         return builder.get_memdesc_type(
-            shape,
+            self.shape,
             self.element_ty.to_ir(builder),
             self.layout.to_ir(builder),
             _storage_to_memdesc_space(self.storage),
             self.alloc_shape,
         )
-
-    def _flatten_ir(self, handles) -> None:
-        handles.append(self.handle)
 
 
 class pipe_slot_type(tl.base_type):

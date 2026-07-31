@@ -31,9 +31,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -538,6 +540,35 @@ static bool tryFoldPointerConvertLayout(triton::gpu::ConvertLayoutOp convert,
       !isa<triton::PointerType>(dstTy.getElementType()))
     return false;
 
+  if (isTleExplicitConvertLayoutOp(convert)) {
+    auto localPointers =
+        convert.getSrc().getDefiningOp<triton::tle::LocalPointersOp>();
+    if (!localPointers || srcTy.getShape() != dstTy.getShape() ||
+        srcTy.getElementType() != dstTy.getElementType())
+      return false;
+
+    Attribute dstEncoding = dstTy.getEncoding();
+    SmallVector<Value> indices;
+    indices.reserve(localPointers.getIndices().size());
+    for (Value index : localPointers.getIndices()) {
+      auto indexTy = dyn_cast<RankedTensorType>(index.getType());
+      if (!indexTy || indexTy.getShape() != dstTy.getShape())
+        return false;
+      indices.push_back(getOrCreateCachedConvertLayout(
+          builder, convert, index, dstEncoding, cache));
+    }
+
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(convert);
+    auto rematerialized = builder.create<triton::tle::LocalPointersOp>(
+        localPointers.getLoc(), dstTy, localPointers.getSrc(), indices);
+    for (NamedAttribute attr : localPointers->getAttrs())
+      rematerialized->setAttr(attr.getName(), attr.getValue());
+    convert.getResult().replaceAllUsesWith(rematerialized.getResult());
+    convert.erase();
+    return true;
+  }
+
   Value srcPtr = convert.getSrc();
   Value convertedPtr = convert.getResult();
   Attribute srcEncoding = srcTy.getEncoding();
@@ -635,6 +666,86 @@ static bool tryFoldPointerConvertLayout(triton::gpu::ConvertLayoutOp convert,
 
   if (convertedPtr.use_empty())
     convert.erase();
+  return true;
+}
+
+static bool tryRematerializeExplicitLocalLoad(
+    triton::gpu::ConvertLayoutOp convert, OpBuilder &builder,
+    CachedConversionMap &cache) {
+  auto dstTy = dyn_cast<RankedTensorType>(convert.getType());
+  if (!dstTy)
+    return false;
+
+  bool isExplicitBoundary = isTleExplicitConvertLayoutOp(convert);
+  for (OpOperand &use : convert.getResult().getUses()) {
+    Attribute memoryEncoding =
+        getTleExplicitMemoryEncoding(use.getOwner());
+    isExplicitBoundary |= memoryEncoding == dstTy.getEncoding();
+  }
+  if (!isExplicitBoundary)
+    return false;
+
+  auto srcTy = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+  if (!srcTy || srcTy.getShape() != dstTy.getShape() ||
+      srcTy.getElementType() != dstTy.getElementType())
+    return false;
+
+  auto load =
+      stripConvertLayouts(convert.getSrc()).getDefiningOp<triton::LoadOp>();
+  if (!load || load.getIsVolatile())
+    return false;
+
+  Value strippedPtr = stripConvertLayouts(load.getPtr());
+  auto localPointers =
+      strippedPtr.getDefiningOp<triton::tle::LocalPointersOp>();
+  auto localPointerTy =
+      localPointers
+          ? dyn_cast<RankedTensorType>(localPointers.getResult().getType())
+          : RankedTensorType();
+  if (!localPointers || !localPointerTy ||
+      localPointerTy.getShape() != dstTy.getShape())
+    return false;
+
+  Attribute dstEncoding = dstTy.getEncoding();
+  auto dstPointerTy = RankedTensorType::get(
+      dstTy.getShape(), localPointerTy.getElementType(), dstEncoding);
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(load);
+  SmallVector<Value> indices;
+  indices.reserve(localPointers.getIndices().size());
+  for (Value index : localPointers.getIndices()) {
+    auto indexTy = dyn_cast<RankedTensorType>(index.getType());
+    if (!indexTy || indexTy.getShape() != dstTy.getShape())
+      return false;
+    indices.push_back(getOrCreateCachedConvertLayout(
+        builder, load, index, dstEncoding, cache));
+  }
+
+  auto rematerialized = builder.create<triton::tle::LocalPointersOp>(
+      localPointers.getLoc(), dstPointerTy, localPointers.getSrc(), indices);
+  for (NamedAttribute attr : localPointers->getAttrs())
+    rematerialized->setAttr(attr.getName(), attr.getValue());
+
+  IRMapping mapping;
+  mapping.map(load.getPtr(), rematerialized.getResult());
+  if (Value mask = load.getMask()) {
+    mapping.map(mask, getOrCreateCachedConvertLayout(
+                          builder, load, mask, dstEncoding, cache));
+  }
+  if (Value other = load.getOther()) {
+    mapping.map(other, getOrCreateCachedConvertLayout(
+                           builder, load, other, dstEncoding, cache));
+  }
+
+  auto rematerializedLoad =
+      cast<triton::LoadOp>(builder.clone(*load, mapping));
+  rematerializedLoad.getResult().setType(dstTy);
+  setTleExplicitMemoryEncoding(rematerializedLoad, dstEncoding);
+  setTleExplicitResultEncoding(
+      rematerializedLoad.getOperation(), 0, dstEncoding);
+  convert.getResult().replaceAllUsesWith(rematerializedLoad.getResult());
+  convert.erase();
   return true;
 }
 
@@ -919,17 +1030,22 @@ class SelectEncodingsPass
     bool changed = true;
     while (changed) {
       changed = false;
-      SmallVector<triton::gpu::ConvertLayoutOp> ptrConverts;
+      SmallVector<triton::gpu::ConvertLayoutOp> converts;
       module.walk([&](triton::gpu::ConvertLayoutOp convert) {
-        if (isPointerTensorType(convert.getType()) &&
-            isPointerTensorType(convert.getSrc().getType()))
-          ptrConverts.push_back(convert);
+        converts.push_back(convert);
       });
-      for (triton::gpu::ConvertLayoutOp convert : ptrConverts) {
+      for (triton::gpu::ConvertLayoutOp convert : converts) {
         if (convert->getBlock() == nullptr)
           continue;
-        changed |= tryFoldPointerConvertLayout(convert, builder,
-                                               userOperandConversionCache);
+        changed |= tryRematerializeExplicitLocalLoad(
+            convert, builder, userOperandConversionCache);
+        if (convert->getBlock() == nullptr)
+          continue;
+        if (isPointerTensorType(convert.getType()) &&
+            isPointerTensorType(convert.getSrc().getType())) {
+          changed |= tryFoldPointerConvertLayout(
+              convert, builder, userOperandConversionCache);
+        }
       }
     }
   }

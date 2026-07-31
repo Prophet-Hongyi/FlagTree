@@ -107,8 +107,8 @@ private:
       opOffsetVal = b.i32_val(opOffset);
     }
 
-    promotedOperands.push_back(LLVM::getGlobalScratchPtr(
-        loc, rewriter, targetInfo, caller, opOffsetVal));
+    promotedOperands.push_back(
+        LLVM::getGlobalScratchBase(loc, rewriter, caller, opOffsetVal));
     promotedOperands.push_back(
         LLVM::getProfileScratchPtr(loc, rewriter, caller));
     return promotedOperands;

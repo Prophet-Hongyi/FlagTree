@@ -1,4 +1,6 @@
 # flagtree tle
+import copy
+
 import pytest
 
 import triton.experimental.tle.language as tle
@@ -45,6 +47,14 @@ class TestDeviceMesh:
             tle.device_mesh({"node": []})
         with pytest.raises(ValueError):
             tle.device_mesh({"node": [("x", 0)]})
+
+    def test_device_mesh_has_structural_value_semantics(self):
+        mesh = tle.device_mesh({"block": [("block_x", 4)]})
+        equivalent = copy.deepcopy(mesh)
+
+        assert equivalent == mesh
+        assert hash(equivalent) == hash(mesh)
+        assert mesh[:2] != mesh[2:]
 
 
 class TestShardingSpec:

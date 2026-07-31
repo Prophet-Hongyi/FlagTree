@@ -4,6 +4,22 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @lower_non_power_of_two_capacity
+  tt.func @lower_non_power_of_two_capacity(%a: !ttg.memdesc<3x16xf16, #shared, #smem, mutable>) {
+    // The logical pipe and payload keep capacity 3, while private control
+    // tensors are padded to 4.
+    // CHECK: tt.splat
+    // CHECK-SAME: tensor<4x1xi32
+    // CHECK: ttg.local_alloc
+    // CHECK-SAME: !ttg.memdesc<4x1xi32
+    // CHECK: nvws.create_token
+    // CHECK-SAME: numBuffers = 4
+    // CHECK-SAME: tensor<4x!nvws.token>
+    tle.pipe.create %a {capacity = 3 : i32, pipe_name = "three_stage", field_names = ["a"], scope = "cta"} : !ttg.memdesc<3x16xf16, #shared, #smem, mutable>
+    // CHECK-NOT: tle.pipe
+    tt.return
+  }
+
   // CHECK-LABEL: tt.func @lower_pipe_to_nvws
   tt.func @lower_pipe_to_nvws(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
     %c0 = arith.constant 0 : i32
