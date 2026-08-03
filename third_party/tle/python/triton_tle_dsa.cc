@@ -73,6 +73,7 @@ static void init_triton_tle_ir(py::module m) {
              py::object scope) -> OpState {
             self.getContext()->getOrLoadDialect<dsa::DsaDialect>();
             DenseI32ArrayAttr meshPhysicalIdsAttr;
+            DenseI32ArrayAttr meshShapeAttr;
             if (!scope.is_none() && py::hasattr(scope, "physical_ids")) {
               py::object physicalIds = scope.attr("physical_ids");
               std::vector<int32_t> ids;
@@ -82,8 +83,17 @@ static void init_triton_tle_ir(py::module m) {
                 meshPhysicalIdsAttr =
                     DenseI32ArrayAttr::get(self.getBuilder().getContext(), ids);
             }
-            return self.create<dsa::RemotePointersOp>(resultTy, src, shardId,
-                                                      meshPhysicalIdsAttr);
+            if (!scope.is_none() && py::hasattr(scope, "shape")) {
+              py::object shape = scope.attr("shape");
+              std::vector<int32_t> dims;
+              for (auto dim : py::reinterpret_borrow<py::iterable>(shape))
+                dims.push_back(py::cast<int32_t>(dim));
+              if (!dims.empty())
+                meshShapeAttr = DenseI32ArrayAttr::get(
+                    self.getBuilder().getContext(), dims);
+            }
+            return self.create<dsa::RemotePointersOp>(
+                resultTy, src, shardId, meshPhysicalIdsAttr, meshShapeAttr);
           },
           py::arg("resultTy"), py::arg("src"), py::arg("shardId"),
           py::arg("scope") = py::none())
@@ -113,6 +123,19 @@ static void init_triton_tle_ir(py::module m) {
 
              self.create<dsa::DistributedBarrierOp>(
                  kindAttr, rankAttr, shapeAttr, axesAttr, maskAttr);
+           })
+      .def("create_dsa_cumsum",
+           [](TritonOpBuilder &self, Type exclusiveTy, Type totalTy,
+              Value input, int32_t axis, bool reverse,
+              const std::vector<int64_t> &shape, int64_t pad) -> OpState {
+             self.getContext()->getOrLoadDialect<dsa::DsaDialect>();
+             auto &builder = self.getBuilder();
+             auto *ctx = builder.getContext();
+             return builder.create<dsa::CumsumOp>(
+                 self.getLastLoc(), TypeRange{exclusiveTy, totalTy}, input,
+                 builder.getI32IntegerAttr(axis), builder.getBoolAttr(reverse),
+                 DenseI64ArrayAttr::get(ctx, shape),
+                 builder.getI64IntegerAttr(pad));
            });
 }
 

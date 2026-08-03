@@ -106,13 +106,48 @@ static int getEffectiveNumStages(scf::ForOp forOp, int globalDefault,
   return n;
 }
 
+static bool isAllocBacked(Value v);
+static void remapMixedFoldResults(ArrayRef<OpFoldResult> in,
+                                  SmallVectorImpl<OpFoldResult> &out,
+                                  const IRMapping &rm);
+static MemRefType inferSubviewResultType(memref::SubViewOp sv,
+                                         MemRefType srcType,
+                                         ArrayRef<OpFoldResult> offsets,
+                                         ArrayRef<OpFoldResult> sizes,
+                                         ArrayRef<OpFoldResult> strides);
+
+// A loop is treated as "pipelineable" (effectively innermost) even if it has
+// nested scf.for loops, provided those nested loops are "trivial" — they
+// contain no mk::DotOp and no alloc-backed memref::CopyOp. Trivial inner
+// loops (e.g., the scalar row-fill loops that broadcast softmax row-max/sum
+// into a 2D buffer) are cloned intact into the compute phase by
+// cloneComputeOps and do not interfere with multi-buffering.
 static bool isInnermostForOp(scf::ForOp forOp) {
-  bool hasNestedFor = false;
-  forOp.walk([&](scf::ForOp inner) {
-    if (inner != forOp)
-      hasNestedFor = true;
+  bool hasSignificantNestedFor = false;
+  forOp.walk([&](scf::ForOp inner) -> WalkResult {
+    if (inner == forOp)
+      return WalkResult::advance();
+    bool significant = false;
+    inner.walk([&](Operation *op) -> WalkResult {
+      if (isa<mlir::mk::DotOp>(op)) {
+        significant = true;
+        return WalkResult::interrupt();
+      }
+      if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
+        if (isAllocBacked(copyOp.getTarget())) {
+          significant = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (significant) {
+      hasSignificantNestedFor = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
-  return !hasNestedFor;
+  return !hasSignificantNestedFor;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -336,27 +371,66 @@ static Value makeBankAdvance(IRRewriter &rewriter, Location loc, Value cur,
   return rewriter.create<arith::RemSIOp>(loc, next, modulo);
 }
 
+// 判断一个 memref 值是否最终来自 memref::AllocOp（SPM 缓冲）。
+// 通过递归穿透所有 view op（不改数据、只改类型/形状/布局的操作）。
+// ──────────────────────────────────────────────────────────────────────────
+// ⚠️ 风险：此函数必须覆盖 ALL view op 类型。如果遗漏某个 view op：
+//   - SPM→SPM 的 copy 会被误判为 DDR→SPM → 错误多缓冲化 → 精度错误
+//   - DDR→SPM 的 copy 可能找不到 base alloc → pipeline 跳过 → 依赖顺序错误
+// 所有 memref 的 ViewLikeOpInterface 实现均在此覆盖。新增 view op
+// 时务必同步更新。
+// ──────────────────────────────────────────────────────────────────────────
 static bool isAllocBacked(Value v) {
   if (!v)
     return false;
   if (v.getDefiningOp<memref::AllocOp>())
     return true;
-  if (auto sv = v.getDefiningOp<memref::SubViewOp>())
-    return isAllocBacked(sv.getSource());
-  if (auto rc = v.getDefiningOp<memref::ReinterpretCastOp>())
-    return isAllocBacked(rc.getSource());
+  if (auto op = v.getDefiningOp<memref::SubViewOp>())
+    return isAllocBacked(op.getSource());
+  if (auto op = v.getDefiningOp<memref::ReinterpretCastOp>())
+    return isAllocBacked(op.getSource());
+  if (auto op = v.getDefiningOp<memref::CollapseShapeOp>())
+    return isAllocBacked(op.getSrc());
+  if (auto op = v.getDefiningOp<memref::ExpandShapeOp>())
+    return isAllocBacked(op.getSrc());
+  if (auto op = v.getDefiningOp<memref::CastOp>())
+    return isAllocBacked(op.getSource());
+  if (auto op = v.getDefiningOp<memref::ReshapeOp>())
+    return isAllocBacked(op.getSource());
+  if (auto op = v.getDefiningOp<memref::MemorySpaceCastOp>())
+    return isAllocBacked(op.getSource());
+  if (auto op = v.getDefiningOp<memref::ViewOp>())
+    return isAllocBacked(op.getSource());
+  if (auto op = v.getDefiningOp<memref::TransposeOp>())
+    return isAllocBacked(op.getIn());
   return false;
 }
 
+// 与 isAllocBacked 配套：沿 view 链找到最终的 memref::AllocOp。
+// 覆盖范围必须与 isAllocBacked 保持同步。
 static memref::AllocOp findBaseAlloc(Value v) {
   if (!v)
     return {};
   if (auto a = v.getDefiningOp<memref::AllocOp>())
     return a;
-  if (auto sv = v.getDefiningOp<memref::SubViewOp>())
-    return findBaseAlloc(sv.getSource());
-  if (auto rc = v.getDefiningOp<memref::ReinterpretCastOp>())
-    return findBaseAlloc(rc.getSource());
+  if (auto op = v.getDefiningOp<memref::SubViewOp>())
+    return findBaseAlloc(op.getSource());
+  if (auto op = v.getDefiningOp<memref::ReinterpretCastOp>())
+    return findBaseAlloc(op.getSource());
+  if (auto op = v.getDefiningOp<memref::CollapseShapeOp>())
+    return findBaseAlloc(op.getSrc());
+  if (auto op = v.getDefiningOp<memref::ExpandShapeOp>())
+    return findBaseAlloc(op.getSrc());
+  if (auto op = v.getDefiningOp<memref::CastOp>())
+    return findBaseAlloc(op.getSource());
+  if (auto op = v.getDefiningOp<memref::ReshapeOp>())
+    return findBaseAlloc(op.getSource());
+  if (auto op = v.getDefiningOp<memref::MemorySpaceCastOp>())
+    return findBaseAlloc(op.getSource());
+  if (auto op = v.getDefiningOp<memref::ViewOp>())
+    return findBaseAlloc(op.getSource());
+  if (auto op = v.getDefiningOp<memref::TransposeOp>())
+    return findBaseAlloc(op.getIn());
   return {};
 }
 
@@ -368,7 +442,10 @@ static memref::AllocOp findBaseAlloc(Value v) {
 // 并把 fill 的 outs 重映射到 multi-buffer slot；compute 阶段则跳过它们，
 // 否则会在 load 之后把已经载入的数据清零，破坏 OOB 区域的 0 语义。
 struct LoadGroup {
-  memref::CopyOp copy;
+  Operation *copy; // 可以是 memref::CopyOp 或 linalg::CopyOp
+  // 标记该copy的目标alloc是否在循环外分配（如cu_seqlens偏移缓冲）。
+  // 循环外分配的缓冲不需要多缓冲，但copy本身仍需从compute移到load阶段。
+  bool isOuterAlloc = false;
   // prelude 中的所有 op（含 scf.if、其内部 fill、condition 计算的 cmp/ori 等）
   // 全部位于 forOp body 顶层、copy 之前。collectPipelinedLoads 一并填充。
   // 在 load 阶段需要按顺序 clone 全部 preludeOps 到 multi-buffer slot
@@ -500,23 +577,52 @@ collectIfConditionDefChain(Value cond, scf::ForOp forOp, Operation *boundary,
   return true;
 }
 
+static Value getCopyTarget(Operation *copyOp) {
+  if (auto mcpy = dyn_cast<memref::CopyOp>(copyOp))
+    return mcpy.getTarget();
+  if (auto lcpy = dyn_cast<linalg::CopyOp>(copyOp))
+    return lcpy.getOutputs()[0];
+  return Value();
+}
+static Value getCopySource(Operation *copyOp) {
+  if (auto mcpy = dyn_cast<memref::CopyOp>(copyOp))
+    return mcpy.getSource();
+  if (auto lcpy = dyn_cast<linalg::CopyOp>(copyOp))
+    return lcpy.getInputs()[0];
+  return Value();
+}
+
 static SmallVector<LoadGroup> collectPipelinedLoads(scf::ForOp forOp) {
   SmallVector<LoadGroup> groups;
   // 标记被收集为 prelude 的 op，避免不同 copy 之间错误共享。
   llvm::SmallPtrSet<Operation *, 16> claimed;
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    auto copyOp = dyn_cast<memref::CopyOp>(&op);
+    // 识别 memref.copy 或 linalg.copy 作为 DDR→SPM 加载
+    Operation *copyOp = nullptr;
+    Value target, source;
+    if (auto mcpy = dyn_cast<memref::CopyOp>(&op)) {
+      copyOp = mcpy.getOperation();
+      target = mcpy.getTarget();
+      source = mcpy.getSource();
+    } else if (auto lcpy = dyn_cast<linalg::CopyOp>(&op)) {
+      copyOp = lcpy.getOperation();
+      target = lcpy.getOutputs()[0];
+      source = lcpy.getInputs()[0];
+    }
     if (!copyOp)
       continue;
-    if (!isAllocBacked(copyOp.getTarget()))
+    if (!isAllocBacked(target))
       continue;
-    memref::AllocOp baseAlloc = findBaseAlloc(copyOp.getTarget());
+    if (isAllocBacked(source))
+      continue; // skip SPM→SPM copies; only DDR→SPM loads are pipelined
+    memref::AllocOp baseAlloc = findBaseAlloc(target);
     if (!baseAlloc)
       continue;
 
     LoadGroup grp;
     grp.copy = copyOp;
+    grp.isOuterAlloc = (baseAlloc->getBlock() != forOp.getBody());
 
     // 在 copy 之前向上扫描，找到第一个对 baseAlloc 做清零的 scf.if。
     // 一旦遇到任何对 baseAlloc 有写副作用的其他 op，立刻停止匹配（保守）。
@@ -541,7 +647,12 @@ static SmallVector<LoadGroup> collectPipelinedLoads(scf::ForOp forOp) {
           if (findBaseAlloc(store.getMemRef()) == baseAlloc)
             writesBase = true;
         if (auto cpy = dyn_cast<memref::CopyOp>(inner))
-          if (cpy != copyOp && findBaseAlloc(cpy.getTarget()) == baseAlloc)
+          if (cpy.getOperation() != copyOp &&
+              findBaseAlloc(cpy.getTarget()) == baseAlloc)
+            writesBase = true;
+        if (auto lcpy = dyn_cast<linalg::CopyOp>(inner))
+          if (lcpy.getOperation() != copyOp &&
+              findBaseAlloc(lcpy.getOutputs()[0]) == baseAlloc)
             writesBase = true;
         if (auto fill = dyn_cast<linalg::FillOp>(inner)) {
           for (Value o : fill.getOutputs())
@@ -779,10 +890,52 @@ cloneDefChainInLoopBody(Operation *root, scf::ForOp forOp, IRMapping &mapping,
         if (mapping.contains(arg))
           mapping.erase(arg);
 
-  Operation *cloned = builder.clone(*root, mapping);
-
-  if (auto clonedIf = dyn_cast<scf::IfOp>(cloned))
-    dedupIfYields(clonedIf, builder);
+  // SubViewOp/ExpandShapeOp/CollapseShapeOp：当 source 的类型因 mapping 而改变
+  // （例如 alloc → multi-buffer slot，引入 dynamic offset/stride），结果类型
+  // 必须重新推导，否则 builder.clone 会原样保留旧 result type，产生
+  // "mismatch of result layout" 验证错误。
+  Operation *cloned = nullptr;
+  if (auto sv = dyn_cast<memref::SubViewOp>(root)) {
+    SmallVector<OpFoldResult> offs, sizes, strides;
+    remapMixedFoldResults(sv.getMixedOffsets(), offs, mapping);
+    remapMixedFoldResults(sv.getMixedSizes(), sizes, mapping);
+    remapMixedFoldResults(sv.getMixedStrides(), strides, mapping);
+    Value newSrc = mapping.lookupOrDefault(sv.getSource());
+    auto newSrcTy = cast<MemRefType>(newSrc.getType());
+    MemRefType resultTy =
+        inferSubviewResultType(sv, newSrcTy, offs, sizes, strides);
+    cloned = builder.create<memref::SubViewOp>(sv.getLoc(), resultTy, newSrc,
+                                               offs, sizes, strides);
+  } else if (auto expand = dyn_cast<memref::ExpandShapeOp>(root)) {
+    Value newSrc = mapping.lookupOrDefault(expand.getSrc());
+    auto newSrcTy = cast<MemRefType>(newSrc.getType());
+    auto reassoc = expand.getReassociationIndices();
+    FailureOr<MemRefType> resultTy = memref::ExpandShapeOp::computeExpandedType(
+        newSrcTy, expand.getResultType().getShape(), reassoc);
+    if (failed(resultTy)) {
+      cloned = builder.clone(*root, mapping);
+    } else {
+      OpBuilder shapeBuilder(builder.getContext());
+      SmallVector<OpFoldResult> mixedOut = getMixedValues(
+          expand.getStaticOutputShape(), expand.getOutputShape(), shapeBuilder);
+      SmallVector<OpFoldResult> remappedMixed;
+      remapMixedFoldResults(mixedOut, remappedMixed, mapping);
+      cloned = builder.create<memref::ExpandShapeOp>(
+          expand.getLoc(), *resultTy, newSrc, reassoc, remappedMixed);
+    }
+  } else if (auto collapse = dyn_cast<memref::CollapseShapeOp>(root)) {
+    Value newSrc = mapping.lookupOrDefault(collapse.getSrc());
+    auto newSrcTy = cast<MemRefType>(newSrc.getType());
+    auto reassoc = collapse.getReassociationIndices();
+    MemRefType resultTy =
+        memref::CollapseShapeOp::computeCollapsedType(newSrcTy, reassoc);
+    cloned = builder.create<memref::CollapseShapeOp>(collapse.getLoc(),
+                                                     resultTy, newSrc, reassoc);
+  } else {
+    cloned = builder.clone(*root, mapping);
+    if (auto clonedIf = dyn_cast<scf::IfOp>(cloned))
+      dedupIfYields(clonedIf, builder);
+  }
 
   cloneOf[root] = cloned;
   for (auto [from, to] : llvm::zip(root->getResults(), cloned->getResults()))
@@ -903,7 +1056,7 @@ static Value remapDestToSlot(OpBuilder &b, Location loc,
 
 struct PipelineRewriter {
   scf::ForOp forOp;
-  SmallVector<memref::CopyOp> copies;
+  SmallVector<Operation *> copies; // 可以是 memref::CopyOp 或 linalg::CopyOp
   // 与 copies 一一对应，保存每个 copy 的 prelude（含 fill-if + 其 cmp/ori
   // 链）。
   SmallVector<LoadGroup> loadGroups;
@@ -950,16 +1103,16 @@ struct PipelineRewriter {
   // load phase. Skipping the whole load-only sub-graph in compute kills
   // the duplicate DMA and the wasted arith that feeds it.
   void buildLoadOnlyOps() {
-    for (memref::CopyOp c : copies)
-      loadOnlyOps.insert(c.getOperation());
+    for (Operation *c : copies)
+      loadOnlyOps.insert(c);
     for (Operation *op : skipInComputeSet)
       loadOnlyOps.insert(op);
 
     // Pipelined alloc bases are NOT load-only (compute reads them via
     // the extract slot), but they must not block propagation either.
     llvm::SmallPtrSet<Operation *, 4> pipelinedAllocBases;
-    for (memref::CopyOp c : copies)
-      if (auto base = findBaseAlloc(c.getTarget()))
+    for (Operation *c : copies)
+      if (auto base = findBaseAlloc(getCopyTarget(c)))
         pipelinedAllocBases.insert(base.getOperation());
 
     Block *body = forOp.getBody();
@@ -1007,8 +1160,8 @@ struct PipelineRewriter {
   bool createMultiBuffers(DenseMap<Value, Value> &destToMultiBuf) {
     DenseMap<Value, Value> baseMemToMulti;
     rewriter.setInsertionPoint(forOp);
-    for (auto copyOp : copies) {
-      Value origDest = copyOp.getTarget();
+    for (Operation *copyOp : copies) {
+      Value origDest = getCopyTarget(copyOp);
       memref::AllocOp baseAlloc = findBaseAlloc(origDest);
       if (!baseAlloc) {
         mlir::emitError(loc,
@@ -1017,6 +1170,12 @@ struct PipelineRewriter {
         return false;
       }
       Value baseMem = baseAlloc.getResult();
+      // 循环外分配的缓冲（如cu_seqlens偏移缓冲1xi32）不需要多缓冲，
+      // 只需把copy移到load阶段即可。后续compute/load阶段直接用原始缓冲。
+      if (baseAlloc->getBlock() != forOp.getBody()) {
+        destToMultiBuf[origDest] = baseMem;
+        continue;
+      }
       Value multi = baseMemToMulti.lookup(baseMem);
       if (!multi) {
         auto baseType = mlir::cast<MemRefType>(baseMem.getType());
@@ -1099,6 +1258,9 @@ struct PipelineRewriter {
 
   Value getSlot(Value multiBuf, Value slotIdx) {
     auto bufType = mlir::cast<MemRefType>(multiBuf.getType());
+    // 非多缓冲（循环外分配的原始缓冲）直接返回本身
+    if (bufType.getShape().empty() || bufType.getShape()[0] != numStages)
+      return multiBuf;
     SmallVector<int64_t> subShape(bufType.getShape().drop_front());
 
     SmallVector<OpFoldResult> offsets, sizes, strides;
@@ -1122,14 +1284,12 @@ struct PipelineRewriter {
     llvm::DenseSet<Operation *> producerDone;
     llvm::DenseMap<Operation *, Operation *> computeCloneOf;
     for (Operation &op : forOp.getBody()->without_terminator()) {
-      if (auto copyOp = dyn_cast<memref::CopyOp>(&op)) {
-        if (llvm::is_contained(copies, copyOp))
-          continue;
-      }
+      if (llvm::is_contained(copies, &op))
+        continue;
       if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
         bool isPipelinedSpmBase = false;
-        for (memref::CopyOp c : copies) {
-          if (findBaseAlloc(c.getTarget()) == allocOp) {
+        for (Operation *c : copies) {
+          if (findBaseAlloc(getCopyTarget(c)) == allocOp) {
             isPipelinedSpmBase = true;
             break;
           }
@@ -1288,7 +1448,7 @@ struct PipelineRewriter {
       LoadGroup &grp = loadGroups[i];
       if (!grp.fillCoversBase || !grp.matchedZeroFillIf)
         continue;
-      Value multi = destToMultiBuf.lookup(grp.copy.getTarget());
+      Value multi = destToMultiBuf.lookup(getCopyTarget(grp.copy));
       if (!multi)
         continue;
       // [关键安全检查] 必须确认 condition 是循环不变量。否则 fill 与
@@ -1441,39 +1601,47 @@ struct PipelineRewriter {
               copyMapping.map(forOp.getRegionIterArgs()[j],
                               forOp.getInitArgs()[j]);
             for (auto &grp : loadGroups) {
-              memref::CopyOp copyOp = grp.copy;
-              Value multi = destToMultiBuf.lookup(copyOp.getTarget());
-              auto bufType = mlir::cast<MemRefType>(multi.getType());
-              SmallVector<int64_t> subShape(bufType.getShape().drop_front());
-              SmallVector<OpFoldResult> offsets, sizes, strides;
-              offsets.push_back(slotIdx);
-              sizes.push_back(b.getIndexAttr(1));
-              strides.push_back(b.getIndexAttr(1));
-              for (int64_t d : subShape) {
-                offsets.push_back(b.getIndexAttr(0));
-                sizes.push_back(b.getIndexAttr(d));
+              Operation *copyOp = grp.copy;
+              Value origTarget = getCopyTarget(copyOp);
+              Value multi = destToMultiBuf.lookup(origTarget);
+              Value slot;
+              memref::AllocOp baseAlloc = findBaseAlloc(origTarget);
+              if (grp.isOuterAlloc) {
+                // 循环外分配的缓冲直接用原缓冲
+                slot = multi;
+              } else {
+                auto bufType = mlir::cast<MemRefType>(multi.getType());
+                SmallVector<int64_t> subShape(bufType.getShape().drop_front());
+                SmallVector<OpFoldResult> offsets, sizes, strides;
+                offsets.push_back(slotIdx);
+                sizes.push_back(b.getIndexAttr(1));
                 strides.push_back(b.getIndexAttr(1));
+                for (int64_t d : subShape) {
+                  offsets.push_back(b.getIndexAttr(0));
+                  sizes.push_back(b.getIndexAttr(d));
+                  strides.push_back(b.getIndexAttr(1));
+                }
+                MemRefType subType =
+                    memref::SubViewOp::inferRankReducedResultType(
+                        subShape, bufType, offsets, sizes, strides);
+                assert(subType &&
+                       "inferRankReducedResultType failed (prologue slot)");
+                slot = b.create<memref::SubViewOp>(l, subType, multi, offsets,
+                                                   sizes, strides);
               }
-              MemRefType subType =
-                  memref::SubViewOp::inferRankReducedResultType(
-                      subShape, bufType, offsets, sizes, strides);
-              assert(subType &&
-                     "inferRankReducedResultType failed (prologue slot)");
-              Value slot = b.create<memref::SubViewOp>(l, subType, multi,
-                                                       offsets, sizes, strides);
-
-              memref::AllocOp baseAlloc = findBaseAlloc(copyOp.getTarget());
 
               if (baseAlloc)
                 copyMapping.map(baseAlloc.getResult(), slot);
               clonePreludeIntoLoad(grp, b, copyMapping);
 
-              Value mappedTarget = remapDestToSlot(
-                  b, l, forOp, copyMapping, copyProducersDone, copyCloneOf,
-                  copyOp.getTarget(), slot, baseAlloc);
-              copyMapping.map(copyOp.getTarget(), mappedTarget);
-              remapCopySourceProducersInLoop(copyOp, forOp, copyMapping, b,
-                                             copyProducersDone, copyCloneOf);
+              Value mappedTarget =
+                  remapDestToSlot(b, l, forOp, copyMapping, copyProducersDone,
+                                  copyCloneOf, origTarget, slot, baseAlloc);
+              copyMapping.map(origTarget, mappedTarget);
+              Value origSource = getCopySource(copyOp);
+              if (Operation *def = origSource.getDefiningOp())
+                cloneDefChainInLoopBody(def, forOp, copyMapping, b,
+                                        copyProducersDone, copyCloneOf);
               b.clone(*copyOp, copyMapping);
             }
             b.create<scf::YieldOp>(l);
@@ -1550,10 +1718,11 @@ struct PipelineRewriter {
                       computeMapping.lookupOrDefault(nextState));
     }
     for (auto &grp : loadGroups) {
-      memref::CopyOp copyOp = grp.copy;
-      Value multi = destToMultiBuf.lookup(copyOp.getTarget());
+      Operation *copyOp = grp.copy;
+      Value origTarget = getCopyTarget(copyOp);
+      Value multi = destToMultiBuf.lookup(origTarget);
       Value slot = getSlot(multi, insertIdx);
-      memref::AllocOp baseAlloc = findBaseAlloc(copyOp.getTarget());
+      memref::AllocOp baseAlloc = findBaseAlloc(origTarget);
 
       if (baseAlloc)
         copyMapping.map(baseAlloc.getResult(), slot);
@@ -1561,11 +1730,12 @@ struct PipelineRewriter {
 
       Value mappedTarget = remapDestToSlot(
           rewriter, loc, forOp, copyMapping, kernelCopyProducersDone,
-          kernelCopyCloneOf, copyOp.getTarget(), slot, baseAlloc);
-      copyMapping.map(copyOp.getTarget(), mappedTarget);
-      remapCopySourceProducersInLoop(copyOp, forOp, copyMapping, rewriter,
-                                     kernelCopyProducersDone,
-                                     kernelCopyCloneOf);
+          kernelCopyCloneOf, origTarget, slot, baseAlloc);
+      copyMapping.map(origTarget, mappedTarget);
+      Value origSource = getCopySource(copyOp);
+      if (Operation *def = origSource.getDefiningOp())
+        cloneDefChainInLoopBody(def, forOp, copyMapping, rewriter,
+                                kernelCopyProducersDone, kernelCopyCloneOf);
       rewriter.clone(*copyOp, copyMapping);
     }
 

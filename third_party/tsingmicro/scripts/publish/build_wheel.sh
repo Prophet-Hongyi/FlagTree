@@ -90,7 +90,6 @@ else
 fi
 PROXY=http://192.168.100.225:8889
 export https_proxy=$PROXY http_proxy=$PROXY all_proxy=$PROXY
-apt install -y lld
 apt install -y ccache
 apt install -y git
 pip3 install scikit_build_core #flaggems需要,也需要torch

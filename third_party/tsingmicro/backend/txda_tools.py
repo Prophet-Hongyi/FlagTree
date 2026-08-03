@@ -115,6 +115,10 @@ def is_use_profile():
     return os.getenv("ENABLE_PROFILING", "0").lower() in ("1", "true", "yes")
 
 
+def is_use_tsm_profiler():
+    return os.getenv("TSM_PROFILER_EN", "0").lower() in ("1", "true", "yes")
+
+
 def is_enable_kernel_file_cache():
     return os.getenv("ENABLE_KERNEL_FILE_CACHE", "1").lower() in ("1", "true", "yes")
 

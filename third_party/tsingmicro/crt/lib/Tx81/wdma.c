@@ -48,23 +48,34 @@ void __Wdma1d(void *restrict dest, const void *restrict src,
 
   if (is_dma_action_checking(action)) {
     uint64_t *header = get_header(base_dst);
-    if (header[1] != ClientPtrMagic) {
+    uint64_t CRC =
+        crc32((uint8_t *)header, ClientPtrHeaderBytes - sizeof(uint64_t));
+    if (CRC != header[2]) {
+      __EP_LOG__(3,
+                 "\n\nerror: [func @%s] wdma total_size %llu, magic %x, bad "
+                 "crc %x != %x(header[2]), "
+                 "base_dst (%p) data %x, src (%p)\n\n",
+                 kernel_name, header[0], header[1], CRC, header[2], base_dst,
+                 header[2], src);
+    } else if (header[1] != ClientPtrMagic) {
       dma_bad_magic_count++;
       __EP_LOG__(3,
-                 "\n\nerror: [func @%s] total_size %llu, bad magic %x, "
+                 "\n\nerror: [func @%s] total_size %llu, bad magic %x, crc %x, "
                  "base_dst (%p) data %x, dst (%p)\n\n",
-                 kernel_name, header[0], header[1], base_dst, header[2], dest);
+                 kernel_name, header[0], header[1], header[2], base_dst,
+                 header[2], dest);
     } else {
       uint64_t total_size = header[0];
       uint32_t elem_bytes = get_dtype_size_new((Data_Format)fmt);
       uintptr_t min_addr = (uintptr_t)dest;
       uintptr_t max_addr = (uintptr_t)dest + (uintptr_t)elem_count * elem_bytes;
 
-      __EP_LOG__(3,
-                 "[func @%s] wdma1d base_dst (%p), total_size %llu, magic %x, "
-                 "dst (%p), range_size %d\n",
-                 kernel_name, base_dst, total_size, header[1], dest,
-                 (unsigned int)(max_addr - min_addr));
+      __EP_LOG__(
+          3,
+          "[func @%s] wdma1d base_dst (%p), total_size %llu, magic %x, crc %x, "
+          "dst (%p), range_size %d\n",
+          kernel_name, base_dst, total_size, header[1], header[2], dest,
+          (unsigned int)(max_addr - min_addr));
 
       if (min_addr < (uintptr_t)base_dst ||
           max_addr > (uintptr_t)base_dst + total_size) {
@@ -197,23 +208,35 @@ void __Wdma(uint64_t *src, uint64_t *dst, int *src_shape, int *src_stride,
 
   if (is_dma_action_checking(action)) {
     uint64_t *header = get_header(base_dst);
-    if (header[1] != ClientPtrMagic) {
-      dma_bad_magic_count++;
+    uint64_t CRC =
+        crc32((uint8_t *)header, ClientPtrHeaderBytes - sizeof(uint64_t));
+    if (CRC != header[2]) {
       __EP_LOG__(3,
-                 "\n\nerror: [func @%s] total_size %llu, bad magic %x, "
-                 "base_dst (%p) data %x, dst (%p)\n\n",
-                 kernel_name, header[0], header[1], base_dst, header[2], dst);
+                 "\n\nerror: [func @%s] wdma total_size %llu, magic %x, bad "
+                 "crc %x != %x(header[2]), "
+                 "base_dst (%p) data %x, src (%p)\n\n",
+                 kernel_name, header[0], header[1], CRC, header[2], base_dst,
+                 header[2], src);
+    } else if (header[1] != ClientPtrMagic) {
+      dma_bad_magic_count++;
+      __EP_LOG__(
+          3,
+          "\n\nerror: [func @%s] wdma total_size %llu, bad magic %x, crc %x, "
+          "base_dst (%p) data %x, dst (%p)\n\n",
+          kernel_name, header[0], header[1], header[2], base_dst, header[2],
+          dst);
     } else {
       uint64_t total_size = header[0];
       Tx81DstAddrRange range =
           compute_wdma_dst_addr_range(dst, src_shape, src_stride, dst_shape,
                                       dst_stride, rank, elem_bytes, fmt);
 
-      __EP_LOG__(3,
-                 "[func @%s] wdma base_dst (%p), total_size %llu, magic %x, "
-                 "dst (%p), rang_size %d\n",
-                 kernel_name, base_dst, total_size, header[1], dst,
-                 (unsigned int)(range.max_addr - range.min_addr));
+      __EP_LOG__(
+          3,
+          "[func @%s] wdma base_dst (%p), total_size %llu, magic %x, crc %x, "
+          "dst (%p), rang_size %d\n",
+          kernel_name, base_dst, total_size, header[1], header[2], dst,
+          (unsigned int)(range.max_addr - range.min_addr));
 
       if (range.min_addr < (uintptr_t)base_dst ||
           range.max_addr > (uintptr_t)base_dst + total_size) {

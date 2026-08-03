@@ -21,6 +21,20 @@ uint64_t *get_header(const void *ddr_addr) {
   return (uint64_t *)((char *)ddr_addr - ClientPtrHeaderBytes);
 }
 
+uint32_t crc32(const uint8_t *data, int len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (int i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++) {
+      if (crc & 1)
+        crc = (crc >> 1) ^ 0x04C11DB7;
+      else
+        crc >>= 1;
+    }
+  }
+  return ~crc;
+}
+
 bool is_contiguous(int *shape, int *strides, int rank) {
   int expected_stride = 1;
   for (int i = rank - 1; i >= 0; i--) {
@@ -191,7 +205,7 @@ void debug_dump_f32_data(uint64_t *in, uint32_t elem_count, char *dump_flag) {
       "------crt dump f32 data, addr: %p, dump_flag: %s, dump elem_count: %d\n",
       in_data, dump_flag, elem_count);
   for (int i = 0; i < elem_count; i++) {
-    __EP_LOG__(3, "idx: %d, in: %f\n", i, in_data[i]);
+    __EP_LOG__(3, "idx: %d, in: %.9f\n", i, in_data[i]);
   }
 }
 
@@ -205,6 +219,93 @@ void debug_dump_i32_data(uint64_t *in, uint32_t elem_count, char *dump_flag) {
       in_data, dump_flag, elem_count);
   for (int i = 0; i < elem_count; i++) {
     __EP_LOG__(3, "idx: %d, in: %d\n", i, in_data[i]);
+  }
+}
+
+void debug_dump_i64_data(uint64_t *in, uint32_t elem_count, char *dump_flag) {
+  RcsWaitfinish();
+  volatile int64_t *in_data =
+      (volatile int64_t *)get_spm_memory_mapping((uint64_t)in);
+  __EP_LOG__(
+      3,
+      "------crt dump i32 data, addr: %p, dump_flag: %s, dump elem_count: %d\n",
+      in_data, dump_flag, elem_count);
+  for (int i = 0; i < elem_count; i++) {
+    __EP_LOG__(3, "idx: %d, in: %lld\n", i, in_data[i]);
+  }
+}
+
+float bf16_to_f32(uint16_t x) {
+  uint32_t u = ((uint32_t)x) << 16;
+  float f;
+  memcpy(&f, &u, sizeof(float));
+  return f;
+}
+
+void debug_dump_bf16_data(uint64_t *in, uint32_t elem_count, char *dump_flag) {
+  RcsWaitfinish();
+  volatile uint16_t *in_data =
+      (volatile uint16_t *)get_spm_memory_mapping((uint64_t)in);
+  __EP_LOG__(3,
+             "------crt dump bf16 data, addr: %p, dump_flag: %s, dump "
+             "elem_count: %d\n",
+             in_data, dump_flag, elem_count);
+  for (int i = 0; i < elem_count; i++) {
+    float num = bf16_to_fp32(in_data[i]);
+    __EP_LOG__(3, "idx: %d, in: %.9f\n", i, num);
+  }
+}
+
+float fp16_to_f32(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+  uint32_t exp = (h >> 10) & 0x1f;
+  uint32_t frac = h & 0x03ff;
+
+  uint32_t fbits;
+
+  if (exp == 0) {
+    if (frac == 0) {
+      // zero
+      fbits = sign;
+    } else {
+      // subnormal
+      exp = 1;
+      while ((frac & 0x0400) == 0) {
+        frac <<= 1;
+        exp--;
+      }
+      frac &= 0x03ff;
+
+      uint32_t fexp = exp + (127 - 15);
+      uint32_t ffrac = frac << 13;
+      fbits = sign | (fexp << 23) | ffrac;
+    }
+  } else if (exp == 0x1f) {
+    // inf / nan
+    fbits = sign | 0x7f800000 | (frac << 13);
+  } else {
+    // normal
+    uint32_t fexp = exp + (127 - 15);
+    uint32_t ffrac = frac << 13;
+    fbits = sign | (fexp << 23) | ffrac;
+  }
+
+  float f;
+  memcpy(&f, &fbits, sizeof(f));
+  return f;
+}
+
+void debug_dump_f16_data(uint64_t *in, uint32_t elem_count, char *dump_flag) {
+  RcsWaitfinish();
+  volatile uint16_t *in_data =
+      (volatile uint16_t *)get_spm_memory_mapping((uint64_t)in);
+  __EP_LOG__(
+      3,
+      "------crt dump f16 data, addr: %p, dump_flag: %s, dump elem_count: %d\n",
+      in_data, dump_flag, elem_count);
+  for (int i = 0; i < elem_count; i++) {
+    float num = fp16_to_f32(in_data[i]);
+    __EP_LOG__(3, "idx: %d, in: %.9f\n", i, num);
   }
 }
 

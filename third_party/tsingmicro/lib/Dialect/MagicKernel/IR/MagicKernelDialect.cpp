@@ -31,7 +31,7 @@ void MagicKernelDialect::initialize() {
       mk::AtomicCASOp, mk::ArgMaxOp, mk::ArgMinOp, mk::Bit2FpOp, mk::MaskMoveOp,
       mk::UnEqualVV, mk::EqualVV, mk::EqualVS, mk::LessThenVS, mk::BoolEqualVS,
       mk::ReduceMaxOp, mk::ReduceMinOp, mk::ReduceSumOp, mk::DequantOp,
-      mk::BitcastOp, mk::AddVS, mk::SubVS, mk::MulVS>();
+      mk::CumsumOp, mk::BitcastOp, mk::AddVS, mk::SubVS, mk::MulVS>();
 }
 
 //===----------------------------------------------------------------------===//

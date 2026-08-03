@@ -1,20 +1,20 @@
-from posixpath import dirname
-from triton.backends.compiler import BaseBackend, GPUTarget
-from triton._C.libtriton import ir, passes
-from triton.runtime.cache import get_cache_manager
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple
-from types import ModuleType
+import functools
 import hashlib
-import tempfile
 import os
 import re
-import sys
 import subprocess
-import functools
+import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Dict, Tuple
+
+from triton._C.libtriton import ir, passes
+from triton.backends.compiler import BaseBackend, GPUTarget
 from triton.backends.tsingmicro import txda_tools
 from triton.backends.tsingmicro.logger_config import setup_logger
+from triton.runtime.cache import get_cache_manager
 
 logger = setup_logger("tsingmicro_launch")
 
@@ -117,7 +117,7 @@ def _ttir_to_coreir(mod, num_stages=2):
         txda_tools.dump_ir_if_needed([src_path])
 
         coreir_to_mk_mode = _get_core_dialects_to_mk_pass_arg()
-        pipeline_flag = f"--mk-pipeline=num-stages={num_stages}" if num_stages > 1 else None
+        pipeline_flag = f"--mk-pipeline=num-stages={num_stages}"
 
         args = [
             triton_opt_path, src_path, "--triton-to-core-dialects", "--tle-to-mk", "--dsa-memory-to-core",
@@ -125,7 +125,8 @@ def _ttir_to_coreir(mod, num_stages=2):
             "--one-shot-bufferize", "--convert-bufferization-to-memref", "--materialize-strided-linalg-inputs", "--cse",
             "--canonicalize"
         ]
-        if pipeline_flag is not None:
+
+        if os.getenv("TRITON_PIPELINE", "1") == "1":
             args.append(pipeline_flag)
             args.append("--mk-loop-bound-canonicalize")
             args.append("--cse")
@@ -225,11 +226,10 @@ def _txir_to_llir(mod, metadata):
         args = [
             triton_opt_path, src_path,
             # Use tx81-memref-to-llvm to replace "--finalize-memref-to-llvm".
-            "--tx81-memref-to-llvm", "--addr-to-llvm", "--convert-scf-to-cf", "--convert-math-to-llvm",
-            "--convert-math-to-libm", "--convert-cf-to-llvm",  # need exec before "convert-func-to-llvm"
+            "--tx81-memref-to-llvm", "--addr-to-llvm", "--convert-scf-to-cf", "--expand-strided-metadata",
+            "--convert-math-to-llvm", "--convert-math-to-libm",
+            "--convert-cf-to-llvm",  # need exec before "convert-func-to-llvm"
             "--convert-func-to-llvm",  # need exec before "kernel-arg-buffer", otherwise un-rank memref will translate to int(rank) + ptr
-            # FIXME: Move this pass into the pipeline from coreir to txir.
-            "--expand-strided-metadata",
             # Other unconverted memref ops, eg: memref.global from scan op conversion
             "--finalize-memref-to-llvm"
         ]
@@ -474,7 +474,7 @@ class TXDABackend(BaseBackend):
     def add_stages(self, stages, options):
         if os.getenv("USE_OUTSIDE_LLVM_TX81", "1").lower() in ("1", "true", "yes"):
             llvm_path = txda_tools.get_llvm_system_path()
-            mlir_path = llvm_path + "python_packages/mlir_core/"
+            mlir_path = os.path.join(llvm_path, "python_packages", "mlir_core")
             if mlir_path not in sys.path:
                 sys.path.insert(0, mlir_path)
             bin_path = llvm_path + "/bin"
