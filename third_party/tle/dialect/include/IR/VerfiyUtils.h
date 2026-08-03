@@ -38,6 +38,7 @@ namespace mlir::triton::tle {
 
 namespace RemotePointers {
 llvm::LogicalResult verifyDeviceSpace(mlir::Value src, mlir::Value result);
+llvm::LogicalResult verifyNodeSpace(RemotePointersOp op);
 }
 
 namespace DistributedBarrier {

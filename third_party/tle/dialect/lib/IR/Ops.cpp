@@ -46,16 +46,6 @@ namespace {
 constexpr int kSharedMemoryAddressSpace = 3;
 // Cluster-shared pointers map to LLVM address space 7 (NVVM shared::cluster).
 constexpr int kClusterSharedMemoryAddressSpace = 7;
-
-std::optional<int64_t> getConstantIntValue(Value value) {
-  auto constant = value.getDefiningOp<arith::ConstantOp>();
-  if (!constant)
-    return std::nullopt;
-  auto integer = dyn_cast<IntegerAttr>(constant.getValue());
-  if (!integer)
-    return std::nullopt;
-  return integer.getInt();
-}
 } // namespace
 
 // ============================================================================
@@ -931,15 +921,53 @@ LogicalResult DistributedBarrierOp::verify() {
   return success();
 }
 
+void RemotePointersOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (getSpace() != "node")
+    return;
+  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
+Speculation::Speculatability RemotePointersOp::getSpeculatability() {
+  return getSpace() == "node" ? Speculation::NotSpeculatable
+                              : Speculation::Speculatable;
+}
+
 LogicalResult RemotePointersOp::verify() {
-  auto spaceAttr = getSpace();
-  if (spaceAttr != "cluster" && spaceAttr != "device")
+  StringRef spaceAttr = getSpace();
+  if (spaceAttr != "cluster" && spaceAttr != "device" &&
+      spaceAttr != "node")
     return emitOpError()
-           << "expects space to be either 'cluster' or 'device'";
+           << "expects space to be 'cluster', 'device', or 'node'";
+
+  if (!getShardId().getType().isInteger(32))
+    return emitOpError() << "expects shard_id to be i32";
+
+  if (spaceAttr == "node")
+    return RemotePointers::verifyNodeSpace(*this);
+
+  auto elemBytesAttr = (*this)->getAttrOfType<IntegerAttr>("elem_bytes");
+  auto putCoopKindAttr =
+      (*this)->getAttrOfType<IntegerAttr>("put_coop_kind");
+
+  if (getDstMem() || getSrcMem() || getComm() || getSrcOffset() ||
+      getNelems() || getNetIdx() || elemBytesAttr || putCoopKindAttr)
+    return emitOpError()
+           << "cluster/device space does not accept node put operands or "
+              "attributes";
+  if (!getResult())
+    return emitOpError()
+           << "cluster/device space must produce a remote pointer result";
+
   if (spaceAttr == "device") {
     if (failed(RemotePointers::verifyDeviceSpace(getSrc(), getResult())))
       return failure();
   } else {
+    if (!getSrc())
+      return emitOpError() << "cluster space requires a source pointer";
+
     Type srcTy = getSrc().getType();
     Type resultTy = getResult().getType();
     auto getPtrInfo = [&](Type ty, triton::PointerType &ptr, bool &isTensor,
@@ -990,8 +1018,7 @@ LogicalResult RemotePointersOp::verify() {
                                 "match";
       if (srcEncoding && resultEncoding && srcEncoding != resultEncoding)
         return emitOpError()
-               << "expects src/result pointer tensor encodings to "
-                  "match";
+               << "expects src/result pointer tensor encodings to match";
     }
     if (srcPtrTy.getPointeeType() != resultPtrTy.getPointeeType())
       return emitOpError() << "expects src/result pointer pointee types to "
@@ -1007,9 +1034,6 @@ LogicalResult RemotePointersOp::verify() {
              << "expects result pointers to live in cluster shared memory "
                 "(addrspace=7)";
   }
-
-  if (!getShardId().getType().isInteger(32))
-    return emitOpError() << "expects shard_id to be i32";
 
   bool hasOffset = getOffset() != nullptr;
   if (spaceAttr == "device") {
@@ -1031,36 +1055,6 @@ LogicalResult RemotePointersOp::verify() {
     if (!offsetTy.isSignlessInteger(64))
       return emitOpError() << "expects offset to be i64";
   }
-
-  return success();
-}
-
-LogicalResult NodePutOp::verify() {
-  if (getElemBytes() <= 0)
-    return emitOpError() << "expects elem_bytes to be > 0";
-
-  int64_t coopKind = getPutCoopKind();
-  if (coopKind < 0 || coopKind > 2)
-    return emitOpError()
-           << "expects put_coop_kind to be THREAD(0), WARP(1), or BLOCK(2)";
-
-  auto verifyNonNegativeConstant =
-      [&](Value value, StringRef name) -> LogicalResult {
-    if (std::optional<int64_t> constant = getConstantIntValue(value);
-        constant && *constant < 0)
-      return emitOpError()
-             << "expects constant " << name << " to be >= 0";
-    return success();
-  };
-
-  if (failed(verifyNonNegativeConstant(getPeer(), "peer")) ||
-      failed(verifyNonNegativeConstant(getDstOffset(), "dst_offset")) ||
-      failed(verifyNonNegativeConstant(getSrcOffset(), "src_offset")))
-    return failure();
-
-  if (std::optional<int64_t> nelems = getConstantIntValue(getNelems());
-      nelems && *nelems <= 0)
-    return emitOpError() << "expects constant nelems to be > 0";
 
   return success();
 }
