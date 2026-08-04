@@ -66,12 +66,14 @@ bool isNoop(Operation *op);
 std::string getTleExplicitEncodingAttrName(unsigned resultNumber);
 const char *getTleExplicitMemoryEncodingAttrName();
 Attribute getTleExplicitResultEncoding(Operation *op, unsigned resultNumber);
-void setTleExplicitResultEncoding(Operation *op, unsigned resultNumber, Attribute encoding);
+void setTleExplicitResultEncoding(Operation *op, unsigned resultNumber,
+                                  Attribute encoding);
 void setTleExplicitResultEncoding(OpResult result, Attribute encoding);
 Attribute getTleExplicitMemoryEncoding(Operation *op);
 void setTleExplicitMemoryEncoding(Operation *op, Attribute encoding);
 Attribute getTleExplicitValueEncoding(Value value);
-LogicalResult inferTleExplicitMemoryEncoding(Operation *op, Attribute &encoding);
+LogicalResult inferTleExplicitMemoryEncoding(Operation *op,
+                                             Attribute &encoding);
 bool isTleExplicitConvertLayoutOp(Operation *op);
 #endif
 

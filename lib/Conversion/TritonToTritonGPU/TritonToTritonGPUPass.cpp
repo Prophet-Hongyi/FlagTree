@@ -75,8 +75,8 @@ struct TleEncodingInfo {
 };
 
 static bool tleEncodingsMayVary(Operation *op) {
-  return isa<triton::JoinOp, triton::SplitOp, triton::ReshapeOp,
-             triton::CatOp, triton::TransOp>(op);
+  return isa<triton::JoinOp, triton::SplitOp, triton::ReshapeOp, triton::CatOp,
+             triton::TransOp>(op);
 }
 
 static LogicalResult mergeTleEncodingInfo(TleEncodingInfo oldInfo,
@@ -127,8 +127,7 @@ updateTleEncoding(ArrayRef<Value> values, TleEncodingInfo info, FuncOp func,
       Operation *defOp = value.getDefiningOp();
       Operation *diagOp = defOp ? defOp : func.getOperation();
       TleEncodingInfo merged;
-      if (failed(
-              mergeTleEncodingInfo(it->second, info, diagOp, merged)))
+      if (failed(mergeTleEncodingInfo(it->second, info, diagOp, merged)))
         return failure();
       if (merged.encoding == it->second.encoding &&
           merged.mayVary == it->second.mayVary)
@@ -154,8 +153,8 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
   llvm::MapVector<Value, TleEncodingInfo> valueToEncoding;
   llvm::PriorityWorklist<Value> worklist;
   for (auto &[value, info] : seedEncodings) {
-    if (failed(updateTleEncoding({value}, info, func, valueToEncoding,
-                                 worklist)))
+    if (failed(
+            updateTleEncoding({value}, info, func, valueToEncoding, worklist)))
       return failure();
   }
 
@@ -185,8 +184,8 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
         // A/B use dot-operand encodings, while C and D use the parent MMA
         // encoding. Only C and D are layout-equivalent across a dot.
         if (use.getOperandNumber() == 2 &&
-            failed(updateTleEncoding({dot.getD()}, info, func,
-                                     valueToEncoding, worklist)))
+            failed(updateTleEncoding({dot.getD()}, info, func, valueToEncoding,
+                                     worklist)))
           return failure();
         continue;
       }
@@ -194,9 +193,9 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
         continue;
 
       if (isa<tle::LocalPointersOp>(op)) {
-        if (failed(updateTleEncoding(
-                llvm::to_vector_of<Value>(op->getResults()), info, func,
-                valueToEncoding, worklist)))
+        if (failed(
+                updateTleEncoding(llvm::to_vector_of<Value>(op->getResults()),
+                                  info, func, valueToEncoding, worklist)))
           return failure();
         continue;
       }
@@ -228,8 +227,8 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
         for (Value index : localPointers.getIndices())
           if (isa<RankedTensorType>(index.getType()))
             tensorIndices.push_back(index);
-        if (failed(updateTleEncoding(tensorIndices, info, func,
-                                     valueToEncoding, worklist)))
+        if (failed(updateTleEncoding(tensorIndices, info, func, valueToEncoding,
+                                     worklist)))
           return failure();
       } else if (!isa<tle::SetLayoutOp>(definingOp)) {
         Attribute srcEncoding = inferSrcEncoding(definingOp, info.encoding);
@@ -249,8 +248,7 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
       Operation *parentOp = blockArg.getOwner()->getParentOp();
       if (isa<scf::ForOp, scf::WhileOp>(parentOp)) {
         int offset = isa<scf::ForOp>(parentOp);
-        auto tiedArgs =
-            getTiedArgs(parentOp, blockArg.getArgNumber() - offset);
+        auto tiedArgs = getTiedArgs(parentOp, blockArg.getArgNumber() - offset);
         if (failed(updateTleEncoding(tiedArgs, info, func, valueToEncoding,
                                      worklist)))
           return failure();
@@ -1227,8 +1225,7 @@ public:
 
     auto convert = rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
         op, resultType, src);
-    convert->setAttr(getTleExplicitEncodingAttrName(0),
-                     op.getTargetEncoding());
+    convert->setAttr(getTleExplicitEncodingAttrName(0), op.getTargetEncoding());
     return success();
   }
 };
@@ -1239,25 +1236,24 @@ public:
 void populateTleRawPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
-  patterns
-      .add<TleDSLRegionOpPattern, TleExtractTileOpPattern,
-           TleInsertTileOpPattern,
+  patterns.add<
+      TleDSLRegionOpPattern, TleExtractTileOpPattern, TleInsertTileOpPattern,
 #ifdef __TLE__
-           TleSetLayoutOpPattern,
+      TleSetLayoutOpPattern,
 #endif
-	   GenericOpPattern<tle::LocalPointersOp>,
-           GenericOpPattern<tle::RemotePointersOp>,
-           GenericOpPattern<tle::ExclusiveCumsumOp>,
-           GenericOpPattern<tle::WGMMAOp>, GenericOpPattern<tle::WGMMAWaitOp>,
-           GenericOpPattern<tle::DistributedBarrierOp>,
-           GenericOpPattern<tle::YieldOp>,
-           GenericOpPattern<tle::ExtractAllocatedPtrOp>,
-           GenericOpPattern<tle::ExtractAlignedPtrOp>,
-           GenericOpPattern<tle::ExtractOffsetOp>,
-           GenericOpPattern<tle::ExtractSizesOp>,
-           GenericOpPattern<tle::ExtractStridesOp>,
-           GenericOpPattern<tle::ExtractPtrOp>, GenericOpPattern<tle::PackOp>>(
-          typeConverter, context);
+      GenericOpPattern<tle::LocalPointersOp>,
+      GenericOpPattern<tle::RemotePointersOp>,
+      GenericOpPattern<tle::ExclusiveCumsumOp>, GenericOpPattern<tle::WGMMAOp>,
+      GenericOpPattern<tle::WGMMAWaitOp>,
+      GenericOpPattern<tle::DistributedBarrierOp>,
+      GenericOpPattern<tle::YieldOp>,
+      GenericOpPattern<tle::ExtractAllocatedPtrOp>,
+      GenericOpPattern<tle::ExtractAlignedPtrOp>,
+      GenericOpPattern<tle::ExtractOffsetOp>,
+      GenericOpPattern<tle::ExtractSizesOp>,
+      GenericOpPattern<tle::ExtractStridesOp>,
+      GenericOpPattern<tle::ExtractPtrOp>, GenericOpPattern<tle::PackOp>>(
+      typeConverter, context);
 }
 #endif
 

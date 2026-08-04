@@ -875,17 +875,16 @@ void init_triton_ir(py::module &&m) {
           [](TritonOpBuilder &self) { return self.getBuilder().getUnitAttr(); })
 #ifdef __TLE__
       .def("get_blocked_encoding",
-           [](TritonOpBuilder &self,
-              std::vector<unsigned> &sizePerThread,
+           [](TritonOpBuilder &self, std::vector<unsigned> &sizePerThread,
               std::vector<unsigned> &threadsPerWarp,
               std::vector<unsigned> &warpsPerCta, std::vector<unsigned> &order,
               std::vector<std::vector<int32_t>> &cgaBases) -> Attribute {
              auto ctx = self.getContext();
              unsigned rank = order.size();
              auto ctaLayout = buildTleCtaLayoutAttr(ctx, cgaBases, rank);
-             return ttg::BlockedEncodingAttr::get(
-                 ctx, sizePerThread, threadsPerWarp, warpsPerCta, order,
-                 ctaLayout);
+             return ttg::BlockedEncodingAttr::get(ctx, sizePerThread,
+                                                  threadsPerWarp, warpsPerCta,
+                                                  order, ctaLayout);
            })
       .def("get_sliced_encoding",
            [](TritonOpBuilder &self, unsigned dim,
@@ -901,19 +900,18 @@ void init_triton_ir(py::module &&m) {
              auto ctx = self.getContext();
              unsigned rank = warpsPerCta.size();
              auto ctaLayout = buildTleCtaLayoutAttr(ctx, cgaBases, rank);
-             return ttg::NvidiaMmaEncodingAttr::get(
-                 ctx, version[0], version[1], warpsPerCta, ctaLayout,
-                 instrShape);
+             return ttg::NvidiaMmaEncodingAttr::get(ctx, version[0], version[1],
+                                                    warpsPerCta, ctaLayout,
+                                                    instrShape);
            })
       .def("get_dot_operand_layout",
            [](TritonOpBuilder &self, unsigned opIdx, Attribute parent,
               unsigned kWidth) -> Attribute {
-             return ttg::DotOperandEncodingAttr::get(
-                 self.getContext(), opIdx, parent, kWidth);
+             return ttg::DotOperandEncodingAttr::get(self.getContext(), opIdx,
+                                                     parent, kWidth);
            })
       .def("clone_tensor_type_with_encoding",
-           [](TritonOpBuilder &self, Type type,
-              Attribute encoding) -> Type {
+           [](TritonOpBuilder &self, Type type, Attribute encoding) -> Type {
              auto tensorTy = cast<RankedTensorType>(type);
              return tensorTy.cloneWithEncoding(encoding);
            })
@@ -922,8 +920,8 @@ void init_triton_ir(py::module &&m) {
               int numCtas) {
              auto *block = self.getBuilder().getInsertionBlock();
              if (!block)
-               throw std::invalid_argument(
-                   "cannot set ttg layout attributes without an insertion block");
+               throw std::invalid_argument("cannot set ttg layout attributes "
+                                           "without an insertion block");
              Operation *op = block->getParentOp();
              while (op && !isa<ModuleOp>(op))
                op = op->getParentOp();
@@ -932,8 +930,7 @@ void init_triton_ir(py::module &&m) {
                throw std::invalid_argument(
                    "cannot find parent module for ttg layout attributes");
              auto i32 = IntegerType::get(self.getContext(), 32);
-             module->setAttr("ttg.num-warps",
-                             IntegerAttr::get(i32, numWarps));
+             module->setAttr("ttg.num-warps", IntegerAttr::get(i32, numWarps));
              module->setAttr("ttg.threads-per-warp",
                              IntegerAttr::get(i32, threadsPerWarp));
              module->setAttr("ttg.num-ctas", IntegerAttr::get(i32, numCtas));

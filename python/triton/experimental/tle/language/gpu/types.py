@@ -48,6 +48,7 @@ class layout:
     def to_ir(self, builder: ir.builder) -> None:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
+
 class distributed_encoding(layout):
     """Base class for explicit TritonGPU distributed tensor encodings."""
 
@@ -65,7 +66,8 @@ class BlockEncoding(distributed_encoding):
         self.threads_per_warp = [int(tl._unwrap_if_constexpr(x)) for x in threads_per_warp]
         self.warps_per_cta = [int(tl._unwrap_if_constexpr(x)) for x in warps_per_cta]
         self.order = [int(tl._unwrap_if_constexpr(x)) for x in order]
-        self.cga_layout = [] if cga_layout is None else [[int(tl._unwrap_if_constexpr(x)) for x in basis]
+        self.cga_layout = [] if cga_layout is None else [[int(tl._unwrap_if_constexpr(x))
+                                                          for x in basis]
                                                          for basis in cga_layout]
 
         rank = len(self.order)
@@ -113,7 +115,8 @@ class MmaEncoding(distributed_encoding):
         self.version = [int(tl._unwrap_if_constexpr(x)) for x in version]
         self.warps_per_cta = [int(tl._unwrap_if_constexpr(x)) for x in warps_per_cta]
         self.instr_shape = [int(tl._unwrap_if_constexpr(x)) for x in instr_shape]
-        self.cga_layout = [] if cga_layout is None else [[int(tl._unwrap_if_constexpr(x)) for x in basis]
+        self.cga_layout = [] if cga_layout is None else [[int(tl._unwrap_if_constexpr(x))
+                                                          for x in basis]
                                                          for basis in cga_layout]
 
         rank = len(self.warps_per_cta)
@@ -178,8 +181,8 @@ class DotOperandEncoding(distributed_encoding):
                 f"k_width={self.k_width})")
 
     def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.operand_index == other.operand_index
-                and self.parent == other.parent and self.k_width == other.k_width)
+        return (type(self) is type(other) and self.operand_index == other.operand_index and self.parent == other.parent
+                and self.k_width == other.k_width)
 
     def __hash__(self):
         return hash((self.operand_index, self.parent, self.k_width))
@@ -212,6 +215,7 @@ class SlicedEncoding(distributed_encoding):
 
     def __hash__(self):
         return hash((self.dim, self.parent))
+
 
 class shared_layout(layout):
 
