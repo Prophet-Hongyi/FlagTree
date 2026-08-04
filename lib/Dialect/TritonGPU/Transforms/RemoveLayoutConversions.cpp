@@ -4856,3 +4856,4 @@ createTritonGPURemoveLayoutConversionsEnhanced(bool enhance) {
 #endif // __FLAGTREE_RLC_ENHANCE__
 
 } // namespace mlir::triton::gpu
+#endif

@@ -1938,3 +1938,4 @@ LogicalResult verifyBarrierType(Operation *op,
 }
 
 } // namespace mlir::triton
+#endif
