@@ -553,7 +553,7 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
       } else {
         dstEncoding = inferDstEncoding(op, encoding);
       }
-      if(dstEncoding) {
+      if (dstEncoding) {
         auto &layoutInfo = layouts[value];
         hasChanged |= layoutInfo.encodings.insert(dstEncoding);
 #ifdef __TLE__
@@ -2732,7 +2732,7 @@ void LayoutPropagation::resolveConflicts() {
     }
     info.encodings.clear();
     info.encodings.insert(bestEncoding);
-#else  // __FLAGTREE_RLC_ENHANCE__
+#else // __FLAGTREE_RLC_ENHANCE__
     Operation *op = it.first.getDefiningOp();
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)

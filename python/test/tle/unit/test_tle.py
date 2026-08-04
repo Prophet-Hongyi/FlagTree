@@ -23,6 +23,7 @@ from triton.language.core import base_value
 from triton.experimental.tle.language.gpu.core import _deduplicate_warp_specialize_captures
 from triton.experimental.tle.language.gpu.semantic import TLESemanticError, TLESemantic
 
+
 @triton.jit
 def _encoding_frontend_kernel(layout: tl.constexpr):
     x = tl.arange(0, 128)
@@ -60,7 +61,7 @@ class TestLayoutEncoding:
         # Original order for 3D rank is [2, 1, 0]
         # Permuting with [1, 0, 2] gives: order[1], order[0], order[2] = [1, 2, 0]
         assert permuted.order == (1, 2, 0)
-        
+
     def test_explicit_distributed_encoding_frontend(self):
         """Test explicit BlockEncoding/SlicedEncoding frontend lowering."""
         parent = tle.gpu.BlockEncoding([1, 1], [1, 32], [8, 1], [1, 0])
@@ -97,6 +98,7 @@ class TestLayoutEncoding:
         assert "opIdx = 0" in ir
         assert "opIdx = 1" in ir
         assert "kWidth = 2" in ir
+
 
 class TestPipeline:
     """Test pipeline iterator"""

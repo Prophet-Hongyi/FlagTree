@@ -52,6 +52,7 @@ class pipeline(range):
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None):
         super().__init__(arg1, arg2, step, num_stages, loop_unroll_factor)
 
+
 @tl.builtin
 def set_layout(value, layout, _semantic=None):
     """标注 TLE block tensor 的显式 TritonGPU 分布式编码,对应 tle.gpu.set_layout op。"""
@@ -73,6 +74,7 @@ def set_layout(value, layout, _semantic=None):
         _semantic.builder.create_tle_gpu_set_layout(value.handle, target_encoding),
         value.type,
     )
+
 
 class range(_tl_range):
     """
