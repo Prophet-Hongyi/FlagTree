@@ -48,8 +48,8 @@ _HAS_TLE_EXPLICIT_LAYOUT = hasattr(libtriton.ir.builder, "ensure_ttg_layout_attr
 
 
 def _cuda_backend_available():
-    from triton.compiler.compiler import get_backend
     try:
+        from triton.compiler.compiler import get_backend
         get_backend(GPUTarget("cuda", 90, 32))
         return True
     except Exception:
