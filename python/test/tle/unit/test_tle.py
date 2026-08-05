@@ -22,7 +22,7 @@ from triton.backends.compiler import GPUTarget
 from triton.language.core import base_value
 from triton.experimental.tle.language.gpu.core import _deduplicate_warp_specialize_captures
 from triton.experimental.tle.language.gpu.semantic import TLESemanticError, TLESemantic
-
+import triton._C.libtriton as libtriton
 
 @triton.jit
 def _encoding_frontend_kernel(layout: tl.constexpr):
@@ -42,6 +42,15 @@ def _dot_encoding_frontend_kernel(
     acc = tle.gpu.set_layout(tl.zeros((32, 8), tl.float32), mma_layout)
     result = tl.dot(lhs, rhs, acc=acc, out_dtype=tl.float32)  # noqa: F841
 
+_HAS_TLE_EXPLICIT_LAYOUT = hasattr(libtriton.ir.builder, "ensure_ttg_layout_attrs")
+
+def _cuda_backend_available():
+    from triton.compiler.compiler import get_backend
+    try:
+        get_backend(GPUTarget("cuda", 90, 32))
+        return True
+    except Exception:
+        return False
 
 class TestLayoutEncoding:
     """Test layout encoding"""
@@ -61,7 +70,9 @@ class TestLayoutEncoding:
         # Original order for 3D rank is [2, 1, 0]
         # Permuting with [1, 0, 2] gives: order[1], order[0], order[2] = [1, 2, 0]
         assert permuted.order == (1, 2, 0)
-
+    
+    @pytest.mark.skipif(not _HAS_TLE_EXPLICIT_LAYOUT, reason="requires __TLE__ build")
+    @pytest.mark.skipif(not _cuda_backend_available(), reason="requires cuda backend")
     def test_explicit_distributed_encoding_frontend(self):
         """Test explicit BlockEncoding/SlicedEncoding frontend lowering."""
         parent = tle.gpu.BlockEncoding([1, 1], [1, 32], [8, 1], [1, 0])
@@ -76,7 +87,9 @@ class TestLayoutEncoding:
         assert "tle.gpu.set_layout" in ir
         assert "ttg.convert_layout" not in ir
         assert "#ttg.slice<{dim = 0, parent = #blocked}>" in ir
-
+    
+    @pytest.mark.skipif(not _HAS_TLE_EXPLICIT_LAYOUT, reason="requires __TLE__ build")
+    @pytest.mark.skipif(not _cuda_backend_available(), reason="requires cuda backend")
     def test_explicit_dot_operand_encoding_frontend(self):
         """Test explicit MMA and dot-operand frontend lowering."""
         mma_layout = tle.gpu.MmaEncoding([2, 0], [4, 1], [16, 8])
