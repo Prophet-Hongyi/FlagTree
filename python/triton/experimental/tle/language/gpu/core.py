@@ -64,12 +64,10 @@ def set_layout(value, layout, _semantic=None):
     if not value.type.is_block():
         raise ValueError("tle.gpu.set_layout only supports block tensors")
     if not hasattr(_semantic.builder, "ensure_ttg_layout_attrs"):
-        raise RuntimeError(
-            "tle.gpu.set_layout requires a Triton build with __TLE__ explicit "
-            "layout support (ir.builder.ensure_ttg_layout_attrs is missing). "
-            "This backend likely uses its own TLE variant "
-            "(e.g. __ILUVATAR_TLE__/__MCTLE__) that does not implement this op."
-        )
+        raise RuntimeError("tle.gpu.set_layout requires a Triton build with __TLE__ explicit "
+                           "layout support (ir.builder.ensure_ttg_layout_attrs is missing). "
+                           "This backend likely uses its own TLE variant "
+                           "(e.g. __ILUVATAR_TLE__/__MCTLE__) that does not implement this op.")
     options = _semantic.builder.options
     _semantic.builder.ensure_ttg_layout_attrs(
         int(getattr(options, "num_warps")),

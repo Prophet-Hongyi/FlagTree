@@ -24,6 +24,7 @@ from triton.experimental.tle.language.gpu.core import _deduplicate_warp_speciali
 from triton.experimental.tle.language.gpu.semantic import TLESemanticError, TLESemantic
 import triton._C.libtriton as libtriton
 
+
 @triton.jit
 def _encoding_frontend_kernel(layout: tl.constexpr):
     x = tl.arange(0, 128)
@@ -42,7 +43,9 @@ def _dot_encoding_frontend_kernel(
     acc = tle.gpu.set_layout(tl.zeros((32, 8), tl.float32), mma_layout)
     result = tl.dot(lhs, rhs, acc=acc, out_dtype=tl.float32)  # noqa: F841
 
+
 _HAS_TLE_EXPLICIT_LAYOUT = hasattr(libtriton.ir.builder, "ensure_ttg_layout_attrs")
+
 
 def _cuda_backend_available():
     from triton.compiler.compiler import get_backend
@@ -51,6 +54,7 @@ def _cuda_backend_available():
         return True
     except Exception:
         return False
+
 
 class TestLayoutEncoding:
     """Test layout encoding"""
@@ -70,7 +74,7 @@ class TestLayoutEncoding:
         # Original order for 3D rank is [2, 1, 0]
         # Permuting with [1, 0, 2] gives: order[1], order[0], order[2] = [1, 2, 0]
         assert permuted.order == (1, 2, 0)
-    
+
     @pytest.mark.skipif(not _HAS_TLE_EXPLICIT_LAYOUT, reason="requires __TLE__ build")
     @pytest.mark.skipif(not _cuda_backend_available(), reason="requires cuda backend")
     def test_explicit_distributed_encoding_frontend(self):
@@ -87,7 +91,7 @@ class TestLayoutEncoding:
         assert "tle.gpu.set_layout" in ir
         assert "ttg.convert_layout" not in ir
         assert "#ttg.slice<{dim = 0, parent = #blocked}>" in ir
-    
+
     @pytest.mark.skipif(not _HAS_TLE_EXPLICIT_LAYOUT, reason="requires __TLE__ build")
     @pytest.mark.skipif(not _cuda_backend_available(), reason="requires cuda backend")
     def test_explicit_dot_operand_encoding_frontend(self):
