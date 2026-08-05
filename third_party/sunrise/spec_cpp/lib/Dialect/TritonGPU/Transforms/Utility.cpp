@@ -27,7 +27,6 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 namespace mlir {
 
-
 #ifdef __TLE__
 static constexpr const char *kTleExplicitEncodingAttrPrefix =
     "tle.explicit_encoding.";
