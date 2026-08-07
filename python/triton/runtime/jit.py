@@ -371,6 +371,149 @@ class KernelInterface(Generic[T]):
         # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))
 
 
+class PreparedKernel:
+    """A compiled JIT specialization with the Python dispatch path removed.
+
+    Arguments passed to :meth:`launch` are only the parameters selected by
+    ``dynamic_arg_indices``. The remaining parameters retain the values bound
+    by :meth:`JITFunction.prepare`. Their compile-time specialization must
+    remain the one established by ``prepare``; changing that contract requires
+    preparing another kernel.
+    """
+
+    __slots__ = (
+        "_jit_function",
+        "_kernel",
+        "_launcher",
+        "_prepared_launcher",
+        "_device",
+        "_grid",
+        "_argument_names",
+        "_bound_args",
+        "_dynamic_arg_indices",
+        "_dynamic_argument_names",
+        "_pre_run_kwargs",
+    )
+
+    def __init__(
+        self,
+        jit_function,
+        kernel,
+        device,
+        grid,
+        argument_names,
+        bound_args,
+        dynamic_arg_indices,
+        trusted_pointer_arguments,
+        pre_run_kwargs,
+    ):
+        dynamic_arg_indices = tuple(dynamic_arg_indices)
+        dynamic_arg_set = set(dynamic_arg_indices)
+        self._jit_function = jit_function
+        self._kernel = kernel
+        self._launcher = kernel.run
+        prepare_launcher = getattr(self._launcher, "prepare", None)
+        self._prepared_launcher = (
+            prepare_launcher(
+                bound_args,
+                dynamic_arg_indices,
+                trusted_pointer_arguments=trusted_pointer_arguments,
+                function=kernel.function,
+                packed_metadata=kernel.packed_metadata,
+            )
+            if callable(prepare_launcher)
+            else None
+        )
+        self._device = device
+        self._grid = tuple(grid)
+        self._argument_names = tuple(argument_names)
+        self._bound_args = tuple(
+            None if index in dynamic_arg_set else value
+            for index, value in enumerate(bound_args)
+        )
+        self._dynamic_arg_indices = dynamic_arg_indices
+        self._dynamic_argument_names = tuple(
+            self._argument_names[index] for index in self._dynamic_arg_indices
+        )
+        self._pre_run_kwargs = dict(pre_run_kwargs)
+
+    @property
+    def compiled_kernel(self):
+        return self._kernel
+
+    @property
+    def argument_names(self):
+        return self._argument_names
+
+    @property
+    def dynamic_argument_names(self):
+        return self._dynamic_argument_names
+
+    @property
+    def grid(self):
+        return self._grid
+
+    def launch(self, *args, grid=None, stream=None):
+        if len(args) != len(self._dynamic_arg_indices):
+            raise TypeError(
+                f"Prepared kernel {self._jit_function._fn_name} expects "
+                f"{len(self._dynamic_arg_indices)} dynamic arguments "
+                f"({', '.join(self._dynamic_argument_names)}), got {len(args)}"
+            )
+
+        full_args = None
+        if (
+            self._prepared_launcher is None
+            or self._jit_function.pre_run_hooks
+            or callable(grid)
+            or knobs.runtime.launch_enter_hook is not None
+        ):
+            full_args = list(self._bound_args)
+            for index, value in zip(self._dynamic_arg_indices, args):
+                full_args[index] = value
+            full_args = tuple(full_args)
+
+        if self._jit_function.pre_run_hooks:
+            for hook in self._jit_function.pre_run_hooks:
+                hook(*full_args, **self._pre_run_kwargs)
+
+        if grid is None:
+            launch_grid = self._grid
+        elif callable(grid):
+            launch_grid = tuple(grid(dict(zip(self._argument_names, full_args))))
+        else:
+            launch_grid = tuple(grid)
+        if not 1 <= len(launch_grid) <= 3:
+            raise ValueError(
+                f"Prepared kernel grid must have one to three dimensions, got {launch_grid}"
+            )
+        grid_0 = launch_grid[0]
+        grid_1 = launch_grid[1] if len(launch_grid) > 1 else 1
+        grid_2 = launch_grid[2] if len(launch_grid) > 2 else 1
+
+        if stream is None:
+            stream = driver.active.get_current_stream(self._device)
+        launch_metadata = self._kernel.launch_metadata(
+            launch_grid, stream, *(full_args or ())
+        )
+        launcher = self._prepared_launcher or self._launcher
+        launch_args = args if self._prepared_launcher is not None else full_args
+        launcher(
+            grid_0,
+            grid_1,
+            grid_2,
+            stream,
+            self._kernel.function,
+            self._kernel.packed_metadata,
+            launch_metadata,
+            knobs.runtime.launch_enter_hook,
+            knobs.runtime.launch_exit_hook,
+            *launch_args,
+        )
+
+    __call__ = launch
+
+
 def serialize_specialization_data(name, signature, constants, attrs, options, key):
     constants = {
         key: str(value) if value.__class__.__name__ == "dtype" else
@@ -676,6 +819,94 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.ASTSource = ASTSource
         binder = create_function_from_signature(self.signature, self.params, backend)
         return {}, {}, target, backend, binder
+
+    def prepare(
+        self,
+        *args,
+        grid,
+        dynamic_arg_indices=None,
+        trusted_pointer_arguments=False,
+        **kwargs,
+    ):
+        """Compile and bind one specialization for direct repeated launch.
+
+        The returned :class:`PreparedKernel` bypasses argument binding,
+        specialization-key construction, and the JIT kernel-cache lookup.  It
+        accepts only the parameters selected by ``dynamic_arg_indices`` and
+        never silently recompiles for a different specialization. By default,
+        every non-constexpr parameter remains dynamic. Pointer validation is
+        retained unless ``trusted_pointer_arguments`` is explicitly enabled by
+        a caller that validates the complete runtime ABI before every launch.
+        """
+        kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
+        kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+
+        device = driver.active.get_current_device()
+        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        bound_args, specialization, options = binder(*args, **kwargs)
+        if dynamic_arg_indices is None:
+            dynamic_arg_indices = tuple(
+                index for index, param in enumerate(self.params) if not param.is_constexpr
+            )
+        else:
+            dynamic_arg_indices = tuple(int(index) for index in dynamic_arg_indices)
+        if len(set(dynamic_arg_indices)) != len(dynamic_arg_indices):
+            raise ValueError("Prepared kernel dynamic_arg_indices must be unique")
+        for index in dynamic_arg_indices:
+            if index < 0 or index >= len(self.params):
+                raise IndexError(
+                    f"Prepared kernel dynamic argument index {index} is outside "
+                    f"[0, {len(self.params)})"
+                )
+            if self.params[index].is_constexpr:
+                raise ValueError(
+                    f"Prepared kernel constexpr argument {self.params[index].name} "
+                    "cannot be dynamic"
+                )
+        key = compute_cache_key(kernel_key_cache, specialization, options)
+        kernel = kernel_cache.get(key, None)
+        if kernel is None:
+            options, signature, constexprs, attrs = self._pack_args(
+                backend, kwargs, bound_args, specialization, options
+            )
+            kernel = self._do_compile(
+                key, signature, device, constexprs, options, attrs, True
+            )
+            if kernel is None:
+                raise RuntimeError(
+                    f"Compilation hook suppressed prepared kernel {self._fn_name}"
+                )
+
+        not_present = object()
+        for (name, _), (val, globals_dict) in self.used_global_vals.items():
+            if (new_val := globals_dict.get(name, not_present)) != val:
+                raise RuntimeError(
+                    f"Global variable {name} has changed since we compiled this kernel, "
+                    f"from {val} to {new_val}"
+                )
+
+        if hasattr(kernel, "result"):
+            kernel = kernel.result()
+        kernel._init_handles()
+
+        if callable(grid):
+            grid = grid(bound_args)
+        grid = tuple(grid)
+        if not 1 <= len(grid) <= 3:
+            raise ValueError(
+                f"Prepared kernel grid must have one to three dimensions, got {grid}"
+            )
+        return PreparedKernel(
+            self,
+            kernel,
+            device,
+            grid,
+            tuple(bound_args.keys()),
+            tuple(bound_args.values()),
+            dynamic_arg_indices,
+            bool(trusted_pointer_arguments),
+            kwargs,
+        )
 
     def _pack_args(self, backend, kwargs, bound_args, specialization, options):
         # options

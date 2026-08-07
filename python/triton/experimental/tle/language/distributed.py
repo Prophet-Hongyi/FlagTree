@@ -150,6 +150,44 @@ class device_mesh:
             _launch_dim_names=self._launch_dim_names,
         )
 
+    def axis_group(self, axes: str | int | Sequence[str | int]) -> "_AxisGroup":
+        """Return the current shard's communication group along ``axes``."""
+        if (
+            self._shape != self._launch_shape
+            or self._dim_names != self._launch_dim_names
+            or self._physical_ids != tuple(range(_prod(self._launch_shape)))
+        ):
+            raise ValueError("axis_group must be constructed from the complete launch device_mesh")
+
+        if isinstance(axes, (str, int)):
+            raw_axes = (axes, )
+        elif isinstance(axes, (tuple, list)):
+            raw_axes = tuple(axes)
+        else:
+            raise TypeError(f"axis_group axes must be str/int/list/tuple, got {type(axes).__name__}")
+        if not raw_axes:
+            raise ValueError("axis_group must contain at least one mesh axis")
+
+        normalized_axes = []
+        for axis in raw_axes:
+            if isinstance(axis, str):
+                if axis not in self._launch_dim_names:
+                    raise ValueError(
+                        f"unknown mesh axis {axis!r}; available axes: {self._launch_dim_names}"
+                    )
+                axis_index = self._launch_dim_names.index(axis)
+            elif isinstance(axis, int):
+                axis_index = axis + self.ndim if axis < 0 else axis
+                if axis_index < 0 or axis_index >= self.ndim:
+                    raise IndexError(f"axis index {axis} out of range for mesh ndim {self.ndim}")
+            else:
+                raise TypeError(f"axis_group entries must be str or int, got {type(axis).__name__}")
+            normalized_axes.append(axis_index)
+
+        if len(set(normalized_axes)) != len(normalized_axes):
+            raise ValueError(f"axis_group axes must be unique, got {raw_axes}")
+        return _AxisGroup(self, tuple(sorted(normalized_axes)))
+
     def _normalize_key(self, key: Any) -> tuple[Any, ...]:
         if not isinstance(key, tuple):
             key = (key, )
@@ -243,6 +281,16 @@ class device_mesh:
             self._launch_shape,
             self._launch_dim_names,
         ))
+
+
+@dataclass(frozen=True)
+class _AxisGroup:
+    mesh: device_mesh
+    axes: tuple[int, ...]
+
+    @property
+    def axis_names(self) -> tuple[str, ...]:
+        return tuple(self.mesh.launch_dim_names[axis] for axis in self.axes)
 
 
 class _BroadcastSpec:
@@ -453,23 +501,40 @@ class _BarrierGroupDescriptor:
     shape: tuple[int, ...]
     axes: tuple[int, ...]
     mask: tuple[int, ...]
+    domain_shape: tuple[int, ...] = tuple()
+
+
+def _infer_grid_axis_group_barrier_group(group: _AxisGroup) -> _BarrierGroupDescriptor:
+    mesh = group.mesh
+    axes = group.axes
+    shape = tuple(int(mesh.launch_shape[axis]) for axis in axes)
+    return _BarrierGroupDescriptor(
+        kind="grid_axis_group",
+        rank=len(shape),
+        shape=shape,
+        axes=axes,
+        mask=tuple(),
+        domain_shape=tuple(int(dim) for dim in mesh.launch_shape),
+    )
 
 
 def _infer_submesh_barrier_group(
     mesh: device_mesh,
-    cluster_dims: Sequence[int],
+    domain_shape: Sequence[int],
+    *,
+    kind: str = "submesh",
 ) -> _BarrierGroupDescriptor | None:
-    cluster_size = _prod(cluster_dims)
-    if mesh.size == cluster_size:
+    domain_size = _prod(domain_shape)
+    if mesh.size == domain_size:
         return None
-    if mesh.size > cluster_size:
-        raise ValueError(f"mesh size ({mesh.size}) exceeds inferred cluster size ({cluster_size})")
+    if mesh.size > domain_size:
+        raise ValueError(f"mesh size ({mesh.size}) exceeds barrier domain size ({domain_size})")
 
     launch_size = _prod(mesh.launch_shape)
-    if launch_size != cluster_size:
+    if launch_size != domain_size:
         raise NotImplementedError(
             "sub-mesh distributed_barrier currently requires launch mesh domain "
-            f"to match inferred cluster size; launch_size={launch_size}, cluster_size={cluster_size}")
+            f"to match barrier domain size; launch_size={launch_size}, domain_size={domain_size}")
 
     if not mesh.dim_names:
         raise NotImplementedError("scalar sub-mesh barrier is not implemented yet; provide at least one sliced axis")
@@ -490,12 +555,12 @@ def _infer_submesh_barrier_group(
     mask = tuple(int(v) for v in mesh.physical_ids)
     if not mask:
         raise ValueError("sub-mesh barrier group mask cannot be empty")
-    if any(v < 0 or v >= cluster_size for v in mask):
-        raise ValueError("sub-mesh barrier group mask contains out-of-range cluster member ids: "
-                         f"mask={mask}, cluster_size={cluster_size}")
+    if any(v < 0 or v >= domain_size for v in mask):
+        raise ValueError("sub-mesh barrier group mask contains out-of-range member ids: "
+                         f"mask={mask}, domain_size={domain_size}")
 
     return _BarrierGroupDescriptor(
-        kind="submesh",
+        kind=kind,
         rank=len(shape),
         shape=shape,
         axes=axes,
@@ -574,9 +639,10 @@ def shard_id(
     if launch_size <= 0:
         raise ValueError(f"invalid launch mesh shape: {launch_shape}")
 
-    cluster_dims = _apply_mesh_cluster_launch(mesh, _semantic)
+    uses_cluster = _mesh_has_cluster_axes(mesh)
+    cluster_dims = _apply_mesh_cluster_launch(mesh, _semantic) if uses_cluster else (1, 1, 1)
     cluster_size = _prod(cluster_dims)
-    if _mesh_has_cluster_axes(mesh) and launch_size == cluster_size:
+    if uses_cluster and launch_size == cluster_size:
         builder = _semantic.builder
         if not hasattr(builder, "create_cluster_cta_id"):
             raise NotImplementedError("cluster shard_id requires rebuilt TLE extension with create_cluster_cta_id")
@@ -584,7 +650,7 @@ def shard_id(
     else:
         linear = tl.program_id(0, _semantic=_semantic)
 
-    if launch_size > 1 and launch_size != cluster_size:
+    if launch_size > 1 and (not uses_cluster or launch_size != cluster_size):
         linear = _semantic.mod(linear, launch_size)
 
     stride = _prod(launch_shape[axis_idx + 1:]) if axis_idx + 1 < len(launch_shape) else 1
@@ -598,7 +664,7 @@ def shard_id(
 
 
 @tl.builtin
-def distributed_barrier(mesh: device_mesh | None = None, _semantic=None):
+def distributed_barrier(mesh: device_mesh | _AxisGroup | None = None, _semantic=None):
     """
     M3 entrypoint: distributed synchronization primitive.
 
@@ -606,28 +672,48 @@ def distributed_barrier(mesh: device_mesh | None = None, _semantic=None):
     - block mesh: cooperative grid synchronization
     """
     mesh = tl._unwrap_if_constexpr(mesh)
-    if mesh is not None and not isinstance(mesh, device_mesh):
-        raise TypeError(f"mesh must be device_mesh or None, got {type(mesh).__name__}")
+    if mesh is not None and not isinstance(mesh, (device_mesh, _AxisGroup)):
+        raise TypeError(f"mesh must be device_mesh, axis_group, or None, got {type(mesh).__name__}")
+    axis_group = mesh if isinstance(mesh, _AxisGroup) else None
+    base_mesh = axis_group.mesh if axis_group is not None else mesh
     subgroup = None
-    use_grid = mesh is not None and _mesh_uses_grid_barrier(mesh)
+    use_grid = base_mesh is not None and _mesh_uses_grid_barrier(base_mesh)
 
     if use_grid:
-        if mesh is not None:
-            _apply_mesh_grid_launch(mesh, _semantic)
+        _apply_mesh_grid_launch(base_mesh, _semantic)
         builder = _semantic.builder
         if not hasattr(builder, "create_distributed_barrier"):
             raise NotImplementedError("grid distributed_barrier requires TLE builder support")
+        if axis_group is not None:
+            subgroup = _infer_grid_axis_group_barrier_group(axis_group)
+        elif base_mesh.size != _prod(base_mesh.launch_shape):
+            raise ValueError(
+                "grid distributed_barrier does not accept a sliced device_mesh; "
+                "use launch_mesh.axis_group(...) so the group contains the current CTA"
+            )
         try:
-            builder.create_distributed_barrier("grid", [], [], [])
+            if subgroup is None:
+                builder.create_distributed_barrier("grid", [], [], [], [])
+            else:
+                builder.create_distributed_barrier(
+                    subgroup.kind,
+                    list(subgroup.shape),
+                    list(subgroup.axes),
+                    list(subgroup.mask),
+                    list(subgroup.domain_shape),
+                )
             return None
         except TypeError as exc:
             raise NotImplementedError(
                 "grid distributed_barrier requires rebuilt TLE extension with "
-                "group-aware create_distributed_barrier(group_kind, group_shape, group_axes, group_mask)") from exc
+                "group-aware create_distributed_barrier(group_kind, group_shape, group_axes, "
+                "group_mask, group_domain_shape)") from exc
 
-    if mesh is not None:
-        cluster_dims = _apply_mesh_cluster_launch(mesh, _semantic)
-        subgroup = _infer_submesh_barrier_group(mesh, cluster_dims)
+    if axis_group is not None:
+        raise NotImplementedError("cluster axis_group distributed_barrier is not implemented")
+    if base_mesh is not None:
+        cluster_dims = _apply_mesh_cluster_launch(base_mesh, _semantic)
+        subgroup = _infer_submesh_barrier_group(base_mesh, cluster_dims)
     builder = _semantic.builder
     if subgroup is not None:
         if not hasattr(builder, "create_distributed_barrier"):
@@ -640,12 +726,14 @@ def distributed_barrier(mesh: device_mesh | None = None, _semantic=None):
                 list(subgroup.shape),
                 list(subgroup.axes),
                 list(subgroup.mask),
+                [],
             )
             return None
         except TypeError as exc:
             raise NotImplementedError(
                 "sub-mesh distributed_barrier requires rebuilt TLE extension with "
-                "group-aware create_distributed_barrier(group_kind, group_shape, group_axes, group_mask); "
+                "group-aware create_distributed_barrier(group_kind, group_shape, group_axes, "
+                "group_mask, group_domain_shape); "
                 f"inferred subgroup descriptor: rank={subgroup.rank}, "
                 f"shape={subgroup.shape}, axes={subgroup.axes}, size={len(subgroup.mask)}") from exc
     if hasattr(builder, "create_distributed_barrier"):

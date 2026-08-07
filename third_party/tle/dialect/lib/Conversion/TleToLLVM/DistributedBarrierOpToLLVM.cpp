@@ -20,7 +20,9 @@ namespace tle = mlir::triton::tle;
 
 constexpr llvm::StringLiteral kGroupKindAttr = "group_kind";
 constexpr llvm::StringLiteral kGroupShapeAttr = "group_shape";
+constexpr llvm::StringLiteral kGroupAxesAttr = "group_axes";
 constexpr llvm::StringLiteral kGroupMaskAttr = "group_mask";
+constexpr llvm::StringLiteral kGroupDomainShapeAttr = "group_domain_shape";
 constexpr llvm::StringLiteral kTTGSharedAttr = "ttg.shared";
 constexpr llvm::StringLiteral kTTGGlobalScratchSizeAttr =
     "ttg.global_scratch_memory_size";
@@ -108,6 +110,25 @@ struct DistributedBarrierOpConversion
     }
     int32_t scratchOffset = static_cast<int32_t>(scratchOffsetValue);
 
+    auto kindAttr = op->getAttrOfType<StringAttr>(kGroupKindAttr);
+    const bool isAxisGroup =
+        kindAttr && kindAttr.getValue() == "grid_axis_group";
+    SmallVector<int32_t> axisGroupDomainShape;
+    SmallVector<int32_t> axisGroupAxes;
+    if (isAxisGroup) {
+      auto domainShapeAttr =
+          op->getAttrOfType<DenseI32ArrayAttr>(kGroupDomainShapeAttr);
+      auto axesAttr = op->getAttrOfType<DenseI32ArrayAttr>(kGroupAxesAttr);
+      if (!domainShapeAttr || !axesAttr || axesAttr.asArrayRef().empty()) {
+        return op.emitOpError(
+            "grid_axis_group lowering requires domain shape and group axes");
+      }
+      axisGroupDomainShape.assign(domainShapeAttr.asArrayRef().begin(),
+                                  domainShapeAttr.asArrayRef().end());
+      axisGroupAxes.assign(axesAttr.asArrayRef().begin(),
+                           axesAttr.asArrayRef().end());
+    }
+
     auto func = op->getParentOfType<LLVM::LLVMFuncOp>();
     if (!func) {
       return op.emitOpError("grid lowering requires LLVM function context");
@@ -125,29 +146,67 @@ struct DistributedBarrierOpConversion
       return op.emitOpError("global scratch argument must be an LLVM pointer");
     }
 
-    auto globalI32PtrTy =
-        LLVM::LLVMPointerType::get(ctx, globalPtrTy.getAddressSpace());
-    Value arrivedBytePtr =
-        b.gep(globalPtrTy, i8Ty, globalScratchBase,
-              b.i32_val(scratchOffset + kGridArrivedOffsetBytes));
-    Value arrivedPtr = b.bitcast(arrivedBytePtr, globalI32PtrTy);
-
     Value threadId = getThreadId(rewriter, loc);
     Value isThread0 = b.icmp_eq(threadId, b.i32_val(0));
     Value blockIdX = rewriter.create<NVVM::BlockIdXOp>(loc, i32Ty);
     Value blockIdY = rewriter.create<NVVM::BlockIdYOp>(loc, i32Ty);
     Value blockIdZ = rewriter.create<NVVM::BlockIdZOp>(loc, i32Ty);
-    Value isBlock0X = b.icmp_eq(blockIdX, b.i32_val(0));
-    Value isBlock0Y = b.icmp_eq(blockIdY, b.i32_val(0));
-    Value isBlock0Z = b.icmp_eq(blockIdZ, b.i32_val(0));
-    Value isBlock0 = b.and_(b.and_(isBlock0X, isBlock0Y), isBlock0Z);
-    Value workerPred = isThread0;
-
     Value gridDimX = rewriter.create<NVVM::GridDimXOp>(loc, i32Ty);
     Value gridDimY = rewriter.create<NVVM::GridDimYOp>(loc, i32Ty);
     Value gridDimZ = rewriter.create<NVVM::GridDimZOp>(loc, i32Ty);
+    Value linearBlockId = b.add(blockIdY, b.mul(gridDimY, blockIdZ));
+    linearBlockId = b.add(blockIdX, b.mul(gridDimX, linearBlockId));
     Value totalCTAs = b.mul(gridDimX, gridDimY);
     totalCTAs = b.mul(totalCTAs, gridDimZ);
+
+    Value isLeader = b.icmp_eq(linearBlockId, b.i32_val(0));
+    Value participantCount = totalCTAs;
+    Value counterIndex = b.i32_val(0);
+    if (isAxisGroup) {
+      int32_t domainSize = 1;
+      SmallVector<uint8_t> isGroupAxis(axisGroupDomainShape.size(), 0);
+      for (int32_t axis : axisGroupAxes)
+        isGroupAxis[static_cast<size_t>(axis)] = 1;
+      for (int32_t dim : axisGroupDomainShape)
+        domainSize *= dim;
+
+      Value remaining = b.urem(linearBlockId, b.i32_val(domainSize));
+      SmallVector<Value> coordinates(axisGroupDomainShape.size());
+      for (int32_t axis =
+               static_cast<int32_t>(axisGroupDomainShape.size()) - 1;
+           axis >= 0; --axis) {
+        Value dim =
+            b.i32_val(axisGroupDomainShape[static_cast<size_t>(axis)]);
+        coordinates[static_cast<size_t>(axis)] = b.urem(remaining, dim);
+        remaining = b.udiv(remaining, dim);
+      }
+
+      Value rankInGroup = b.i32_val(0);
+      int32_t axisGroupSize = 1;
+      for (size_t axis = 0; axis < axisGroupDomainShape.size(); ++axis) {
+        int32_t dim = axisGroupDomainShape[axis];
+        if (isGroupAxis[axis]) {
+          rankInGroup =
+              b.add(b.mul(rankInGroup, b.i32_val(dim)), coordinates[axis]);
+          axisGroupSize *= dim;
+        } else {
+          counterIndex =
+              b.add(b.mul(counterIndex, b.i32_val(dim)), coordinates[axis]);
+        }
+      }
+      isLeader = b.icmp_eq(rankInGroup, b.i32_val(0));
+      participantCount = b.i32_val(axisGroupSize);
+    }
+    Value workerPred = isThread0;
+
+    auto globalI32PtrTy =
+        LLVM::LLVMPointerType::get(ctx, globalPtrTy.getAddressSpace());
+    Value counterByteOffset =
+        b.add(b.i32_val(scratchOffset + kGridArrivedOffsetBytes),
+              b.mul(counterIndex, b.i32_val(4)));
+    Value arrivedBytePtr =
+        b.gep(globalPtrTy, i8Ty, globalScratchBase, counterByteOffset);
+    Value arrivedPtr = b.bitcast(arrivedBytePtr, globalI32PtrTy);
 
     Block *curBlock = rewriter.getInsertionBlock();
     Block *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
@@ -163,9 +222,9 @@ struct DistributedBarrierOpConversion
                                     doneBlock, ValueRange{});
 
     rewriter.setInsertionPointToEnd(workBlock);
-    Value expectedMinusOne = b.sub(totalCTAs, b.i32_val(1));
+    Value expectedMinusOne = b.sub(participantCount, b.i32_val(1));
     Value gpuMasterAdd = b.sub(b.i32_val(0x80000000u), expectedMinusOne);
-    Value nb = b.select(isBlock0, gpuMasterAdd, b.i32_val(1));
+    Value nb = b.select(isLeader, gpuMasterAdd, b.i32_val(1));
 
     auto emitAtomAddReleaseGpu = [&](Value ptr, Value addVal) -> Value {
       ::mlir::triton::PTXBuilder ptxBuilder;
@@ -385,7 +444,8 @@ struct DistributedBarrierOpConversion
   matchAndRewrite(tle::DistributedBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     if (auto kindAttr = op->getAttrOfType<StringAttr>(kGroupKindAttr)) {
-      if (kindAttr.getValue() == "grid")
+      if (kindAttr.getValue() == "grid" ||
+          kindAttr.getValue() == "grid_axis_group")
         return lowerGridBarrier(op, rewriter);
       if (kindAttr.getValue() == "submesh")
         return lowerSubmeshBarrier(op, rewriter);

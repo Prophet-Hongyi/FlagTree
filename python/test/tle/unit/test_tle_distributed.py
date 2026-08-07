@@ -10,6 +10,7 @@ from triton.experimental.tle.language import (
     _normalize_remote_shard_id,
     _resolve_launch_axis,
 )
+from triton.experimental.tle.language.distributed import _infer_grid_axis_group_barrier_group
 import triton.language.core as tlcore
 
 
@@ -39,6 +40,22 @@ class TestDeviceMesh:
         assert sub.shape == (2, )
         assert sub.dim_names == ("node_y", )
         assert sub.size == 2
+
+    def test_device_mesh_axis_group(self):
+        mesh = tle.device_mesh({"block": [("block_y", 4), ("block_x", 8)]})
+        axis_group = mesh.axis_group("block_x")
+
+        assert axis_group.axes == (1, )
+        assert axis_group.axis_names == ("block_x", )
+        descriptor = _infer_grid_axis_group_barrier_group(axis_group)
+        assert descriptor.kind == "grid_axis_group"
+        assert descriptor.shape == (8, )
+        assert descriptor.axes == (1, )
+        assert descriptor.mask == tuple()
+        assert descriptor.domain_shape == (4, 8)
+
+        with pytest.raises(ValueError, match="complete launch device_mesh"):
+            mesh[0, :].axis_group("block_x")
 
     def test_device_mesh_invalid_topology(self):
         with pytest.raises(TypeError):
@@ -229,6 +246,12 @@ class _FakeSemantic:
     def __init__(self, builder=None):
         self.builder = _FakeBuilder() if builder is None else builder
 
+    def mod(self, lhs, rhs):
+        return ("mod", lhs, rhs)
+
+    def floordiv(self, lhs, rhs):
+        return ("floordiv", lhs, rhs)
+
 
 class _LegacyBarrierSemantic:
 
@@ -272,7 +295,22 @@ class TestDistributedBarrierScope:
         assert semantic.builder.options.launch_cooperative_grid is True
         assert semantic.builder.options.cluster_dims == (1, 1, 1)
         assert semantic.builder.distributed_barrier_calls == 1
-        assert semantic.builder.distributed_barrier_group_args == [("grid", [], [], [])]
+        assert semantic.builder.distributed_barrier_group_args == [("grid", [], [], [], [])]
+
+    def test_distributed_barrier_grid_axis_group_preserves_2d_topology(self):
+        mesh = tle.device_mesh({"block": [("block_y", 2), ("block_x", 2)]})
+
+        semantic = _FakeSemantic()
+        tle.distributed_barrier(mesh=mesh.axis_group("block_x"), _semantic=semantic)
+        assert semantic.builder.options.launch_cooperative_grid is True
+        assert semantic.builder.distributed_barrier_group_args == [
+            ("grid_axis_group", [2], [1], [], [2, 2])
+        ]
+
+    def test_distributed_barrier_grid_rejects_static_submesh(self):
+        mesh = tle.device_mesh({"block": [("block_y", 2), ("block_x", 2)]})
+        with pytest.raises(ValueError, match="axis_group"):
+            tle.distributed_barrier(mesh=mesh[0, :], _semantic=_FakeSemantic())
 
     def test_distributed_barrier_grid_mesh_rejects_cluster_launch(self):
         mesh = tle.device_mesh({"block": [("block_x", 4)]})
@@ -291,9 +329,12 @@ class TestDistributedBarrierScope:
         tle.distributed_barrier(mesh=mesh[:, 0], _semantic=semantic_cluster)
         assert semantic_cluster.builder.distributed_barrier_group_args == [tuple()]
 
+        grid_mesh = tle.device_mesh({"block": [("block_y", 2), ("block_x", 4)]})
         semantic_grid = _FakeSemantic()
-        tle.distributed_barrier(mesh=mesh[0, :], _semantic=semantic_grid)
-        assert semantic_grid.builder.distributed_barrier_group_args == [("grid", [], [], [])]
+        tle.distributed_barrier(mesh=grid_mesh.axis_group("block_x"), _semantic=semantic_grid)
+        assert semantic_grid.builder.distributed_barrier_group_args == [
+            ("grid_axis_group", [4], [1], [], [2, 4])
+        ]
 
     def test_infer_submesh_barrier_group(self):
         mesh = tle.device_mesh({"block_cluster": [("cluster_x", 2), ("cluster_y", 2)]})

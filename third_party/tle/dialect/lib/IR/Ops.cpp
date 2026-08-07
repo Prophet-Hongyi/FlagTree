@@ -977,9 +977,12 @@ LogicalResult DistributedBarrierOp::verify() {
   auto shapeAttr = op->getAttrOfType<DenseI32ArrayAttr>("group_shape");
   auto axesAttr = op->getAttrOfType<DenseI32ArrayAttr>("group_axes");
   auto maskAttr = op->getAttrOfType<DenseI32ArrayAttr>("group_mask");
+  auto domainShapeAttr =
+      op->getAttrOfType<DenseI32ArrayAttr>("group_domain_shape");
 
   const bool hasAnyGroupMeta =
-      rankAttr || shapeAttr || axesAttr || maskAttr || kindAttr;
+      rankAttr || shapeAttr || axesAttr || maskAttr || domainShapeAttr ||
+      kindAttr;
   if (!hasAnyGroupMeta)
     return success();
 
@@ -990,25 +993,42 @@ LogicalResult DistributedBarrierOp::verify() {
   }
 
   StringRef kind = kindAttr.getValue();
-  if (kind != "cluster" && kind != "submesh" && kind != "grid") {
+  if (kind != "cluster" && kind != "submesh" && kind != "grid" &&
+      kind != "grid_axis_group") {
     return emitOpError()
-           << "group_kind must be 'cluster', 'submesh', or 'grid', got '"
+           << "group_kind must be 'cluster', 'submesh', 'grid', or "
+              "'grid_axis_group', got '"
            << kind << "'";
   }
 
   if (kind == "cluster" || kind == "grid") {
-    if (rankAttr || shapeAttr || axesAttr || maskAttr) {
+    if (rankAttr || shapeAttr || axesAttr || maskAttr || domainShapeAttr) {
       return emitOpError()
              << kind
              << " group_kind does not accept "
-                "group_rank/group_shape/group_axes/group_mask attrs";
+                "group_rank/group_shape/group_axes/group_mask/"
+                "group_domain_shape attrs";
     }
     return success();
   }
 
   if (!rankAttr || !shapeAttr || !axesAttr) {
     return emitOpError()
-           << "submesh group_kind requires group_rank/group_shape/group_axes";
+           << kind
+           << " group_kind requires "
+              "group_rank/group_shape/group_axes";
+  }
+  const bool isGridAxisGroup = kind == "grid_axis_group";
+  if (isGridAxisGroup) {
+    if (maskAttr || !domainShapeAttr) {
+      return emitOpError()
+             << "grid_axis_group requires group_domain_shape and does not accept "
+                "group_mask";
+    }
+  } else if (!maskAttr || domainShapeAttr) {
+    return emitOpError()
+           << kind
+           << " requires group_mask and does not accept group_domain_shape";
   }
   if (!rankAttr.getType().isInteger(32)) {
     return emitOpError() << "group_rank must be i32";
@@ -1039,7 +1059,60 @@ LogicalResult DistributedBarrierOp::verify() {
       return emitOpError() << "group_axes entries must be unique";
     }
   }
-  if (maskAttr) {
+
+  if (isGridAxisGroup) {
+    ArrayRef<int32_t> domainShape = domainShapeAttr.asArrayRef();
+    if (domainShape.size() < static_cast<size_t>(rank)) {
+      return emitOpError()
+             << "grid_axis_group rank cannot exceed its launch domain rank";
+    }
+    for (int32_t dim : domainShape) {
+      if (dim <= 0)
+        return emitOpError() << "group_domain_shape entries must be > 0";
+    }
+
+    int64_t domainSize = 1;
+    int64_t groupCount = 1;
+    int64_t axisGroupSize = 1;
+    for (int32_t dim : domainShape) {
+      if (domainSize > std::numeric_limits<int32_t>::max() / dim) {
+        return emitOpError()
+               << "grid_axis_group domain size exceeds i32 range";
+      }
+      domainSize *= dim;
+    }
+    for (auto [index, axis] : llvm::enumerate(axesAttr.asArrayRef())) {
+      if (axis >= static_cast<int32_t>(domainShape.size())) {
+        return emitOpError()
+               << "group_axes entry " << axis
+               << " exceeds group_domain_shape rank " << domainShape.size();
+      }
+      if (shapeAttr.asArrayRef()[index] != domainShape[axis]) {
+        return emitOpError()
+               << "group_shape entry " << shapeAttr.asArrayRef()[index]
+               << " must equal group_domain_shape[" << axis
+               << "] (" << domainShape[axis] << ")";
+      }
+      int32_t dim = domainShape[axis];
+      if (axisGroupSize > std::numeric_limits<int32_t>::max() / dim) {
+        return emitOpError()
+               << "grid_axis_group size exceeds i32 range";
+      }
+      axisGroupSize *= dim;
+    }
+    for (auto [axis, dim] : llvm::enumerate(domainShape)) {
+      if (seenAxes.contains(static_cast<int32_t>(axis)))
+        continue;
+      if (groupCount > std::numeric_limits<int32_t>::max() / dim) {
+        return emitOpError() << "grid_axis_group count exceeds i32 range";
+      }
+      groupCount *= dim;
+    }
+    if (groupCount > std::numeric_limits<int32_t>::max() / 4) {
+      return emitOpError()
+             << "grid_axis_group scratch allocation exceeds i32 byte range";
+    }
+  } else {
     if (maskAttr.asArrayRef().empty())
       return emitOpError() << "group_mask cannot be empty";
     for (int32_t id : maskAttr.asArrayRef()) {

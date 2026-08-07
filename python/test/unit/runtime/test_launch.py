@@ -1,13 +1,126 @@
 import gc
-import tracemalloc
-import pytest
-import pathlib
 import os
+import pathlib
+import tracemalloc
+import weakref
 
+import pytest
 import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_cuda, is_hip
+
+
+def test_prepared_kernel_launch(device) -> None:
+
+    @triton.jit(do_not_specialize=("n", ))
+    def kernel(x, bias, output, n, input_offset, block_size: tl.constexpr):
+        offsets = tl.arange(0, block_size)
+        mask = offsets < n
+        value = tl.load(x + input_offset + offsets, mask=mask)
+        tl.store(output + offsets, value + tl.load(bias), mask=mask)
+
+    x = torch.arange(22, dtype=torch.float32, device=device)
+    bias = torch.tensor(2.0, dtype=torch.float32, device=device)
+    output = torch.empty(19, dtype=torch.float32, device=device)
+    prepared = kernel.prepare(
+        x,
+        bias,
+        output,
+        19,
+        3,
+        32,
+        grid=(1, ),
+        dynamic_arg_indices=(0, 2, 3),
+        trusted_pointer_arguments=True,
+    )
+
+    prepared.launch(x, output, 19)
+    torch.testing.assert_close(output, x[3:] + bias)
+
+    x2 = torch.arange(10, dtype=torch.float32, device=device)
+    output2 = torch.empty(7, dtype=torch.float32, device=device)
+    prepared.launch(x2, output2, 7)
+    torch.testing.assert_close(output2, x2[3:] + bias)
+
+    with pytest.raises(TypeError, match="dynamic arguments"):
+        prepared.launch(x2, output2)
+
+    x_ref = weakref.ref(x)
+    output_ref = weakref.ref(output)
+    del x
+    del output
+    gc.collect()
+    assert x_ref() is None
+    assert output_ref() is None
+
+    safe_prepared = kernel.prepare(
+        x2,
+        bias,
+        output2,
+        7,
+        3,
+        32,
+        grid=(1, ),
+        dynamic_arg_indices=(0, 2, 3),
+    )
+    with pytest.raises(ValueError, match="cannot be accessed from Triton"):
+        safe_prepared.launch(x2.cpu(), output2, 7)
+
+    @triton.jit
+    def specialized_scalar_kernel(output, value):
+        tl.store(output, value)
+
+    with pytest.raises(IndexError, match="invalid or constexpr"):
+        specialized_scalar_kernel.prepare(
+            output2,
+            1,
+            grid=(1, ),
+            dynamic_arg_indices=(1, ),
+        )
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+def test_prepared_kernel_cuda_graph_replay(device) -> None:
+
+    @triton.jit(do_not_specialize=("n", ))
+    def kernel(x, bias, output, n, input_offset, block_size: tl.constexpr):
+        offsets = tl.arange(0, block_size)
+        mask = offsets < n
+        value = tl.load(x + input_offset + offsets, mask=mask)
+        tl.store(output + offsets, value + tl.load(bias), mask=mask)
+
+    x = torch.arange(22, dtype=torch.float32, device=device)
+    bias = torch.tensor(2.0, dtype=torch.float32, device=device)
+    output = torch.empty(19, dtype=torch.float32, device=device)
+    prepared = kernel.prepare(
+        x,
+        bias,
+        output,
+        19,
+        3,
+        32,
+        grid=(1, ),
+        dynamic_arg_indices=(0, 2, 3),
+        trusted_pointer_arguments=True,
+    )
+
+    capture_stream = torch.cuda.Stream(device=device)
+    current_stream = torch.cuda.current_stream(device)
+    capture_stream.wait_stream(current_stream)
+    with torch.cuda.stream(capture_stream):
+        prepared.launch(x, output, 19)
+    current_stream.wait_stream(capture_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        prepared.launch(x, output, 19)
+    current_stream.wait_stream(capture_stream)
+    torch.testing.assert_close(output, x[3:] + bias)
+
+    x.add_(5)
+    graph.replay()
+    torch.testing.assert_close(output, x[3:] + bias)
 
 
 def test_metadata() -> None:

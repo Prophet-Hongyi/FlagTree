@@ -1,6 +1,8 @@
 #include "mlir/Analysis/Liveness.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/STLExtras.h"
+#include <limits>
 
 using namespace mlir;
 using namespace triton;
@@ -16,13 +18,33 @@ static int32_t roundUp(int32_t val, int32_t step) {
   return t - (t % step);
 }
 
-static bool isGridDistributedBarrier(Operation *op) {
+static uint32_t getGridBarrierScratchBytes(Operation *op) {
   if (op->getName().getStringRef() != "tle.distributed_barrier") {
-    return false;
+    return 0;
   }
 
   auto kind = op->getAttrOfType<StringAttr>("group_kind");
-  return kind && kind.getValue() == "grid";
+  if (!kind)
+    return 0;
+  if (kind.getValue() == "grid")
+    return 4;
+  if (kind.getValue() != "grid_axis_group")
+    return 0;
+
+  auto domainShape =
+      op->getAttrOfType<DenseI32ArrayAttr>("group_domain_shape");
+  auto axes = op->getAttrOfType<DenseI32ArrayAttr>("group_axes");
+  assert(domainShape && axes &&
+         "verified grid_axis_group metadata is required");
+  uint64_t groupCount = 1;
+  for (auto [axis, dim] : llvm::enumerate(domainShape.asArrayRef())) {
+    if (llvm::is_contained(axes.asArrayRef(), static_cast<int32_t>(axis)))
+      continue;
+    groupCount *= static_cast<uint32_t>(dim);
+  }
+  assert(groupCount <= std::numeric_limits<uint32_t>::max() / 4 &&
+         "grid_axis_group scratch size must be verified");
+  return static_cast<uint32_t>(groupCount * 4);
 }
 
 static void allocateGMem(Operation *parentOp,
@@ -52,8 +74,7 @@ static void allocateGMem(Operation *parentOp,
     if (auto alloc = dyn_cast<triton::gpu::GlobalScratchAllocOp>(op)) {
       nbytes = alloc.getNbytes();
       align = alloc.getAlignment();
-    } else if (isGridDistributedBarrier(op)) {
-      nbytes = 4;
+    } else if ((nbytes = getGridBarrierScratchBytes(op)) != 0) {
       align = 4;
     } else if (auto callOp = dyn_cast<triton::CallOp>(op)) {
       auto callable = callOp.resolveCallable();

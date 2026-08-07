@@ -22,10 +22,13 @@ BLOCK_CLUSTER_MESH = tle.device_mesh({"block_cluster": [("cluster_x", 2)]})
 BLOCK_CLUSTER_MESH_8 = tle.device_mesh({"block_cluster": [("cluster_x", 8)]})
 BLOCK_CLUSTER_MESH_2X2 = tle.device_mesh({"block_cluster": [("cluster_x", 2), ("cluster_y", 2)]})
 BLOCK_GRID_MESH_8 = tle.device_mesh({"block": [("block_x", 8)]})
+BLOCK_GRID_MESH_2X2 = tle.device_mesh({"block": [("block_y", 2), ("block_x", 2)]})
 BLOCK_CLUSTER_SUBMESH_ROW0 = BLOCK_CLUSTER_MESH_2X2[0, :]
 BLOCK_CLUSTER_SUBMESH_ROW1 = BLOCK_CLUSTER_MESH_2X2[1, :]
 BLOCK_CLUSTER_SUBMESH_COL0 = BLOCK_CLUSTER_MESH_2X2[:, 0]
 BLOCK_CLUSTER_SUBMESH_COL1 = BLOCK_CLUSTER_MESH_2X2[:, 1]
+BLOCK_GRID_AXIS_GROUP_X = BLOCK_GRID_MESH_2X2.axis_group("block_x")
+BLOCK_GRID_AXIS_GROUP_Y = BLOCK_GRID_MESH_2X2.axis_group("block_y")
 
 
 def _has_cluster_cuda() -> bool:
@@ -386,6 +389,24 @@ def _distributed_barrier_grid_counter_kernel(counter_ptr, out_ptr, mesh: tl.cons
     tl.atomic_add(counter_ptr, 1)
     tle.distributed_barrier(mesh)
     seen = tl.load(counter_ptr)
+    tl.store(out_ptr + pid, seen)
+
+
+@triton.jit
+def _distributed_barrier_grid_axis_group_kernel(
+    counter_ptr,
+    out_ptr,
+    mesh: tl.constexpr,
+    axis_group: tl.constexpr,
+    group_axis: tl.constexpr,
+    fixed_axis: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    group_rank = tle.shard_id(mesh, group_axis)
+    group_index = tle.shard_id(mesh, fixed_axis)
+    tl.atomic_add(counter_ptr + group_index, group_rank + 1)
+    tle.distributed_barrier(axis_group)
+    seen = tl.load(counter_ptr + group_index)
     tl.store(out_ptr + pid, seen)
 
 
@@ -1470,6 +1491,56 @@ class TestTLEDistributed:
             assert bool(torch.all(out == grid))
         finally:
             triton.set_allocator(default_alloc_fn)
+
+    @pytest.mark.parametrize(
+        "axis_group,group_axis,fixed_axis",
+        [
+            (BLOCK_GRID_AXIS_GROUP_X, "block_x", "block_y"),
+            (BLOCK_GRID_AXIS_GROUP_Y, "block_y", "block_x"),
+        ],
+    )
+    def test_distributed_barrier_grid_axis_group(
+        self,
+        with_allocator,
+        axis_group,
+        group_axis,
+        fixed_axis,
+    ):
+        grid = 4
+        counter = torch.zeros((2, ), device="cuda", dtype=torch.int32)
+        out = torch.empty((grid, ), device="cuda", dtype=torch.int32)
+
+        compiled = _distributed_barrier_grid_axis_group_kernel.warmup(
+            counter,
+            out,
+            mesh=BLOCK_GRID_MESH_2X2,
+            axis_group=axis_group,
+            group_axis=group_axis,
+            fixed_axis=fixed_axis,
+            grid=(grid, ),
+            num_ctas=1,
+            num_warps=4,
+        )
+        assert compiled.metadata.cluster_dims == (1, 1, 1)
+        assert compiled.metadata.launch_cooperative_grid is True
+        assert compiled.metadata.global_scratch_size >= 8
+        assert compiled.asm["ttgir"].count('group_kind = "grid_axis_group"') == 1
+        assert 'group_domain_shape = array<i32: 2, 2>' in compiled.asm["ttgir"]
+
+        _distributed_barrier_grid_axis_group_kernel[(grid, )](
+            counter,
+            out,
+            mesh=BLOCK_GRID_MESH_2X2,
+            axis_group=axis_group,
+            group_axis=group_axis,
+            fixed_axis=fixed_axis,
+            num_ctas=1,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(counter, torch.tensor([3, 3], device="cuda", dtype=torch.int32))
+        torch.testing.assert_close(out, torch.full_like(out, 3))
 
     def test_distributed_barrier_row_group_independence(self):
         grid = 2
