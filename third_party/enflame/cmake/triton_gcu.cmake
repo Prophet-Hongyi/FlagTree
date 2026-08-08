@@ -52,18 +52,9 @@ macro(triton_gcu_stage_nested_upstream_triton_build)
     file(MAKE_DIRECTORY ${third_party_triton_${arch}_fetch_bin})
 
     triton_gcu_append_nested_triton_cmake_args(triton_cmake_args "${MLIR_DIR}" "${LLVM_LIBRARY_DIR}")
-    triton_gcu_apply_common_triton_upstream_patches("${third_party_triton_${arch}_fetch_src}")
-
-    execute_process(
-      COMMAND sed -i "/auto dTy = cast<ShapedType>(\\$_op.getD().getType());/d"
-                ${third_party_triton_${arch}_fetch_src}/include/triton/Dialect/Triton/IR/TritonOpInterfaces.td
-      ERROR_QUIET
-    )
 
     add_custom_command(
       OUTPUT ${triton_${arch}_objs}
-      COMMAND sed -i "s/-Wno-covered-switch-default//g" ${third_party_triton_${arch}_fetch_src}/CMakeLists.txt
-      COMMAND find ${third_party_triton_${arch}_fetch_src} -name "CMakeLists.txt" -exec sed -i "s/-Wno-covered-switch-default//g" {} +
       COMMAND cmake -S ${third_party_triton_${arch}_fetch_src} -B ${third_party_triton_${arch}_fetch_bin} ${triton_cmake_args} -DTRITON_CODEGEN_BACKENDS='nvidia\;amd' -DCMAKE_CXX_FLAGS='-Wno-reorder -Wno-error=comment -Wno-unknown-warning-option' -G Ninja
       COMMAND cmake --build ${third_party_triton_${arch}_fetch_bin} --target all ${JOB_SETTING}
       DEPENDS ${third_party_triton_${arch}_src}

@@ -54,58 +54,6 @@ macro(triton_gcu_append_nested_triton_cmake_args _out_var _mlir_dir _llvm_lib_di
   list(APPEND ${_out_var} -DCMAKE_BUILD_TYPE=Release)
 endmacro()
 
-# In-place patches applied to upstream Triton before the nested configure (shared kurama/flagtree).
-# Parameters:
-#   triton_src_root - root of the Triton source tree to patch
-macro(triton_gcu_apply_common_triton_upstream_patches triton_src_root)
-  # Patches common to all Triton versions (3.5+)
-  execute_process(
-    COMMAND sed -i "\\#HasParent<\"ModuleOp\">#d"
-              ${triton_src_root}/include/triton/Dialect/Triton/IR/TritonOps.td
-    ERROR_QUIET
-  )
-  execute_process(
-    COMMAND sed -i "s/\\/\\/ Prevent LLVM's inliner to inline this function/return failure();\\/*/"
-              ${triton_src_root}/lib/Conversion/TritonGPUToLLVM/FuncOpToLLVM.cpp
-    ERROR_QUIET
-  )
-  execute_process(
-    COMMAND sed -i "s/return success();/*\\//"
-              ${triton_src_root}/lib/Conversion/TritonGPUToLLVM/FuncOpToLLVM.cpp
-    ERROR_QUIET
-  )
-
-  # Patches for Triton 3.6+ (NVWS dialect removal)
-  if(TRITON_VERSION VERSION_GREATER_EQUAL "3.6")
-    execute_process(
-      COMMAND sed -i "\\#nvidia/include/Dialect/NVWS/IR/Dialect.h#d"
-                ${triton_src_root}/include/triton/Dialect/TritonGPU/Transforms/Passes.h
-      ERROR_QUIET
-    )
-    execute_process(
-      COMMAND sed -i "/nvws::NVWSDialect/d"
-                ${triton_src_root}/include/triton/Dialect/TritonGPU/Transforms/Passes.td
-      ERROR_QUIET
-    )
-    execute_process(
-        COMMAND sed -i "/maybeLookupNumWarps/,/multiple of 4/ { /multiple of 4/ { N; N; d; }; d; }"
-                ${triton_src_root}/lib/Dialect/TritonGPU/IR/Ops.cpp
-        ERROR_QUIET
-    )
-  endif()
-
-  # Patches for Triton 3.7+ (to be added as compilation reveals needs)
-  if(TRITON_VERSION VERSION_GREATER_EQUAL "3.7")
-    # GCC 7 rejects `getResults() : ValueRange()` in a ternary (ResultRange vs
-    # ValueRange); newer GCC accepts it. Explicitly construct ValueRange.
-    execute_process(
-      COMMAND sed -i "s/return successor.isParent() ? getResults() : ValueRange();/return successor.isParent() ? ValueRange(getResults()) : ValueRange();/"
-                ${triton_src_root}/lib/Dialect/TritonGPU/IR/Ops.cpp
-      ERROR_QUIET
-    )
-  endif()
-endmacro()
-
 # triton-${_arch}-opt, shared link/compile flags, and triton-${_arch}-tools aggregate target.
 # Parameters:
 #   _arch       - architecture tag
@@ -280,7 +228,6 @@ macro(triton_gcu_stage_nested_upstream_triton_build _arch _git_url_dir _mlir_dir
   file(MAKE_DIRECTORY ${_fetch_bin})
   set(_tgnub_cmake_args "")
   triton_gcu_append_nested_triton_cmake_args(_tgnub_cmake_args "${_mlir_dir}" "${_llvm_lib_dir}")
-  triton_gcu_apply_common_triton_upstream_patches("${_fetch_src}")
 
   triton_gcu_nested_upstream_cxx_flags("${_arch}" "-Wno-reorder -Wno-error=comment" _triton_stage_nested_cxx_flags)
 
@@ -288,7 +235,6 @@ macro(triton_gcu_stage_nested_upstream_triton_build _arch _git_url_dir _mlir_dir
     OUTPUT ${_triton_objs}
     COMMAND sed -i "/add_subdirectory\\(test\\)/d" ${_fetch_src}/CMakeLists.txt
     COMMAND sed -i "/add_subdirectory\\(bin\\)/d" ${_fetch_src}/CMakeLists.txt
-    COMMAND sed -i "s/-Wno-covered-switch-default//g" ${_fetch_src}/CMakeLists.txt
     COMMAND cmake -S ${_fetch_src} -B ${_fetch_bin} ${_tgnub_cmake_args} -DTRITON_CODEGEN_BACKENDS='nvidia\;amd' "-DCMAKE_CXX_FLAGS=${_triton_stage_nested_cxx_flags}" -G Ninja
     COMMAND cmake --build ${_fetch_bin} --target all ${_job_setting}
     DEPENDS ${_src_files}
