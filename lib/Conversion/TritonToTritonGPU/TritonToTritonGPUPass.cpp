@@ -2,6 +2,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #ifdef __TLE__
@@ -119,6 +120,42 @@ updateTleEncoding(ArrayRef<Value> values, TleEncodingInfo info, FuncOp func,
   return success();
 }
 
+static bool isTleLayoutPolymorphicRoot(Operation *op) {
+  if (op->getNumRegions() != 0 || op->getNumResults() != 1 ||
+      !isa<RankedTensorType>(op->getResult(0).getType()) ||
+      !isMemoryEffectFree(op))
+    return false;
+
+  return llvm::none_of(op->getOperands(), [](Value operand) {
+    return isa<RankedTensorType>(operand.getType());
+  });
+}
+
+static void isolateSharedTleLayoutRoots(FuncOp func) {
+  llvm::SmallVector<Operation *> sharedRoots;
+  func.walk([&](Operation *op) {
+    if (isTleLayoutPolymorphicRoot(op) &&
+        !op->getResult(0).hasOneUse() && !op->getResult(0).use_empty())
+      sharedRoots.push_back(op);
+  });
+
+  for (Operation *root : sharedRoots) {
+    llvm::SmallVector<OpOperand *> uses;
+    for (OpOperand &use : root->getResult(0).getUses())
+      uses.push_back(&use);
+
+    // Pure tensor roots without tensor inputs are layout-polymorphic. CSE may
+    // share them across independent explicit-encoding domains, so specialize
+    // each use without duplicating tensor computation or weakening conflicts
+    // on state-carrying values.
+    for (size_t index = 1; index < uses.size(); ++index) {
+      OpBuilder builder(uses[index]->getOwner());
+      Operation *clone = builder.clone(*root);
+      uses[index]->set(clone->getResult(0));
+    }
+  }
+}
+
 static LogicalResult propagateTleEncodingHints(FuncOp func) {
   llvm::SmallVector<std::pair<Value, TleEncodingInfo>> seedEncodings;
   func.walk([&](tle::EncodingOp op) {
@@ -127,6 +164,8 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
   });
   if (seedEncodings.empty())
     return success();
+
+  isolateSharedTleLayoutRoots(func);
 
   llvm::MapVector<Value, TleEncodingInfo> valueToEncoding;
   llvm::PriorityWorklist<Value> worklist;

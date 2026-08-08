@@ -7,6 +7,7 @@ from .core import (
     copy,
     memory_space,
     local_ptr,
+    rematerialize_index,
     warp_specialize,
 )
 from .types import (layout, distributed_encoding, BlockEncoding, MmaEncoding, DotOperandEncoding, SlicedEncoding,
@@ -23,6 +24,7 @@ __all__ = [
     "async_wait_group",
     "copy",
     "local_ptr",
+    "rematerialize_index",
     "warp_specialize",
     "storage_kind",
     "layout",
