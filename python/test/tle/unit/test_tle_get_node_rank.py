@@ -48,12 +48,29 @@ def test_tle_get_node_rank():
     )
     torch.cuda.synchronize()
 
-    expected_node_rank = dist.get_rank() // LOCAL_WORLD_SIZE
-    torch.testing.assert_close(
-        node_rank_out,
-        torch.full_like(node_rank_out, expected_node_rank),
-    )
-    tle.cleanup_communicator()
+    rank = dist.get_rank()
+    expected_node_rank = int(os.environ["GROUP_RANK"])
+    actual_node_ranks = node_rank_out.cpu().tolist()
+    try:
+        torch.testing.assert_close(
+            node_rank_out,
+            torch.full_like(node_rank_out, expected_node_rank),
+        )
+    except AssertionError:
+        print(
+            f"[Rank {rank}] FAILED: node ranks={actual_node_ranks}, "
+            f"expected={expected_node_rank}",
+            flush=True,
+        )
+        raise
+    else:
+        print(
+            f"[Rank {rank}] PASSED: node ranks={actual_node_ranks}, "
+            f"expected={expected_node_rank}",
+            flush=True,
+        )
+    finally:
+        tle.cleanup_communicator()
 
 
 test_tle_get_node_rank()

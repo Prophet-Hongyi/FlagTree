@@ -16,10 +16,10 @@ export FLAGCX_P2P_DISABLE=1
 export CUDA_VISIBLE_DEVICES=0,1
 
 nproc_per_node=${NPROC_PER_NODE:-2}
-nnodes=${NNODES:-1}
+nnodes=${NNODES:-2}
 node_rank=${NODE_RANK:-0}
-master_addr=${MASTER_ADDR:-localhost}
-port=${MASTER_PORT:-8333}
+master_addr=${MASTER_ADDR:-10.0.9.3}
+port=${MASTER_PORT:-8335}
 
 if [ "${nnodes}" -eq 1 ]; then
     while ss -ltn | grep -q ":${port} "; do

@@ -226,6 +226,15 @@ class _LegacyBarrierSemantic:
         self.builder = _LegacyDistributedBarrierBuilder()
 
 
+class TestShardId:
+
+    def test_node_axis_requires_device_dptr(self):
+        mesh = tle.device_mesh({"node": 2, "device": 4})
+        semantic = _FakeSemantic()
+        with pytest.raises(ValueError, match="device_dptr is required for axis 'node'"):
+            tle.shard_id(mesh, "node", _semantic=semantic)
+
+
 class TestDistributedBarrierScope:
 
     def test_distributed_barrier_full_cluster_mesh(self):
