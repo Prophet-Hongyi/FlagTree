@@ -6,15 +6,12 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 if WORLD_SIZE % LOCAL_WORLD_SIZE != 0:
     raise ValueError("WORLD_SIZE must be divisible by LOCAL_WORLD_SIZE")
 
-DEVICE_MESH = tle.device_mesh(
-    tle.MeshConfig(node=WORLD_SIZE // LOCAL_WORLD_SIZE, device=LOCAL_WORLD_SIZE)
-)
+DEVICE_MESH = tle.device_mesh(tle.MeshConfig(node=WORLD_SIZE // LOCAL_WORLD_SIZE, device=LOCAL_WORLD_SIZE))
 
 
 @triton.jit
