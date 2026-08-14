@@ -5,8 +5,8 @@ name: Spacemit3.6-Build-And-Test
 # 执行环境: self-hosted runner (label spacemit3.6)。
 # RPC 执行: jdsk-qemu v10.0.2 用户态模拟 (-cpu max,vlen=1024,elen=64,vext_spec=v1.0)
 #           跑 spine-rpc-server, host triton 交叉编译 kernel 后通过 TCP 9999 发给 QEMU 执行。
-# LLVM / spine-mlir / spine-runtime / rpc-runtime / toolchain / jdsk-qemu 从
-# zuoweixia497/spacemit-ci-assets GitHub release (及 archive.spacemit.com) 下载并缓存。
+# LLVM / spine-mlir / spine-runtime / rpc-runtime / toolchain / jdsk-qemu 由
+# python/setup_tools/utils/spacemit.py 下载到 FlagTree 缓存。
 # 更新包: 修改 third_party/spacemit/spacemit-ci.env 里的 URL+MD5 即可。
 
 on:
@@ -43,116 +43,17 @@ jobs:
         with:
           backend: spacemit
 
-      - name: Load CI variables
-        if: steps.check_backend.outputs.should_skip != 'true'
-        run: grep -v '^\s*#' third_party/spacemit/spacemit-ci.env | grep -v '^\s*$' >> $GITHUB_ENV
-
-      - name: Cache RV toolchain
-        if: steps.check_backend.outputs.should_skip != 'true'
-        id: cache-rv-toolchain
-        uses: actions/cache@v4
-        with:
-          path: toolchain
-          key: rv-toolchain-${{ env.RISCV_TOOLCHAIN_MD5 }}
-
-      - name: Download and extract RV toolchain
-        if: steps.check_backend.outputs.should_skip != 'true' && steps.cache-rv-toolchain.outputs.cache-hit != 'true'
-        run: |
-          curl -k -L --retry 5 --retry-delay 5 --retry-all-errors -o spacemit-toolchain.tar.xz "$RISCV_TOOLCHAIN_URL"
-          mkdir -p toolchain
-          tar -xf spacemit-toolchain.tar.xz -C toolchain --strip-components=1
-          rm spacemit-toolchain.tar.xz
-
-      - name: Cache LLVM
-        if: steps.check_backend.outputs.should_skip != 'true'
-        id: cache-llvm
-        uses: actions/cache@v4
-        with:
-          path: llvm_installed
-          key: llvm-${{ env.LLVM_MD5 }}
-
-      - name: Download and extract LLVM
-        if: steps.check_backend.outputs.should_skip != 'true' && steps.cache-llvm.outputs.cache-hit != 'true'
-        run: |
-          curl -k -L --retry 5 --retry-delay 5 --retry-all-errors -o llvm.tar.gz "$LLVM_URL"
-          mkdir -p llvm_installed
-          tar -xf llvm.tar.gz -C llvm_installed --strip-components=1
-          rm llvm.tar.gz
-
-      - name: Cache spine-mlir
-        if: steps.check_backend.outputs.should_skip != 'true'
-        id: cache-spine-mlir
-        uses: actions/cache@v4
-        with:
-          path: spine_mlir_installed
-          key: spine-mlir-${{ env.SPINE_MLIR_MD5 }}
-
-      - name: Download and extract spine-mlir
-        if: steps.check_backend.outputs.should_skip != 'true' && steps.cache-spine-mlir.outputs.cache-hit != 'true'
-        run: |
-          curl -k -L --retry 5 --retry-delay 5 --retry-all-errors -o spine-mlir.tar.gz "$SPINE_MLIR_URL"
-          mkdir -p spine_mlir_installed
-          tar -xf spine-mlir.tar.gz -C spine_mlir_installed --strip-components=1
-          rm spine-mlir.tar.gz
-
-      - name: Cache spine-runtime
-        if: steps.check_backend.outputs.should_skip != 'true'
-        id: cache-spine-runtime
-        uses: actions/cache@v4
-        with:
-          path: spine_runtime_installed
-          key: spine-runtime-${{ env.SPINE_RUNTIME_MD5 }}
-
-      - name: Download and extract spine-runtime
-        if: steps.check_backend.outputs.should_skip != 'true' && steps.cache-spine-runtime.outputs.cache-hit != 'true'
-        run: |
-          curl -k -L --retry 5 --retry-delay 5 --retry-all-errors -o spine-runtime.tar.gz "$SPINE_RUNTIME_URL"
-          mkdir -p spine_runtime_installed
-          tar -xf spine-runtime.tar.gz -C spine_runtime_installed --strip-components=1
-          rm spine-runtime.tar.gz
-
-      - name: Cache RPC runtime
-        if: steps.check_backend.outputs.should_skip != 'true'
-        id: cache-rpc-runtime
-        uses: actions/cache@v4
-        with:
-          path: rpc_runtime_installed
-          key: rpc-runtime-${{ env.RPC_RUNTIME_MD5 }}
-
-      - name: Download and extract RPC runtime
-        if: steps.check_backend.outputs.should_skip != 'true' && steps.cache-rpc-runtime.outputs.cache-hit != 'true'
-        run: |
-          curl -k -L --retry 5 --retry-delay 5 --retry-all-errors -o rpc-runtime.tar.gz "$RPC_RUNTIME_URL"
-          mkdir -p rpc_runtime_installed
-          tar -xf rpc-runtime.tar.gz -C rpc_runtime_installed --strip-components=1
-          rm rpc-runtime.tar.gz
-
-      - name: Cache jdsk-qemu
-        if: steps.check_backend.outputs.should_skip != 'true'
-        id: cache-qemu
-        uses: actions/cache@v4
-        with:
-          path: jdsk-qemu
-          key: jdsk-qemu-${{ env.JDSK_QEMU_MD5 }}
-
-      - name: Download and extract jdsk-qemu
-        if: steps.check_backend.outputs.should_skip != 'true' && steps.cache-qemu.outputs.cache-hit != 'true'
-        run: |
-          curl -k -L --retry 5 --retry-delay 5 --retry-all-errors -o jdsk-qemu.tar.gz "$JDSK_QEMU_URL"
-          tar -xf jdsk-qemu.tar.gz
-          rm jdsk-qemu.tar.gz
-
       - name: Build (apply flagtree.patch + pip install)
         if: steps.check_backend.outputs.should_skip != 'true'
         run: |
           set -euo pipefail
+          set -a
+          source third_party/spacemit/spacemit-ci.env
+          set +a
           NEED=""
           [ -e /usr/lib/x86_64-linux-gnu/libzstd.so ] || NEED="$NEED libzstd-dev"
           if [ -n "$NEED" ]; then apt-get update -qq && apt-get install -y -qq $NEED; fi
           python -m pip install --quiet --upgrade pip cmake ninja pybind11 setuptools wheel
-          LLVM_SYSPATH="$(pwd)/llvm_installed" \
-          SPINE_MLIR_INSTALL_DIR="$(pwd)/spine_mlir_installed" \
-          SPINE_RUNTIME_INSTALL_DIR="$(pwd)/spine_runtime_installed" \
           MAX_JOBS="${MAX_JOBS:-4}" PIP="python -m pip" \
             bash third_party/spacemit/scripts/install_flagtree_plugin.sh
 
@@ -160,9 +61,10 @@ jobs:
         if: steps.check_backend.outputs.should_skip != 'true'
         run: |
           set -euo pipefail
-          QEMU_BIN="$(pwd)/jdsk-qemu/bin/qemu-riscv64"
-          SYSROOT="$(pwd)/toolchain/sysroot"
-          RPC_DIR="$(pwd)/rpc_runtime_installed"
+          SPACEMIT_CACHE="${FLAGTREE_CACHE_DIR:-$HOME/.flagtree}/spacemit"
+          QEMU_BIN="$SPACEMIT_CACHE/jdsk-qemu/bin/qemu-riscv64"
+          SYSROOT="$SPACEMIT_CACHE/toolchain/sysroot"
+          RPC_DIR="$SPACEMIT_CACHE/rpc_runtime_installed"
           chmod +x "$QEMU_BIN" 2>/dev/null || true
           # sanity: confirm the rpc-server binary and qemu exist
           test -f "$QEMU_BIN" || { echo "ERROR: qemu not found at $QEMU_BIN" >&2; exit 1; }
@@ -199,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           export SPINE_TRITON_TARGET_ARCH=riscv64
-          export SPINE_TRITON_CROSS_TOOLCHAIN="$(pwd)/toolchain"
+          export SPINE_TRITON_CROSS_TOOLCHAIN="${FLAGTREE_CACHE_DIR:-$HOME/.flagtree}/spacemit/toolchain"
           export SPACEMIT_EP_QEMU_SET_CORE_ARCH=0xA064
           export GEMS_VENDOR=spacemit
           export SPINE_TRITON_RPC_HOST=127.0.0.1
@@ -241,7 +143,7 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet pytest numpy scipy PyYAML
           export SPINE_TRITON_TARGET_ARCH=riscv64
-          export SPINE_TRITON_CROSS_TOOLCHAIN="$(pwd)/toolchain"
+          export SPINE_TRITON_CROSS_TOOLCHAIN="${FLAGTREE_CACHE_DIR:-$HOME/.flagtree}/spacemit/toolchain"
           export SPACEMIT_EP_QEMU_SET_CORE_ARCH=0xA064
           export GEMS_VENDOR=spacemit
           export SPINE_TRITON_RPC_HOST=127.0.0.1
