@@ -552,3 +552,14 @@ function(flagtree_spec_td_set output_td td_filename)
   endif()
   set(${output_td} ${ret} PARENT_SCOPE)
 endfunction()
+
+
+# FLAGTREE SPEC MLIR DOC FUNC
+function(flagtree_spec_add_mlir_doc
+    doc_filename output_file output_directory command)
+  flagtree_spec_td_set(_flagtree_doc_td "${doc_filename}.td")
+  string(REGEX REPLACE "\\.td$" "" _flagtree_doc_stem "${_flagtree_doc_td}")
+  add_mlir_doc(
+    "${_flagtree_doc_stem}" "${output_file}" "${output_directory}"
+    "${command}" ${ARGN})
+endfunction()
