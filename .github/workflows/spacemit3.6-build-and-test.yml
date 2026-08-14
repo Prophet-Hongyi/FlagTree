@@ -147,11 +147,8 @@ jobs:
         run: |
           set -euo pipefail
           NEED=""
-          python3 -c 'import ensurepip' 2>/dev/null || NEED="$NEED python3.12-venv"
           [ -e /usr/lib/x86_64-linux-gnu/libzstd.so ] || NEED="$NEED libzstd-dev"
           if [ -n "$NEED" ]; then apt-get update -qq && apt-get install -y -qq $NEED; fi
-          python3 -m venv --system-site-packages .venv-ci
-          source .venv-ci/bin/activate
           python -m pip install --quiet --upgrade pip cmake ninja pybind11 setuptools wheel
           LLVM_SYSPATH="$(pwd)/llvm_installed" \
           SPINE_MLIR_INSTALL_DIR="$(pwd)/spine_mlir_installed" \
@@ -201,7 +198,6 @@ jobs:
         if: steps.check_backend.outputs.should_skip != 'true'
         run: |
           set -euo pipefail
-          source .venv-ci/bin/activate
           export SPINE_TRITON_TARGET_ARCH=riscv64
           export SPINE_TRITON_CROSS_TOOLCHAIN="$(pwd)/toolchain"
           export SPACEMIT_EP_QEMU_SET_CORE_ARCH=0xA064
@@ -243,7 +239,6 @@ jobs:
         if: steps.check_backend.outputs.should_skip != 'true'
         run: |
           set -euo pipefail
-          source .venv-ci/bin/activate
           python -m pip install --quiet pytest numpy scipy PyYAML
           export SPINE_TRITON_TARGET_ARCH=riscv64
           export SPINE_TRITON_CROSS_TOOLCHAIN="$(pwd)/toolchain"
