@@ -18,7 +18,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK: gpu.barrier
   // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>}
   // CHECK: ttng.arrive_barrier {{.*}}, 128 {async_task_id = array<i32: 0>, release_fence = true}
-  // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 1>}
+  // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 1>, waitMode = 1 : i32}
   // CHECK: ttg.local_load {{.*}} {async_task_id = array<i32: 1>}
   // CHECK: arith.cmpi ne
   // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}})
@@ -42,7 +42,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK-NOT: nvws.
   // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>}
   // CHECK: ttng.arrive_barrier {{.*}}, 128 {async_task_id = array<i32: 0>, release_fence = true}
-  // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>}
+  // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>, waitMode = 1 : i32}
   // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}})
   // CHECK-SAME: async_task_id = array<i32: 0>
   // CHECK-SAME: participant_arrive = true

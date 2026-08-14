@@ -47,6 +47,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
     // CHECK: nvws.consumer_wait %[[TOKEN]]
     // CHECK-SAME: async_task_id
+    // CHECK-SAME: waitMode = 1 : i32
     // CHECK: %[[TAG:.*]] = ttg.local_load
     // CHECK: %[[TAG_I32:.*]] = tt.unsplat %[[TAG]]
     // CHECK: %[[CLOSED:.*]] = arith.cmpi ne, %[[TAG_I32]]
@@ -88,6 +89,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tle.pipe.writer_commit %a[%c0] {async_task_id = array<i32: 0>, capacity = 1 : i32, pipe_name = "ready", field_names = ["a"], scope = "cta"} : !ttg.memdesc<1x16xf16, #shared, #smem, mutable>
 
     // CHECK: nvws.consumer_wait %[[TOKEN]]
+    // CHECK-NOT: waitMode
     %left_closed = tle.pipe.reader_wait %a[%c0, %false] {async_task_id = array<i32: 1>, capacity = 1 : i32, pipe_name = "ready", field_names = ["a"], reader_name = "left", scope = "cta"} : !ttg.memdesc<1x16xf16, #shared, #smem, mutable>
     // CHECK: arith.constant {{.*}}false
     // CHECK: scf.if
@@ -117,6 +119,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
     // CHECK: nvws.consumer_wait %[[TOKEN]]
     // CHECK-SAME: async_task_id = array<i32: 1>
+    // CHECK-SAME: waitMode = 1 : i32
     %left_closed = tle.pipe.reader_wait %a[%c0, %false] {async_task_id = array<i32: 1>, capacity = 2 : i32, pipe_name = "broadcast", field_names = ["a"], reader_name = "left", scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
     // CHECK: nvws.consumer_release %[[TOKEN]], %{{.*}}, %arg0
     // CHECK-SAME: async_task_id = array<i32: 1>
@@ -126,6 +129,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
     // CHECK: nvws.consumer_wait %[[TOKEN]]
     // CHECK-SAME: async_task_id = array<i32: 2>
+    // CHECK-SAME: waitMode = 1 : i32
     %right_closed = tle.pipe.reader_wait %a[%c0, %false] {async_task_id = array<i32: 2>, capacity = 2 : i32, pipe_name = "broadcast", field_names = ["a"], reader_name = "right", scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
     // CHECK: nvws.consumer_release %[[TOKEN]], %{{.*}}, %arg0
     // CHECK-SAME: async_task_id = array<i32: 2>

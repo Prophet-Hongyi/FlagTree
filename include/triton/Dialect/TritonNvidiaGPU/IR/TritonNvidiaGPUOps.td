@@ -32,6 +32,7 @@ include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUAttrDefs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
@@ -202,6 +203,12 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
     Blocks the program progress until the mbarrier object in `alloc` completes
     its current phase.
 
+    `participant_counted` mode is reserved for a cyclic pipeline whose slot
+    reuse is protected by an empty barrier with one post-read release from
+    every consumer participant. In that mode different consumer warps may
+    wait on successive stages independently; the release barrier, rather than
+    a lockstep CTA barrier, prevents premature slot reuse.
+
     This lowers a waitloop using PTX instruction
     mbarrier.try_wait.parity.shared.b64.
 
@@ -216,21 +223,28 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
     I32:$phase,
     Optional<I1>:$pred,
-    Variadic<TTG_MemDescType>:$deps
+    Variadic<TTG_MemDescType>:$deps,
+    DefaultValuedAttr<TTNG_BarrierWaitModeAttr,
+                      "::mlir::triton::nvidia_gpu::BarrierWaitMode::Lockstep">:$waitMode
   );
 
   let builders = [
     OpBuilder<(ins "Value":$alloc, "Value":$phase),
     [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{});
+    build($_builder, $_state, alloc, phase,
+          /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{},
+          BarrierWaitMode::Lockstep);
     }]>,
     OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred),
     [{
-    build($_builder, $_state, alloc, phase, pred, /*deps=*/{});
+    build($_builder, $_state, alloc, phase, pred, /*deps=*/{},
+          BarrierWaitMode::Lockstep);
     }]>,
     OpBuilder<(ins "Value":$alloc, "Value":$phase, "ValueRange":$deps),
     [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps);
+    build($_builder, $_state, alloc, phase,
+          /*pred=*/static_cast<mlir::Value>(nullptr), deps,
+          BarrierWaitMode::Lockstep);
     }]>,
   ];
 

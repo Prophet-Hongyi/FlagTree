@@ -514,6 +514,80 @@ getPipeReaderNameForDefinition(ArrayRef<std::string> readerNames,
   return readerName;
 }
 
+static FailureOr<bool> hasMatchingParticipantRelease(
+    PipeReaderWaitOp wait, const PipeDefinition &definition) {
+  if (definition.oneShot || wait.getFields().empty())
+    return false;
+
+  FailureOr<std::string> readerName = getPipeReaderNameForDefinition(
+      getDeclaredReaderNames(definition.create), wait.getOperation());
+  if (failed(readerName))
+    return failure();
+  auto waitTaskId = getSingleTaskId(
+      wait.getOperation(),
+      getEnclosingDefaultTaskId(wait.getOperation(), /*reader=*/1));
+  auto waitThreadCount = getTaskThreadCount(wait.getOperation());
+  if (failed(waitTaskId) || failed(waitThreadCount))
+    return failure();
+
+  std::string pipeKey = getPipeKey(wait.getOperation());
+  for (Operation *next = wait->getNextNode(); next;
+       next = next->getNextNode()) {
+    if (!isa<PipeReaderWaitOp, PipeReaderReleaseOp>(next) ||
+        getPipeKey(next) != pipeKey)
+      continue;
+
+    FailureOr<std::string> nextReaderName = getPipeReaderNameForDefinition(
+        getDeclaredReaderNames(definition.create), next);
+    if (failed(nextReaderName))
+      return failure();
+    if (*nextReaderName != *readerName)
+      continue;
+
+    // A second wait before releasing the current stage does not establish a
+    // participant-counted cyclic protocol for either wait.
+    if (isa<PipeReaderWaitOp>(next))
+      return false;
+
+    auto release = cast<PipeReaderReleaseOp>(next);
+    if (release.getFields().empty() ||
+        !sameIndexValue(wait.getStage(), release.getStage()))
+      return false;
+
+    auto releaseTaskId = getSingleTaskId(
+        release.getOperation(),
+        getEnclosingDefaultTaskId(release.getOperation(), /*reader=*/1));
+    auto releaseThreadCount = getTaskThreadCount(release.getOperation());
+    if (failed(releaseTaskId) || failed(releaseThreadCount))
+      return failure();
+    return *releaseTaskId == *waitTaskId &&
+           *releaseThreadCount == *waitThreadCount;
+  }
+
+  return false;
+}
+
+static LogicalResult analyzeParticipantCountedWaits(
+    ArrayRef<Operation *> ops,
+    const std::map<std::string, PipeDefinition> &pipes,
+    DenseSet<Operation *> &participantCountedWaits) {
+  for (Operation *op : ops) {
+    auto wait = dyn_cast<PipeReaderWaitOp>(op);
+    if (!wait)
+      continue;
+    auto definition = pipes.find(getPipeKey(op));
+    if (definition == pipes.end())
+      return wait.emitOpError("requires a preceding matching pipe.create");
+    FailureOr<bool> matched =
+        hasMatchingParticipantRelease(wait, definition->second);
+    if (failed(matched))
+      return failure();
+    if (*matched)
+      participantCountedWaits.insert(op);
+  }
+  return success();
+}
+
 static StringRef getTransportName(PipeCommitTransport transport) {
   switch (transport) {
   case PipeCommitTransport::LocalStore:
@@ -1608,6 +1682,12 @@ public:
       signalPassFailure();
       return;
     }
+    DenseSet<Operation *> participantCountedWaits;
+    if (failed(analyzeParticipantCountedWaits(
+            ops, pipeDefinitions, participantCountedWaits))) {
+      signalPassFailure();
+      return;
+    }
 
     std::map<std::string, PipeState> pipes;
     for (Operation *op : ops) {
@@ -1824,6 +1904,8 @@ public:
         Value token = getWarpSpecializeCaptureForUse(op, state.token);
         auto nvwsOp = ttnvws::ConsumerWaitOp::create(
             builder, loc, token, wait.getStage(), wait.getPhase());
+        if (participantCountedWaits.contains(op))
+          nvwsOp.setWaitMode(ttnvws::ConsumerWaitMode::ParticipantCounted);
         setRoleTaskId(op, nvwsOp.getOperation(), *taskId);
         if (!wait.getIsClosed().use_empty()) {
           Value isClosed;

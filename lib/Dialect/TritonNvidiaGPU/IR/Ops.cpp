@@ -42,6 +42,9 @@
 #endif
 #include "llvm/Support/ErrorHandling.h"
 
+// Enum attribute definitions.
+#include "triton/Dialect/TritonNvidiaGPU/IR/OpsEnums.cpp.inc"
+
 using namespace mlir::triton::gpu;
 
 namespace mlir {
@@ -293,6 +296,10 @@ LogicalResult BarrierExpectOp::verify() {
 LogicalResult WaitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
+  if (getWaitMode() == BarrierWaitMode::ParticipantCounted && getPred())
+    return emitOpError(
+        "participant-counted waits must be executed by every reader "
+        "participant");
   return success();
 }
 
@@ -306,6 +313,10 @@ LogicalResult ArriveBarrierOp::verify() {
   bool isConsumerRelease = !getReleasedFields().empty();
   if (getParticipantArrive() && !isConsumerRelease && !getReleaseFence())
     return emitOpError("participant_arrive requires release_fence");
+  if (getParticipantArrive() && isConsumerRelease && getPred())
+    return emitOpError(
+        "participant consumer release must be executed by every reader "
+        "participant");
 #endif
   return success();
 }

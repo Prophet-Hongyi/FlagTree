@@ -2,8 +2,18 @@
 #define TRITONNVIDIAGPU_ATTRDEFS
 
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/EnumAttr.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
+
+def TTNG_BarrierWaitModeAttr : I32EnumAttr<
+    "BarrierWaitMode", "cross-warp mbarrier wait progress protocol",
+    [
+      I32EnumAttrCase<"Lockstep", 0, "lockstep">,
+      I32EnumAttrCase<"ParticipantCounted", 1, "participant_counted">,
+    ]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
 
 def TTG_TensorMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"> {
   let mnemonic = "tensor_memory";

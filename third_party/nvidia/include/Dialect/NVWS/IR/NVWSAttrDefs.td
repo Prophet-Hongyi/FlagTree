@@ -63,6 +63,15 @@ def NVWS_ProducerCommitKindAttr : I32EnumAttr<
   let cppNamespace = "::mlir::triton::nvws";
 }
 
+def NVWS_ConsumerWaitModeAttr : I32EnumAttr<
+    "ConsumerWaitMode", "consumer wait progress protocol",
+    [
+      I32EnumAttrCase<"Lockstep", 0, "lockstep">,
+      I32EnumAttrCase<"ParticipantCounted", 1, "participant_counted">,
+    ]> {
+  let cppNamespace = "::mlir::triton::nvws";
+}
+
 def NVWS_AsyncOpAttr: I32EnumAttr<
   "AsyncOp", "",
   [

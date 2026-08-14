@@ -221,6 +221,10 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
   auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase);
+#ifdef __TLE__
+  if (op.getWaitMode() == ttnvws::ConsumerWaitMode::ParticipantCounted)
+    waitOp.setWaitMode(ttng::BarrierWaitMode::ParticipantCounted);
+#endif
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
 }

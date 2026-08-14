@@ -143,3 +143,74 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+// CHECK-LABEL: @lockstep_wait_chain
+tt.func @lockstep_wait_chain() {
+  %c0 = arith.constant 0 : i32
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  // CHECK: ttng.wait_barrier
+  // CHECK-NEXT: ttg.local_barrier
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.wait_barrier %barrier, %c0 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  ttng.wait_barrier %barrier, %c0 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: @participant_counted_wait_chain
+tt.func @participant_counted_wait_chain() {
+  %c0 = arith.constant 0 : i32
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  // CHECK: ttng.wait_barrier
+  // CHECK-NOT: ttg.local_barrier
+  // CHECK-NEXT: ttng.wait_barrier
+  ttng.wait_barrier %barrier, %c0 {waitMode = 1 : i32} : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  ttng.wait_barrier %barrier, %c0 {waitMode = 1 : i32} : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#barrier_array = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#payload = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+// CHECK-LABEL: @participant_consumer_release_loop
+tt.func @participant_consumer_release_loop(%upper_bound: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %empty = ttg.local_alloc : () -> !ttg.memdesc<4x1xi64, #barrier_array, #ttg.shared_memory, mutable>
+  %stages = ttg.local_alloc : () -> !ttg.memdesc<4x128xi8, #payload, #ttg.shared_memory, mutable>
+  scf.for %iteration = %c0 to %upper_bound step %c1 {
+    %slot_index = arith.remsi %iteration, %c4 : index
+    %slot = arith.index_cast %slot_index : index to i32
+    %empty_slot = ttg.memdesc_index %empty[%slot] : !ttg.memdesc<4x1xi64, #barrier_array, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    // CHECK-NOT: ttg.local_barrier
+    // CHECK: ttng.arrive_barrier
+    ttng.arrive_barrier %empty_slot, 256 released[%slot] (%stages) {participant_arrive = true} : !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>, i32, !ttg.memdesc<4x128xi8, #payload, #ttg.shared_memory, mutable>
+  }
+  // CHECK-NOT: ttg.local_barrier
+  // CHECK: tt.return
+  tt.return
+}
+
+// CHECK-LABEL: @participant_producer_arrive_loop
+tt.func @participant_producer_arrive_loop(%upper_bound: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %barrier_alloc = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+  scf.for %iteration = %c0 to %upper_bound step %c1 {
+    // CHECK: ttg.local_barrier
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %barrier_alloc, 256 {participant_arrive = true, release_fence = true} : !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+  }
+  tt.return
+}
+}

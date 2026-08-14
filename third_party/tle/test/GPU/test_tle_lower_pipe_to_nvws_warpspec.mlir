@@ -39,6 +39,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: partition0(%{{.*}}, %[[PART_TOKEN:.*]]: tensor<2x!nvws.token>, %[[PART_TAGS:.*]]: !ttg.memdesc<2x1xi32
     partition0(%arg0: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) num_warps(4) {
       // CHECK: nvws.consumer_wait %[[PART_TOKEN]]
+      // CHECK-SAME: waitMode = 1 : i32
       // CHECK: ttg.memdesc_index %[[PART_TAGS]]
       tt.call @reader(%arg0) : (!ttg.memdesc<2x16xf16, #shared, #smem, mutable>) -> ()
       ttg.warp_return
@@ -69,7 +70,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %p0_c0 = arith.constant 0 : i32
       %p0_false = arith.constant false
       // CHECK: partition0
-      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 1>}
+      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 1>, waitMode = 1 : i32}
       // CHECK: nvws.consumer_release
       // CHECK-SAME: async_task_id = array<i32: 1>
       // CHECK-SAME: release_count = 128 : i32
@@ -82,7 +83,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %p1_c0 = arith.constant 0 : i32
       %p1_false = arith.constant false
       // CHECK: partition1
-      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 2>}
+      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 2>, waitMode = 1 : i32}
       // CHECK: nvws.consumer_release
       // CHECK-SAME: async_task_id = array<i32: 2>
       // CHECK-SAME: release_count = 128 : i32
@@ -116,7 +117,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %p0_c0 = arith.constant 0 : i32
       %p0_false = arith.constant false
       // CHECK: partition0
-      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 1>}
+      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 1>, waitMode = 1 : i32}
       // CHECK: nvws.producer_acquire %{{.*}}{{.*}} {async_task_id = array<i32: 1>}
       %closed_left = tle.pipe.reader_wait %arg0[%p0_c0, %p0_false] {capacity = 2 : i32, pipe_name = "left", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
       tle.pipe.reader_release %arg0[%p0_c0] {capacity = 2 : i32, pipe_name = "left", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
@@ -128,7 +129,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %p1_c0 = arith.constant 0 : i32
       %p1_false = arith.constant false
       // CHECK: partition1
-      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 2>}
+      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 2>, waitMode = 1 : i32}
       %closed_score = tle.pipe.reader_wait %arg3[%p1_c0, %p1_false] {capacity = 1 : i32, pipe_name = "score", field_names = ["b"], scope = "cta"} : !ttg.memdesc<1x16xf16, #shared, #smem, mutable>
       tle.pipe.reader_release %arg3[%p1_c0] {capacity = 1 : i32, pipe_name = "score", field_names = ["b"], scope = "cta"} : !ttg.memdesc<1x16xf16, #shared, #smem, mutable>
       ttg.warp_return
@@ -157,7 +158,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       // CHECK: partition0
       // CHECK: nvws.producer_acquire %{{.*}}{{.*}} {async_task_id = array<i32: 1>}
       // CHECK: nvws.producer_commit %{{.*}}{{.*}} {async_task_id = array<i32: 1>}
-      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 1>}
+      // CHECK: nvws.consumer_wait %{{.*}}{{.*}} {async_task_id = array<i32: 1>, waitMode = 1 : i32}
       // CHECK: nvws.consumer_release
       // CHECK-SAME: async_task_id = array<i32: 1>
       // CHECK-SAME: release_count = 128 : i32

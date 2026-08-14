@@ -282,10 +282,20 @@ def NVWS_ConsumerWaitOp : NVWS_Op<"consumer_wait"> {
   let description = [{ The consumer will wait for the buffer to be ready
     to be consumed. If the buffers are not ready, the consumer will wait to be
     signalled by the producer which finishes filling the buffers and
-    releases the token.
+    releases the token. A participant-counted wait belongs to a cyclic buffer
+    protocol whose empty barrier receives one release from every reader
+    participant after its reads. Those readers may advance independently
+    between stages because a slot cannot be reused until all participants have
+    released it.
   }];
 
-  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx, I1: $phase);
+  let arguments = (ins
+    TensorOf<[NVWS_TokenType]>:$token,
+    I32:$idx,
+    I1:$phase,
+    DefaultValuedAttr<NVWS_ConsumerWaitModeAttr,
+                      "::mlir::triton::nvws::ConsumerWaitMode::Lockstep">:$waitMode
+  );
 
   let assemblyFormat = "$token `,` $idx `,` $phase attr-dict `:` type(operands)";
 }

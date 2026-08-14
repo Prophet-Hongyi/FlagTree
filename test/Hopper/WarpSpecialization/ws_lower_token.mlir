@@ -10,13 +10,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: arith.xori
   // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>}
   // CHECK: ttng.arrive_barrier {{.*}}, 128 {{.*}}{async_task_id = array<i32: 0>, release_fence = true}
-  // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 1>}
+  // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 1>, waitMode = 1 : i32}
   // CHECK: ttng.arrive_barrier {{.*}}, 128 {{.*}}{async_task_id = array<i32: 1>}
   tt.func @local_store_token(%idx: i32, %phase: i1) {
     %token = nvws.create_token {loadType = 3 : i32, numBuffers = 2 : i32} : tensor<2x!nvws.token>
     nvws.producer_acquire %token, %idx, %phase {async_task_id = array<i32: 0>} : tensor<2x!nvws.token>, i32, i1
     nvws.producer_commit %token, %idx {async_task_id = array<i32: 0>} : tensor<2x!nvws.token>, i32
-    nvws.consumer_wait %token, %idx, %phase {async_task_id = array<i32: 1>} : tensor<2x!nvws.token>, i32, i1
+    nvws.consumer_wait %token, %idx, %phase {async_task_id = array<i32: 1>, waitMode = 1 : i32} : tensor<2x!nvws.token>, i32, i1
     nvws.consumer_release %token, %idx {async_task_id = array<i32: 1>} : tensor<2x!nvws.token>, i32
     tt.return
   }

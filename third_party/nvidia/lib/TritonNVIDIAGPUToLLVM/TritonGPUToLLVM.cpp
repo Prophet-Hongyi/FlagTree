@@ -346,11 +346,40 @@ bool NVIDIA::canSkipBarSync(Operation *before, Operation *after) {
       isa<triton::nvidia_gpu::InvalBarrierOp>(after))
     return true;
 
-  //  We can't have a warp get ahead when we have a chain of mbarrier wait so we
-  //  need a barrier in between two WaitBarrierOp.
-  if (isa<triton::nvidia_gpu::WaitBarrierOp>(before) &&
-      isa<triton::nvidia_gpu::WaitBarrierOp>(after))
-    return false;
+  // Generic mbarrier waits require lockstep progress across a chain of waits.
+  // A participant-counted cyclic pipeline instead protects slot reuse with an
+  // empty barrier to which every reader arrives after its own reads. A faster
+  // warp may therefore advance to a later wait without allowing the producer
+  // to overwrite a slot still used by a slower warp.
+  if (auto beforeWait =
+          dyn_cast<triton::nvidia_gpu::WaitBarrierOp>(before)) {
+    if (auto afterWait =
+            dyn_cast<triton::nvidia_gpu::WaitBarrierOp>(after)) {
+      return beforeWait.getWaitMode() ==
+                 triton::nvidia_gpu::BarrierWaitMode::ParticipantCounted &&
+             afterWait.getWaitMode() ==
+                 triton::nvidia_gpu::BarrierWaitMode::ParticipantCounted;
+    }
+  }
+
+#ifdef __TLE__
+  auto isParticipantConsumerRelease = [](Operation *op) {
+    auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op);
+    return arrive && arrive.getParticipantArrive() && !arrive.getPred() &&
+           arrive.getReleasedIdx() && !arrive.getReleasedFields().empty();
+  };
+
+  // The empty-barrier phase is the reader-completion edge of a cyclic pipe.
+  // Every reader participant arrives only after finishing its reads. Before a
+  // participant can arrive at the same slot in a later generation, its full
+  // barrier must complete; the producer can publish that generation only after
+  // the previous empty barrier has collected every reader. Consequently, two
+  // loop-carried consumer releases do not need a separate CTA rendezvous even
+  // when conservative allocation analysis aliases their dynamic slot indices.
+  if (isParticipantConsumerRelease(before) &&
+      isParticipantConsumerRelease(after))
+    return true;
+#endif
 
   // Even though WaitBarrierOp, AsyncTMACopyGlobalToLocalOp and
   // AsyncTMACopyGlobalToLocalOp read and write to the mbarrier allocation it is
