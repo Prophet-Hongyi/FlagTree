@@ -2,9 +2,11 @@
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
+#explicit = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-DAG: #[[$BLOCKED:.*]] = #ttg.blocked
+  // CHECK-DAG: #[[$EXPLICIT:.*]] = #ttg.blocked<{{.*}}sizePerThread = [1, 2]{{.*}}threadsPerWarp = [2, 16]{{.*}}warpsPerCTA = [4, 1]{{.*}}>
   // CHECK-LABEL: tt.func private @tensor_memdesc_worker(
   // CHECK-SAME: tensor<64xi32, #[[$BLOCKED]]>
   // CHECK-SAME: !ttg.memdesc<128xi8, #shared, #smem, mutable>
@@ -41,6 +43,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %output_ptrs = tt.addptr %output_splat, %offsets :
         tensor<64x!tt.ptr<i32>>, tensor<64xi32>
     tt.store %output_ptrs, %result : tensor<64x!tt.ptr<i32>>
+    tt.return
+  }
+
+  // An explicit result layout is a noinline function ABI contract. Keep the
+  // callee signature and every call result synchronized with the return value.
+  // CHECK-LABEL: tt.func private @explicit_result_worker
+  // CHECK-SAME: -> tensor<8x32xf32, #[[$EXPLICIT]]>
+  tt.func private @explicit_result_worker() -> tensor<8x32xf32> attributes {noinline = true} {
+    %zero = arith.constant dense<0.0> : tensor<8x32xf32>
+    %encoded = tle.encoding %zero {target_encoding = #explicit} : tensor<8x32xf32> -> tensor<8x32xf32>
+    // CHECK: tt.return {{.*}} : tensor<8x32xf32, #[[$EXPLICIT]]>
+    tt.return %encoded : tensor<8x32xf32>
+  }
+
+  // CHECK-LABEL: tt.func public @explicit_result_caller
+  tt.func public @explicit_result_caller() attributes {noinline = false} {
+    // CHECK: tt.call @explicit_result_worker() : () -> tensor<8x32xf32, #[[$EXPLICIT]]>
+    %result = tt.call @explicit_result_worker() : () -> tensor<8x32xf32>
     tt.return
   }
 }

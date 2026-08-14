@@ -28,6 +28,79 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [1, 2], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 2], instrShape = [16, 8]}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, rank = 5}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @load_rank_collapsed_full_view
+  tt.func @load_rank_collapsed_full_view() -> tensor<64x128xbf16, #rhs> {
+    %zero = arith.constant dense<0> : tensor<64x128xi32, #blocked>
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<1x1x64x1x128xbf16, #shared, #smem, mutable>
+    %row = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %row2d = tt.expand_dims %row {axis = 1 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<64x1xi32, #blocked>
+    %rowb = tt.broadcast %row2d : tensor<64x1xi32, #blocked> -> tensor<64x128xi32, #blocked>
+    %col = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %col_rematerialized = tt.elementwise_inline_asm "mov.u32 $0, $1;" {constraints = "=r,r", packed_element = 1 : i32, pure = false, "tle.rematerialize_index" = true} %col : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %col2d = tt.expand_dims %col_rematerialized {axis = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xi32, #blocked>
+    %colb = tt.broadcast %col2d : tensor<1x128xi32, #blocked> -> tensor<64x128xi32, #blocked>
+    %ptr = "tle.local_pointers"(%smem, %zero, %zero, %rowb, %zero, %colb) : (!ttg.memdesc<1x1x64x1x128xbf16, #shared, #smem, mutable>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>) -> tensor<64x128x!tt.ptr<bf16, 3>, #blocked>
+    %value = tt.load %ptr : tensor<64x128x!tt.ptr<bf16, 3>, #blocked>
+    // CHECK-NOT: ttg.memdesc_subslice
+    // CHECK: %[[VIEW:.*]] = ttg.memdesc_reshape %[[BASE:.*]] : !ttg.memdesc<1x1x64x1x128xbf16, #{{.*}}, #smem, mutable> -> !ttg.memdesc<64x128xbf16, #{{.*}}, #smem, mutable>
+    // CHECK: %[[LOAD:.*]] = ttg.local_load %[[VIEW]] : {{.*}} -> tensor<64x128xbf16, #ttg.dot_op<
+    // CHECK-NOT: tt.load
+    // CHECK-NOT: ttg.convert_layout
+    %out = ttg.convert_layout %value : tensor<64x128xbf16, #blocked> -> tensor<64x128xbf16, #rhs>
+    tt.return %out : tensor<64x128xbf16, #rhs>
+  }
+
+  // CHECK-LABEL: tt.func @load_rank_collapsed_tail_view
+  tt.func @load_rank_collapsed_tail_view() -> tensor<32x128xbf16, #rhs> {
+    %zero = arith.constant dense<0> : tensor<32x128xi32, #blocked>
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<1x1x64x1x128xbf16, #shared, #smem, mutable>
+    %tail = ttg.memdesc_subslice %smem[0, 0, 32, 0, 0] : !ttg.memdesc<1x1x64x1x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<1x1x32x1x128xbf16, #shared, #smem, mutable, 1x1x64x1x128>
+    %row = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %row2d = tt.expand_dims %row {axis = 1 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi32, #blocked>
+    %rowb = tt.broadcast %row2d : tensor<32x1xi32, #blocked> -> tensor<32x128xi32, #blocked>
+    %col = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %col2d = tt.expand_dims %col {axis = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xi32, #blocked>
+    %colb = tt.broadcast %col2d : tensor<1x128xi32, #blocked> -> tensor<32x128xi32, #blocked>
+    %ptr = "tle.local_pointers"(%tail, %zero, %zero, %rowb, %zero, %colb) : (!ttg.memdesc<1x1x32x1x128xbf16, #shared, #smem, mutable, 1x1x64x1x128>, tensor<32x128xi32, #blocked>, tensor<32x128xi32, #blocked>, tensor<32x128xi32, #blocked>, tensor<32x128xi32, #blocked>, tensor<32x128xi32, #blocked>) -> tensor<32x128x!tt.ptr<bf16, 3>, #blocked>
+    %value = tt.load %ptr : tensor<32x128x!tt.ptr<bf16, 3>, #blocked>
+    // CHECK: %[[FULL:.*]] = ttg.memdesc_reshape %[[BASE:.*]] : !ttg.memdesc<1x1x64x1x128xbf16, #{{.*}}, #smem, mutable> -> !ttg.memdesc<64x128xbf16, #{{.*}}, #smem, mutable>
+    // CHECK: %[[TAIL:.*]] = ttg.memdesc_subslice %[[FULL]][32, 0] : {{.*}} -> !ttg.memdesc<32x128xbf16, #{{.*}}, #smem, mutable, 64x128>
+    // CHECK: %[[LOAD:.*]] = ttg.local_load %[[TAIL]] : {{.*}} -> tensor<32x128xbf16, #ttg.dot_op<
+    // CHECK-NOT: tt.load
+    // CHECK-NOT: ttg.convert_layout
+    %out = ttg.convert_layout %value : tensor<32x128xbf16, #blocked> -> tensor<32x128xbf16, #rhs>
+    tt.return %out : tensor<32x128xbf16, #rhs>
+  }
+
+  // CHECK-LABEL: tt.func @do_not_collapse_unmarked_inline_asm
+  tt.func @do_not_collapse_unmarked_inline_asm() -> tensor<64x128xbf16, #rhs> {
+    %zero = arith.constant dense<0> : tensor<64x128xi32, #blocked>
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<1x1x64x1x128xbf16, #shared, #smem, mutable>
+    %row = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %row2d = tt.expand_dims %row {axis = 1 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<64x1xi32, #blocked>
+    %rowb = tt.broadcast %row2d : tensor<64x1xi32, #blocked> -> tensor<64x128xi32, #blocked>
+    %col = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %col_opaque = tt.elementwise_inline_asm "mov.u32 $0, $1;" {constraints = "=r,r", packed_element = 1 : i32, pure = false} %col : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %col2d = tt.expand_dims %col_opaque {axis = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xi32, #blocked>
+    %colb = tt.broadcast %col2d : tensor<1x128xi32, #blocked> -> tensor<64x128xi32, #blocked>
+    %ptr = "tle.local_pointers"(%smem, %zero, %zero, %rowb, %zero, %colb) : (!ttg.memdesc<1x1x64x1x128xbf16, #shared, #smem, mutable>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>, tensor<64x128xi32, #blocked>) -> tensor<64x128x!tt.ptr<bf16, 3>, #blocked>
+    // CHECK: %[[VALUE:.*]] = tt.load
+    // CHECK: ttg.convert_layout %[[VALUE]]
+    %value = tt.load %ptr : tensor<64x128x!tt.ptr<bf16, 3>, #blocked>
+    %out = ttg.convert_layout %value : tensor<64x128xbf16, #blocked> -> tensor<64x128xbf16, #rhs>
+    tt.return %out : tensor<64x128xbf16, #rhs>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [2, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory

@@ -1,3 +1,9 @@
+#ifdef __TLE__
+#include <cstdint>
+#include <optional>
+#include <string>
+#endif
+
 #include "TargetInfo.h"
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
@@ -14,6 +20,9 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#ifdef __TLE__
+#include "tle/dialect/include/Transforms/TransformAttrs.h"
+#endif
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTWARPSPECIALIZETOLLVM
@@ -102,6 +111,23 @@ static void createAllBarrier(TritonLLVMIRRewriter &b, unsigned barIdx) {
                                   "llvm.nvvm.barrier.cta.sync.all",
                                   void_ty(b.getContext()), b.i32_val(barIdx));
 }
+
+#ifdef __TLE__
+static Value createWorkerRelativeWarpId(TritonLLVMIRRewriter &b,
+                                        unsigned defaultNumWarps) {
+  std::string asmString =
+      "mov.u32 $0, %tid.x;\n\tshr.u32 $0, $0, 5;\n\tsub.u32 $0, $0, " +
+      std::to_string(defaultNumWarps) + ";";
+  return LLVM::InlineAsmOp::create(
+             b, b.getLoc(), b.getI32Type(), ValueRange{}, asmString, "=r",
+             /*has_side_effects=*/true,
+             /*is_align_stack=*/false, LLVM::TailCallKind::None,
+             LLVM::AsmDialectAttr::get(b.getContext(),
+                                       LLVM::AsmDialect::AD_ATT),
+             ArrayAttr::get(b.getContext(), {}))
+      .getResult(0);
+}
+#endif
 
 namespace {
 
@@ -337,6 +363,58 @@ static bool isCtaInvariantSpecialRegister(Operation *op) {
              NVVM::BlockInClusterIdXOp, NVVM::BlockInClusterIdYOp,
              NVVM::BlockInClusterIdZOp>(op);
 }
+
+static std::optional<int32_t>
+getKernelArgumentTableOffset(LLVM::LLVMFuncOp func, BlockArgument arg) {
+  if (arg.getOwner() != &func.getBody().front())
+    return std::nullopt;
+
+  auto offsets = func->getAttrOfType<DenseI32ArrayAttr>(
+      tle::kTleWarpSpecializeKernelArgumentTableOffsetsAttr);
+  if (!offsets || arg.getArgNumber() >= offsets.size())
+    return std::nullopt;
+  int32_t offset = offsets.asArrayRef()[arg.getArgNumber()];
+  if (offset < 0)
+    return std::nullopt;
+  return offset;
+}
+
+static Value createKernelArgumentReload(
+    LLVM::LLVMFuncOp func, Type type, int32_t byteOffset,
+    const NVIDIA::TargetInfo &targetInfo, Operation *user) {
+  TritonLLVMIRRewriter b(user->getLoc(), user);
+  Value tableBase =
+      LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
+  LLVM::LLVMPointerType ptrTy = ptr_ty(b.getContext(), 3);
+  Value ptr = b.gep(ptrTy, b.getI8Type(), tableBase,
+                    LLVM::GEPArg(byteOffset));
+  LLVM::LoadOp reload = b.load(type, ptr, /*align=*/8);
+  reload.setVolatile_(true);
+  return reload;
+}
+
+static void reloadKernelArgumentsInWarpSpecializeRegions(
+    LLVM::LLVMFuncOp func, const NVIDIA::TargetInfo &targetInfo) {
+  for (BlockArgument arg : func.getArguments()) {
+    std::optional<int32_t> tableOffset =
+        getKernelArgumentTableOffset(func, arg);
+    if (!tableOffset)
+      continue;
+
+    SmallVector<OpOperand *> uses;
+    for (OpOperand &use : arg.getUses())
+      uses.push_back(&use);
+    for (OpOperand *use : uses) {
+      Operation *user = use->getOwner();
+      if (isa<WarpSpecializeOp>(user) ||
+          !user->getParentOfType<WarpSpecializeOp>())
+        continue;
+      Value reload = createKernelArgumentReload(
+          func, arg.getType(), *tableOffset, targetInfo, user);
+      use->set(reload);
+    }
+  }
+}
 #endif
 
 static LogicalResult findTrivialSubcomputation(LLVM::LLVMFuncOp func,
@@ -348,8 +426,9 @@ static LogicalResult findTrivialSubcomputation(LLVM::LLVMFuncOp func,
     Value capture = worklist[i];
     // Check for a kernel argument.
     if (auto arg = dyn_cast<BlockArgument>(capture)) {
-      if (arg.getOwner() == &func.getBody().front())
+      if (arg.getOwner() == &func.getBody().front()) {
         continue;
+      }
       // Otherwise, this is some other block argument that cannot be elided.
       return failure();
     }
@@ -379,8 +458,10 @@ static LogicalResult findTrivialSubcomputation(LLVM::LLVMFuncOp func,
   return success(ops.size() <= 16);
 }
 
-static void elideTrivialCaptures(LLVM::LLVMFuncOp func,
-                                 ArrayRef<WarpSpecializeOp> wsOps) {
+static LogicalResult
+elideTrivialCaptures(LLVM::LLVMFuncOp func,
+                     ArrayRef<WarpSpecializeOp> wsOps,
+                     const NVIDIA::TargetInfo &targetInfo) {
   // The goal is to completely eliminate captures by hoisting or rematerializing
   // computations. We could minimize captures by rematerializing
   // subcomputations, but that is much more complicated. Prefer rematerializing
@@ -390,6 +471,28 @@ static void elideTrivialCaptures(LLVM::LLVMFuncOp func,
   for (WarpSpecializeOp wsOp : wsOps) {
     llvm::BitVector toErase(wsOp.getNumOperands());
     for (auto [i, capture] : llvm::enumerate(wsOp.getExplicitCaptures())) {
+#ifdef __TLE__
+      if (auto arg = dyn_cast<BlockArgument>(capture)) {
+        if (auto tableOffset = getKernelArgumentTableOffset(func, arg)) {
+          toErase.set(i);
+          for (Region *region : wsOp.getPartitionRegions()) {
+            BlockArgument partitionArg = region->getArgument(i);
+            SmallVector<OpOperand *> uses;
+            for (OpOperand &use : partitionArg.getUses())
+              uses.push_back(&use);
+
+            for (OpOperand *use : uses) {
+              Operation *user = use->getOwner();
+              Value reload = createKernelArgumentReload(
+                  func, partitionArg.getType(), *tableOffset, targetInfo,
+                  user);
+              use->set(reload);
+            }
+          }
+          continue;
+        }
+      }
+#endif
       subgraph.clear();
       if (failed(findTrivialSubcomputation(func, capture, subgraph)))
         continue;
@@ -416,6 +519,7 @@ static void elideTrivialCaptures(LLVM::LLVMFuncOp func,
       region->front().eraseArguments(toErase);
     }
   }
+  return success();
 }
 
 #ifdef __TLE__
@@ -431,8 +535,11 @@ static LogicalResult findCtaUniformSubcomputation(LLVM::LLVMFuncOp func,
   for (unsigned i = 0; i != worklist.size(); ++i) {
     Value capture = worklist[i];
     if (auto arg = dyn_cast<BlockArgument>(capture)) {
-      if (arg.getOwner() == &func.getBody().front())
+      if (arg.getOwner() == &func.getBody().front()) {
+        if (getKernelArgumentTableOffset(func, arg))
+          return failure();
         continue;
+      }
       return failure();
     }
 
@@ -665,7 +772,11 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
 
   // Attempt to elide captures of trivial computations by hoisting them into the
   // header or rematerializing them into each partition.
-  elideTrivialCaptures(func, wsOps);
+  if (failed(elideTrivialCaptures(func, wsOps, targetInfo)))
+    return failure();
+#ifdef __TLE__
+  reloadKernelArgumentsInWarpSpecializeRegions(func, targetInfo);
+#endif
 
   MLIRContext *ctx = func.getContext();
   TritonLLVMIRRewriter b(func.getLoc(), ctx);
@@ -676,6 +787,16 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   SmallVector<Location> argLocs = llvm::to_vector(llvm::map_range(
       func.getArguments(), [](BlockArgument arg) { return arg.getLoc(); }));
   Block *header = b.createBlock(entry, func.getArgumentTypes(), argLocs);
+#ifdef __TLE__
+  Block *kernelArgumentInit = nullptr;
+  Block *dispatch = nullptr;
+  auto kernelArgumentTableOffsets = func->getAttrOfType<DenseI32ArrayAttr>(
+      tle::kTleWarpSpecializeKernelArgumentTableOffsetsAttr);
+  if (kernelArgumentTableOffsets) {
+    kernelArgumentInit = b.createBlock(entry);
+    dispatch = b.createBlock(entry);
+  }
+#endif
   Block *switchLoop = b.createBlock(entry);
   b.setInsertionPointToStart(header);
 
@@ -685,7 +806,35 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
+#ifdef __TLE__
+  if (kernelArgumentInit) {
+    Value isThreadZero = b.icmp_eq(tid, b.i32_val(0));
+    LLVM::CondBrOp::create(b, b.getLoc(), isThreadZero, kernelArgumentInit,
+                           dispatch);
+
+    b.setInsertionPointToStart(kernelArgumentInit);
+    Value tableBase =
+        LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
+    LLVM::LLVMPointerType ptrTy = ptr_ty(ctx, 3);
+    for (auto [i, byteOffset] :
+         llvm::enumerate(kernelArgumentTableOffsets.asArrayRef())) {
+      if (byteOffset < 0)
+        continue;
+      Value ptr =
+          b.gep(ptrTy, i8_ty, tableBase, LLVM::GEPArg(byteOffset));
+      b.store(header->getArgument(i), ptr, /*align=*/8);
+    }
+    LLVM::BrOp::create(b, b.getLoc(), dispatch);
+
+    b.setInsertionPointToStart(dispatch);
+    createAllBarrier(b, kSwitchLoopBarrierIdx);
+    LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
+  } else {
+#endif
   LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
+#ifdef __TLE__
+  }
+#endif
 
   // Forward arguments from the header into the old entry block.
   for (auto [arg, oldArg] :
@@ -707,9 +856,15 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   b.setInsertionPointToStart(switchLoop);
   if (maxnreg)
     createRegRealloc(b, maxnreg.getInt(), lowRegs);
+#ifdef __TLE__
+  Value relWid = maxnreg ? createWorkerRelativeWarpId(b, defaultNumWarps)
+                         : b.sub(wid, b.i32_val(defaultNumWarps));
+#endif
   createAllBarrier(b, kSwitchLoopBarrierIdx);
   Value statePtr = LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
+#ifndef __TLE__
   Value relWid = b.sub(wid, b.i32_val(defaultNumWarps));
+#endif
 
   // The default warp group will populate the state pointer with the state ID
   // for all warps.

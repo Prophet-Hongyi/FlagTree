@@ -21,6 +21,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#padding_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: tt.func public @warp_specialize_tma_descriptor_table
+  // CHECK-SAME: allocation.offset = 24 : i32
+  // CHECK-SAME: tle.warp_specialize_kernel_argument_table_offsets = array<i32: 8, -1>
+  tt.func public @warp_specialize_tma_descriptor_table(
+      %desc0: !tt.tensordesc<tensor<16x16xbf16>>,
+      %desc1: !tt.tensordesc<tensor<16x16xbf16>>) {
+    // Keep a larger, 4-byte-aligned allocation live across the function-level
+    // warp-specialize scratch buffer to verify that its base is 8-byte aligned.
+    %padding = ttg.local_alloc : () -> !ttg.memdesc<5xi32, #padding_shared, #smem, mutable>
+    ttg.warp_specialize(%desc0)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !tt.tensordesc<tensor<16x16xbf16>>) num_warps(4) {
+      ttg.warp_return
+    } : (!tt.tensordesc<tensor<16x16xbf16>>) -> ()
+    ttg.local_dealloc %padding : !ttg.memdesc<5xi32, #padding_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory

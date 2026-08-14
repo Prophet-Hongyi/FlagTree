@@ -203,7 +203,7 @@ def rematerialize_index(value, _semantic=None):
             "rematerialize_index requires a 32-bit integer block tensor, "
             f"got {value.dtype}"
         )
-    return tl.inline_asm_elementwise(
+    result = tl.inline_asm_elementwise(
         "mov.u32 $0, $1;",
         "=r,r",
         [value],
@@ -212,6 +212,11 @@ def rematerialize_index(value, _semantic=None):
         pack=1,
         _semantic=_semantic,
     )
+    result.handle.set_attr(
+        "tle.rematerialize_index",
+        _semantic.builder.get_bool_attr(True),
+    )
+    return result
 
 
 @tl.builtin

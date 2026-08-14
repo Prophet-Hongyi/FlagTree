@@ -32,6 +32,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include <limits>
 #include <optional>
 
 namespace mlir::triton::tle {
@@ -44,6 +45,7 @@ namespace {
 namespace ttg = mlir::triton::gpu;
 
 constexpr int kSharedMemoryAddressSpace = 3;
+constexpr StringLiteral kRematerializeIndexAttr = "tle.rematerialize_index";
 
 struct RematerializedValue {
   Value value;
@@ -61,6 +63,16 @@ static Value stripConvertLayouts(Value value) {
   while (auto cvt = current.getDefiningOp<ttg::ConvertLayoutOp>())
     current = cvt.getSrc();
   return current;
+}
+
+static bool isRematerializeIndex(triton::ElementwiseInlineAsmOp op) {
+  if (!op || op->getNumOperands() != 1 || op->getNumResults() != 1)
+    return false;
+  auto marker = op->getAttrOfType<BoolAttr>(kRematerializeIndexAttr);
+  auto resultTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  return marker && marker.getValue() && resultTy &&
+         resultTy.getElementType().isInteger(32) &&
+         op.getOperand(0).getType() == resultTy;
 }
 
 static Value stripIndexValueWrappers(Value value) {
@@ -85,6 +97,13 @@ static Value stripIndexValueWrappers(Value value) {
     if (auto cast = current.getDefiningOp<arith::IndexCastOp>()) {
       current = cast.getIn();
       continue;
+    }
+    if (auto rematerialize =
+            current.getDefiningOp<triton::ElementwiseInlineAsmOp>()) {
+      if (isRematerializeIndex(rematerialize)) {
+        current = rematerialize.getOperand(0);
+        continue;
+      }
     }
     break;
   }
@@ -178,6 +197,8 @@ static bool matchFullIndexTensorForAxis(Value index, size_t axis,
 struct StaticSubviewMatch {
   Value baseMemDesc;
   SmallVector<int32_t> offsets;
+  SmallVector<int64_t> viewShape;
+  SmallVector<int64_t> logicalToMemAxes;
   RankedTensorType valueType;
 };
 
@@ -215,43 +236,153 @@ matchStaticSubviewMemDesc(triton::LoadOp load) {
     return std::nullopt;
 
   SmallVector<int32_t> offsets(memDescTy.getRank(), 0);
+  SmallVector<int64_t> viewShape(memDescShape.begin(), memDescShape.end());
+  SmallVector<int64_t> logicalToMemAxes(loadTy.getRank(), -1);
   auto indices = localPointers.getIndices();
   if (indices.empty()) {
-    if (loadTy.getShape() == memDescShape)
-      return StaticSubviewMatch{localPointers.getSrc(), std::move(offsets),
-                                loadTy};
-    return std::nullopt;
-  }
-  if (indices.size() != memDescShape.size())
-    return std::nullopt;
-
-  for (auto [axis, index] : llvm::enumerate(indices)) {
-    int64_t offset = 0;
-    if (!matchFullIndexTensorForAxis(index, axis, loadTy.getShape(), offset))
+    if (loadTy.getNumElements() != memDescTy.getNumElements())
       return std::nullopt;
-    if (offset < 0 || offset + loadTy.getShape()[axis] > memDescShape[axis])
+    int64_t logicalAxis = 0;
+    for (auto [memAxis, memExtent] : llvm::enumerate(memDescShape)) {
+      if (logicalAxis < loadTy.getRank() &&
+          memExtent == loadTy.getShape()[logicalAxis]) {
+        logicalToMemAxes[logicalAxis++] = memAxis;
+      } else if (memExtent != 1) {
+        return std::nullopt;
+      }
+    }
+    if (logicalAxis != loadTy.getRank())
       return std::nullopt;
-    offsets[axis] = static_cast<int32_t>(offset);
+  } else {
+    if (indices.size() != memDescShape.size())
+      return std::nullopt;
+
+    SmallVector<bool> mappedLogicalAxes(loadTy.getRank(), false);
+    int64_t previousLogicalAxis = -1;
+    for (auto [memAxis, index] : llvm::enumerate(indices)) {
+      auto indexTy = dyn_cast<RankedTensorType>(index.getType());
+      if (!indexTy || indexTy.getShape() != loadTy.getShape() ||
+          !indexTy.getElementType().isInteger())
+        return std::nullopt;
+
+      if (std::optional<int64_t> constant = getConstantIntLike(index)) {
+        if (*constant < 0 || *constant >= memDescShape[memAxis] ||
+            *constant > std::numeric_limits<int32_t>::max())
+          return std::nullopt;
+        offsets[memAxis] = static_cast<int32_t>(*constant);
+        viewShape[memAxis] = 1;
+        continue;
+      }
+
+      bool matched = false;
+      for (auto logicalAxis : llvm::seq<int64_t>(0, loadTy.getRank())) {
+        if (mappedLogicalAxes[logicalAxis])
+          continue;
+        int64_t offset = 0;
+        if (!matchFullIndexTensorForAxis(index, logicalAxis,
+                                         loadTy.getShape(), offset))
+          continue;
+        if (logicalAxis <= previousLogicalAxis || offset < 0 ||
+            offset > std::numeric_limits<int32_t>::max() ||
+            offset + loadTy.getShape()[logicalAxis] > memDescShape[memAxis])
+          return std::nullopt;
+        offsets[memAxis] = static_cast<int32_t>(offset);
+        viewShape[memAxis] = loadTy.getShape()[logicalAxis];
+        mappedLogicalAxes[logicalAxis] = true;
+        logicalToMemAxes[logicalAxis] = memAxis;
+        previousLogicalAxis = logicalAxis;
+        matched = true;
+        break;
+      }
+      if (!matched)
+        return std::nullopt;
+    }
+    if (!llvm::all_of(mappedLogicalAxes, [](bool mapped) { return mapped; }))
+      return std::nullopt;
   }
 
-  return StaticSubviewMatch{localPointers.getSrc(), std::move(offsets), loadTy};
+  Value baseMemDesc = localPointers.getSrc();
+  if (memDescTy.getRank() != loadTy.getRank()) {
+    if (!isa<ttg::DotOperandEncodingAttr>(loadTy.getEncoding()))
+      return std::nullopt;
+
+    while (auto subslice =
+               baseMemDesc.getDefiningOp<ttg::MemDescSubsliceOp>()) {
+      for (auto [axis, subOffset] : llvm::enumerate(subslice.getOffsets())) {
+        int64_t combined = static_cast<int64_t>(offsets[axis]) + subOffset;
+        if (combined < 0 ||
+            combined > std::numeric_limits<int32_t>::max())
+          return std::nullopt;
+        offsets[axis] = static_cast<int32_t>(combined);
+      }
+      baseMemDesc = subslice.getSrc();
+    }
+
+    auto baseTy = cast<ttg::MemDescType>(baseMemDesc.getType());
+    SmallVector<bool> mappedMemAxes(baseTy.getRank(), false);
+    for (int64_t memAxis : logicalToMemAxes)
+      mappedMemAxes[memAxis] = true;
+    for (auto [memAxis, mapped] : llvm::enumerate(mappedMemAxes)) {
+      if (!mapped && (baseTy.getShape()[memAxis] != 1 ||
+                      viewShape[memAxis] != 1 || offsets[memAxis] != 0))
+        return std::nullopt;
+      if (offsets[memAxis] < 0 ||
+          offsets[memAxis] + viewShape[memAxis] >
+              baseTy.getShape()[memAxis])
+        return std::nullopt;
+    }
+  }
+
+  return StaticSubviewMatch{baseMemDesc, std::move(offsets),
+                            std::move(viewShape),
+                            std::move(logicalToMemAxes), loadTy};
 }
 
 static Value createSubviewForLoad(OpBuilder &builder, Location loc,
                                   StaticSubviewMatch match) {
   auto memDescTy = cast<ttg::MemDescType>(match.baseMemDesc.getType());
-  bool isFullView =
-      llvm::equal(match.valueType.getShape(), memDescTy.getShape()) &&
-      llvm::all_of(match.offsets, [](int32_t offset) { return offset == 0; });
-  if (isFullView)
-    return match.baseMemDesc;
+  if (memDescTy.getRank() != match.valueType.getRank()) {
+    SmallVector<int64_t> baseLogicalShape(match.valueType.getRank());
+    SmallVector<int32_t> logicalOffsets(match.valueType.getRank());
+    for (auto logicalAxis : llvm::seq<int64_t>(0,
+                                               match.valueType.getRank())) {
+      int64_t memAxis = match.logicalToMemAxes[logicalAxis];
+      baseLogicalShape[logicalAxis] = memDescTy.getShape()[memAxis];
+      logicalOffsets[logicalAxis] = match.offsets[memAxis];
+    }
 
-  auto subTy = ttg::MemDescType::get(
-      match.valueType.getShape(), match.valueType.getElementType(),
-      memDescTy.getEncoding(), memDescTy.getMemorySpace(),
-      memDescTy.getMutableMemory(), memDescTy.getAllocShape());
-  return ttg::MemDescSubsliceOp::create(builder, loc, subTy, match.baseMemDesc,
-                                        match.offsets);
+    Value collapsed = ttg::MemDescReshapeOp::create(
+        builder, loc, match.baseMemDesc, baseLogicalShape);
+    bool isFullView =
+        llvm::equal(baseLogicalShape, match.valueType.getShape()) &&
+        llvm::all_of(logicalOffsets,
+                     [](int32_t offset) { return offset == 0; });
+    if (isFullView)
+      return collapsed;
+
+    auto collapsedTy = cast<ttg::MemDescType>(collapsed.getType());
+    auto subTy = ttg::MemDescType::get(
+        match.valueType.getShape(), match.valueType.getElementType(),
+        collapsedTy.getEncoding(), collapsedTy.getMemorySpace(),
+        collapsedTy.getMutableMemory(), collapsedTy.getAllocShape());
+    return ttg::MemDescSubsliceOp::create(builder, loc, subTy, collapsed,
+                                          logicalOffsets);
+  }
+
+  bool isFullView =
+      llvm::equal(match.viewShape, memDescTy.getShape()) &&
+      llvm::all_of(match.offsets, [](int32_t offset) { return offset == 0; });
+  Value view = match.baseMemDesc;
+  if (!isFullView) {
+    auto subTy = ttg::MemDescType::get(
+        match.viewShape, match.valueType.getElementType(),
+        memDescTy.getEncoding(), memDescTy.getMemorySpace(),
+        memDescTy.getMutableMemory(), memDescTy.getAllocShape());
+    view = ttg::MemDescSubsliceOp::create(builder, loc, subTy,
+                                          match.baseMemDesc, match.offsets);
+  }
+
+  return view;
 }
 
 static RankedTensorType cloneWithElementAndEncoding(RankedTensorType type,
@@ -505,6 +636,21 @@ static std::optional<RematerializedValue> rematerializeForLayout(
                                             cache, depth + 1);
   } else if (auto range = dyn_cast<triton::MakeRangeOp>(def)) {
     rematerialized = rematerializeMakeRange(range, targetTy, builder);
+  } else if (auto inlineAsm = dyn_cast<triton::ElementwiseInlineAsmOp>(def);
+             isRematerializeIndex(inlineAsm)) {
+    auto input = rematerializeForLayout(inlineAsm.getOperand(0), targetTy,
+                                        builder, cache, depth + 1);
+    if (input) {
+      auto newInlineAsm = triton::ElementwiseInlineAsmOp::create(
+          builder, inlineAsm.getLoc(), targetTy, inlineAsm.getAsmString(),
+          inlineAsm.getConstraints(), inlineAsm.getPure(),
+          inlineAsm.getPackedElement(), ArrayRef<Value>{input->value});
+      newInlineAsm->setAttr(kRematerializeIndexAttr,
+                            builder.getBoolAttr(true));
+      rematerialized =
+          RematerializedValue{newInlineAsm.getResult()[0],
+                              input->usesLocalPointerLoad};
+    }
   } else if (auto splat = dyn_cast<triton::SplatOp>(def)) {
     rematerialized = rematerializeSplat(splat, targetTy, builder);
   } else if (auto broadcast = dyn_cast<triton::BroadcastOp>(def)) {

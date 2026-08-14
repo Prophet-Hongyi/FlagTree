@@ -180,33 +180,41 @@ static LogicalResult propagateTleEncodingHints(FuncOp func) {
     TleEncodingInfo info = valueToEncoding[value];
     assert(info && "worklist value must have an encoding");
 
-    if (info.propagateToUses) {
-      for (OpOperand &use : value.getUses()) {
-        Operation *op = use.getOwner();
-        if (isa<scf::ForOp, scf::WhileOp>(op)) {
-          int offset = 3 * isa<scf::ForOp>(op);
-          auto tiedArgs = getTiedArgs(op, use.getOperandNumber() - offset);
-          if (failed(updateTleEncoding(tiedArgs, info, func, valueToEncoding,
-                                       worklist)))
-            return failure();
-          continue;
-        }
-        if (isa<scf::YieldOp>(op)) {
-          auto tiedArgs = getTiedArgs(op, use.getOperandNumber());
-          if (failed(updateTleEncoding(tiedArgs, info, func, valueToEncoding,
-                                       worklist)))
-            return failure();
-          continue;
-        }
-        if (auto dot = dyn_cast<triton::DotOpInterface>(op)) {
-          // A/B use dot-operand encodings, while C and D use the parent MMA
-          // encoding. Only C and D are layout-equivalent across a dot.
-          if (use.getOperandNumber() == 2 &&
-              failed(updateTleEncoding({dot.getD()}, info, func,
+    for (OpOperand &use : value.getUses()) {
+      Operation *op = use.getOwner();
+      if (auto dot = dyn_cast<triton::DotOpInterface>(op)) {
+        // C and D have the same layout, but that intrinsic equality must not
+        // turn a C-side encoding boundary into a layout hint for every
+        // consumer of D. Continue across chained dot accumulators only.
+        if (use.getOperandNumber() == 2) {
+          TleEncodingInfo resultInfo = info;
+          resultInfo.propagateToUses = false;
+          if (failed(updateTleEncoding({dot.getD()}, resultInfo, func,
                                        valueToEncoding, worklist)))
             return failure();
-          continue;
         }
+        continue;
+      }
+
+      // Loop-carried values are one SSA type contract. Preserve their layout
+      // even when the value came from a closed explicit-encoding boundary.
+      if (isa<scf::ForOp, scf::WhileOp>(op)) {
+        int offset = 3 * isa<scf::ForOp>(op);
+        auto tiedArgs = getTiedArgs(op, use.getOperandNumber() - offset);
+        if (failed(updateTleEncoding(tiedArgs, info, func, valueToEncoding,
+                                     worklist)))
+          return failure();
+        continue;
+      }
+      if (isa<scf::YieldOp>(op)) {
+        auto tiedArgs = getTiedArgs(op->getParentOp(), use.getOperandNumber());
+        if (failed(updateTleEncoding(tiedArgs, info, func, valueToEncoding,
+                                     worklist)))
+          return failure();
+        continue;
+      }
+
+      if (info.propagateToUses) {
         if (isa<tle::EncodingOp>(op))
           continue;
 
@@ -322,6 +330,51 @@ static LogicalResult applyTleEncodingHints(ModuleOp mod) {
   for (FuncOp func : mod.getOps<FuncOp>())
     if (failed(propagateTleEncodingHints(func)))
       return failure();
+
+  // Explicit encodings selected inside a noinline callee are part of its
+  // result ABI. Function and call result types are otherwise converted from
+  // their original unencoded tensor types independently, which can assign a
+  // default layout that disagrees with the returned value.
+  for (FuncOp func : mod.getOps<FuncOp>()) {
+    unsigned numResults = func.getFunctionType().getNumResults();
+    if (func.isExternal() || numResults == 0)
+      continue;
+
+    SmallVector<ReturnOp> returns;
+    func.walk([&](ReturnOp op) { returns.push_back(op); });
+    if (returns.empty())
+      continue;
+
+    SmallVector<Type> resultTypes;
+    resultTypes.reserve(numResults);
+    for (unsigned index = 0; index < numResults; ++index) {
+      Type resultType = returns.front().getOperand(index).getType();
+      for (ReturnOp op : llvm::drop_begin(returns)) {
+        if (op.getOperand(index).getType() != resultType)
+          return op.emitOpError(
+              "has inconsistent return types after TLE encoding propagation "
+              "for result ")
+                 << index << ": " << resultType << " and "
+                 << op.getOperand(index).getType();
+      }
+      resultTypes.push_back(resultType);
+    }
+
+    if (!llvm::equal(func.getResultTypes(), resultTypes))
+      func.setFunctionType(FunctionType::get(
+          func.getContext(), func.getArgumentTypes(), resultTypes));
+  }
+
+  mod.walk([&](CallOp call) {
+    FuncOp callee = mod.lookupSymbol<FuncOp>(call.getCallee());
+    if (!callee || call.getNumResults() !=
+                       callee.getFunctionType().getNumResults())
+      return;
+
+    for (auto [result, calleeType] :
+         llvm::zip(call.getResults(), callee.getResultTypes()))
+      result.setType(calleeType);
+  });
   return success();
 }
 #endif
@@ -341,8 +394,40 @@ template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
                                                       retTypes)))
 #endif
       return failure();
-    rewriter.replaceOpWithNewOp<Op>(op, retTypes, adaptor.getOperands(),
-                                    op->getAttrs());
+
+    SmallVector<Value> operands(adaptor.getOperands());
+#ifdef __TLE__
+    if (op->template hasTrait<OpTrait::Elementwise>()) {
+      Attribute resultEncoding;
+      for (Type type : retTypes) {
+        auto tensorType = dyn_cast<RankedTensorType>(type);
+        if (!tensorType)
+          continue;
+        if (!resultEncoding) {
+          resultEncoding = tensorType.getEncoding();
+          continue;
+        }
+        if (resultEncoding != tensorType.getEncoding())
+          return rewriter.notifyMatchFailure(
+              op, "elementwise results require one common encoding");
+      }
+
+      // A hard TLE boundary may feed an otherwise default-layout elementwise
+      // op. Reconcile that edge at this use instead of propagating the layout
+      // backward through other, potentially shared operand DAGs.
+      if (resultEncoding) {
+        for (Value &operand : operands) {
+          auto tensorType = dyn_cast<RankedTensorType>(operand.getType());
+          if (!tensorType || tensorType.getEncoding() == resultEncoding)
+            continue;
+          auto targetType = tensorType.cloneWithEncoding(resultEncoding);
+          operand = rewriter.create<triton::gpu::ConvertLayoutOp>(
+              op.getLoc(), targetType, operand);
+        }
+      }
+    }
+#endif
+    rewriter.replaceOpWithNewOp<Op>(op, retTypes, operands, op->getAttrs());
 
     return success();
   }

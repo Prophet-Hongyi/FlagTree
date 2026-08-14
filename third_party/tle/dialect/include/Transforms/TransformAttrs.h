@@ -39,6 +39,13 @@ inline constexpr llvm::StringLiteral
 inline constexpr llvm::StringLiteral kTleEnableEncodingRematerializationAttr(
     "tle.enable_encoding_rematerialization");
 
+// Byte offsets, relative to a kernel's persistent shared-memory allocation, of
+// entry arguments reloaded inside warp-specialize regions. A negative entry
+// means that the corresponding argument has no table slot.
+inline constexpr llvm::StringLiteral
+    kTleWarpSpecializeKernelArgumentTableOffsetsAttr(
+        "tle.warp_specialize_kernel_argument_table_offsets");
+
 } // namespace mlir::triton::tle
 
 #endif // TRITON_TLE_TRANSFORM_ATTRS_H

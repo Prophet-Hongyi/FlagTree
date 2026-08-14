@@ -1,4 +1,7 @@
 #include <algorithm>
+#ifdef __TLE__
+#include <cstdint>
+#endif
 #include <limits>
 #include <memory>
 
@@ -16,6 +19,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #ifdef __TLE__
 #include "tle/dialect/include/IR/Dialect.h"
+#include "tle/dialect/include/Transforms/TransformAttrs.h"
 #endif
 
 using namespace mlir;
@@ -29,6 +33,42 @@ namespace triton {
 } // namespace mlir
 
 namespace {
+#ifdef __TLE__
+static void reserveWarpSpecializeKernelArgumentTables(ModuleOp mod) {
+  mod.walk<WalkOrder::PreOrder>([](triton::FuncOp func) {
+    if (!triton::isKernel(func))
+      return WalkResult::advance();
+
+    unsigned numWarpIndices = 0;
+    func.walk([&](triton::gpu::WarpSpecializeOp op) {
+      numWarpIndices = std::max(numWarpIndices, op.getTotalPartitionWarps());
+    });
+    if (numWarpIndices == 0)
+      return WalkResult::advance();
+
+    int32_t nextOffset = llvm::alignTo(numWarpIndices, alignof(uint64_t));
+    SmallVector<int32_t> offsets;
+    offsets.reserve(func.getNumArguments());
+    bool hasTableEntry = false;
+    for (BlockArgument arg : func.getArguments()) {
+      if (arg.use_empty()) {
+        offsets.push_back(-1);
+        continue;
+      }
+      offsets.push_back(nextOffset);
+      nextOffset += sizeof(uint64_t);
+      hasTableEntry = true;
+    }
+    if (hasTableEntry) {
+      func->setAttr(
+          tle::kTleWarpSpecializeKernelArgumentTableOffsetsAttr,
+          DenseI32ArrayAttr::get(func.getContext(), offsets));
+    }
+    return WalkResult::advance();
+  });
+}
+#endif
+
 struct AllocateSharedMemoryNv
     : public mlir::triton::impl::AllocateSharedMemoryNvBase<
           AllocateSharedMemoryNv> {
@@ -39,6 +79,9 @@ struct AllocateSharedMemoryNv
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+#ifdef __TLE__
+    reserveWarpSpecializeKernelArgumentTables(mod);
+#endif
     mlir::triton::NVIDIA::TargetInfo targetInfo(computeCapability, ptxVersion);
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(

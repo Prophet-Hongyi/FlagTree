@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #ifdef __TLE__
+#include <cstdint>
 #include <iterator>
 #endif
 #include <limits>
@@ -13,6 +14,7 @@
 #include "mlir/Support/LLVM.h"
 #ifdef __TLE__
 #include "tle/dialect/include/IR/Dialect.h"
+#include "tle/dialect/include/Transforms/TransformAttrs.h"
 #endif
 #include "triton/Analysis/Alias.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -321,11 +323,33 @@ private:
     }
     if (auto func = dyn_cast<FunctionOpInterface>(op)) {
       unsigned numWarpIndices = 0;
+#ifdef __TLE__
+      bool hasKernelArgumentTable = false;
+#endif
       // Warp specialization communicates states over shared memory to each
       // warp. Add space for an i8 for each warpgroup warp.
       func.walk([&](gpu::WarpSpecializeOp op) {
         numWarpIndices = std::max(numWarpIndices, op.getTotalPartitionWarps());
       });
+#ifdef __TLE__
+      if (auto tableOffsets = op->getAttrOfType<DenseI32ArrayAttr>(
+              tle::kTleWarpSpecializeKernelArgumentTableOffsetsAttr)) {
+        hasKernelArgumentTable = true;
+        unsigned tableEnd = 0;
+        for (int32_t offset : tableOffsets.asArrayRef()) {
+          if (offset >= 0)
+            tableEnd = std::max(
+                tableEnd,
+                static_cast<unsigned>(offset + sizeof(uint64_t)));
+        }
+        numWarpIndices = std::max(numWarpIndices, tableEnd);
+      }
+      if (hasKernelArgumentTable) {
+        maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(
+            op, numWarpIndices, alignof(uint64_t));
+        return;
+      }
+#endif
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, numWarpIndices);
       return;
     }

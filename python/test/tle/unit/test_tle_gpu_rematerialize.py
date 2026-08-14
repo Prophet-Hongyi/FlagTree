@@ -32,6 +32,7 @@ def test_rematerialize_index_preserves_value_and_program_points():
     )
 
     assert compiled.asm["ttir"].count("tt.elementwise_inline_asm") == 2
+    assert compiled.asm["ttir"].count("tle.rematerialize_index") == 2
     _rematerialize_index_kernel[(1,)](output, BLOCK=64, num_warps=4)
     torch.testing.assert_close(
         output,
