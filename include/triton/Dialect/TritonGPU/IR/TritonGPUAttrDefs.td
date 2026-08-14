@@ -397,11 +397,10 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
 
   let description = [{
     Represent blocked shared memory matching MMAv3/MMAv5 shared memory input.
-    This is also the canonical NVIDIA TMA shared-memory encoding because it
-    carries the swizzle, element width, FP4 padding, and allocation alignment
-    required by TensorMap transfers. Using this storage encoding does not
-    require its consumers to issue MMA instructions. This is meant to
-    represent 2d tiled blocked layout.
+    The encoding is also compatible with NVIDIA TensorMap transfers, but its
+    type-level contract is specifically the shared-memory operand layout
+    required by MMA instructions. This is meant to represent 2d tiled blocked
+    layout.
     The full layout representation is described here:
     https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout
     When the memdesc has more than 2 dimensions the tiling is applied to 8 rows even if the first outer dimension is smaller than 8.
@@ -460,6 +459,73 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
     int getMaxPhase() const;
     int getVec() const;
   }];
+  let hasCustomAssemblyFormat = 1;
+}
+
+def NVTMASharedEncodingAttr : TritonGPU_Attr<"NVTMASharedEncoding", "nvtma_shared_encoding",
+                     [DeclareSharedEncodingMethods, LayoutEncodingTrait,
+                      DeclareLayoutEncodingMethods]> {
+  let mnemonic = "nvtma_shared";
+
+  let description = [{
+    Represent the physical shared-memory layout written by an NVIDIA TensorMap
+    transfer. The encoding carries the hardware swizzle width, element width,
+    FP4 padding, and required allocation alignment, without implying that a
+    consumer uses MMA instructions.
+
+    For rank greater than two, all outer dimensions form the hardware TMA row
+    coordinate and the contiguous dimension forms the column coordinate. The
+    hardware swizzle therefore applies across the flattened outer dimensions,
+    rather than independently to the two innermost logical dimensions as in a
+    generic SwizzledSharedEncodingAttr.
+  }];
+
+  let parameters = (
+    ins
+    "unsigned":$swizzlingByteWidth,
+    "bool":$transposed,
+    "unsigned":$elementBitWidth,
+    "bool":$fp4Padded,
+    "CTAEncodingAttr":$CTALayout
+  );
+
+  let builders = [
+    AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
+                     "ArrayRef<unsigned>":$order,
+                     "CTAEncodingAttr":$CTALayout,
+                     "Type":$eltTy,
+                     "bool": $fp4Padded), [{
+        auto shapePerCTA = getShapePerCTA(CTALayout.getCTASplitNum(), shape);
+        int32_t swizzlingByteWidth = 0;
+        unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
+        int packingFactor = fp4Padded ? 2 : 1;
+
+        auto contigDimSizeInByte = shapePerCTA[order[0]] * packingFactor * eleBitWidth / 8;
+        if (contigDimSizeInByte >= 128 && contigDimSizeInByte % 128 == 0) {
+          swizzlingByteWidth = 128;
+        } else if (contigDimSizeInByte >= 64 && contigDimSizeInByte % 64 == 0) {
+          swizzlingByteWidth = 64;
+        } else if (contigDimSizeInByte >= 32 && contigDimSizeInByte % 32 == 0) {
+          swizzlingByteWidth = 32;
+        }
+        int flattenOuterDim = 1;
+        for (int i = 1; i < shapePerCTA.size(); i++) {
+          flattenOuterDim *= shapePerCTA[order[i]];
+        }
+        if (shapePerCTA.size() < 2 || flattenOuterDim < 8) {
+          swizzlingByteWidth = 0;
+        }
+        bool transposed = order[0] == 0;
+        return $_get(context, swizzlingByteWidth, transposed, eleBitWidth, fp4Padded, CTALayout);
+    }]>
+  ];
+
+  let extraClassDeclaration = extraBaseClassDeclaration # [{
+    int getPerPhase() const;
+    int getMaxPhase() const;
+    int getVec() const;
+  }];
+  let genVerifyDecl = 1;
   let hasCustomAssemblyFormat = 1;
 }
 

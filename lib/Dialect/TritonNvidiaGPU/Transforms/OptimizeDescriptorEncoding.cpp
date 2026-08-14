@@ -26,11 +26,10 @@ struct UseInfo {
   ttg::CTAEncodingAttr ctaLayout;
 };
 
-static bool isTMACompatibleEncoding(Attribute enc) {
-  if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(enc)) {
-    return !nvmma.getTransposed();
-  }
-  return false;
+static bool isTMACompatibleEncoding(Attribute enc, Type elementType) {
+  auto info = mlir::triton::nvidia_gpu::getTMASharedLayoutInfo(enc,
+                                                               elementType);
+  return succeeded(info) && !info->transposed;
 }
 
 Attribute findLoadEncodingFromUsers(Operation *op) {
@@ -38,11 +37,12 @@ Attribute findLoadEncodingFromUsers(Operation *op) {
   for (auto use : op->getUsers()) {
     if (auto alloc = dyn_cast<ttg::LocalAllocOp>(use)) {
       auto enc = alloc.getType().getEncoding();
-      if (isTMACompatibleEncoding(enc))
+      if (isTMACompatibleEncoding(enc, alloc.getType().getElementType()))
         return enc;
     } else if (auto store = dyn_cast<ttg::LocalStoreOp>(use)) {
       auto enc = store.getDst().getType().getEncoding();
-      if (isTMACompatibleEncoding(enc))
+      if (isTMACompatibleEncoding(
+              enc, store.getDst().getType().getElementType()))
         return enc;
     }
   }
@@ -60,6 +60,38 @@ SmallVector<int64_t> expandToRank(ArrayRef<int64_t> shape, int rank) {
 std::optional<UseInfo> getUseInfo(Operation *op) {
   UseInfo info;
   info.use = op;
+#ifdef __TLE__
+  if (auto copy = dyn_cast<ttg::TMACopyOp>(op)) {
+    Value descriptor;
+    ttg::MemDescType memDescTy;
+    if (isa<TensorDescType>(copy.getSrc().getType()) &&
+        isa<ttg::MemDescType>(copy.getDst().getType())) {
+      descriptor = copy.getSrc();
+      memDescTy = cast<ttg::MemDescType>(copy.getDst().getType());
+    } else if (isa<ttg::MemDescType>(copy.getSrc().getType()) &&
+               isa<TensorDescType>(copy.getDst().getType())) {
+      descriptor = copy.getDst();
+      memDescTy = cast<ttg::MemDescType>(copy.getSrc().getType());
+    } else {
+      return std::nullopt;
+    }
+
+    auto descriptorTy = cast<TensorDescType>(descriptor.getType());
+    unsigned descriptorRank = descriptorTy.getBlockType().getRank();
+    if (memDescTy.getRank() > descriptorRank)
+      return std::nullopt;
+
+    Attribute encoding = memDescTy.getEncoding();
+    if (!isTMACompatibleEncoding(encoding, memDescTy.getElementType()))
+      return std::nullopt;
+
+    info.descriptor = cast<TypedValue<TensorDescType>>(descriptor);
+    info.desiredSharedEncoding = encoding;
+    info.ctaLayout = ttg::getCTALayout(encoding);
+    info.shape = expandToRank(memDescTy.getShape(), descriptorRank);
+    return info;
+  }
+#endif
   if (auto load = dyn_cast<DescriptorLoadOp>(op)) {
     info.descriptor = load.getDesc();
     info.desiredSharedEncoding = findLoadEncodingFromUsers(op);
@@ -208,7 +240,7 @@ Attribute getFallbackSharedEncoding(RankedTensorType tensorType,
   else if (ctaLayout.getRank() != tensorType.getRank())
     ctaLayout = updateCTALayoutForShape(ctaLayout, shape);
 
-  return ttg::NVMMASharedEncodingAttr::get(ctx, shape, order, ctaLayout,
+  return ttg::NVTMASharedEncodingAttr::get(ctx, shape, order, ctaLayout,
                                            tensorType.getElementType(),
                                            /*fp4Padded*/ false);
 }
@@ -248,11 +280,12 @@ void syncWarpSpecializePartitionArgTypes(FuncOp func) {
 }
 #endif
 
-void assignMemoryLayouts(FuncOp &func) {
+void assignMemoryLayouts(ModuleOp &mod) {
   std::unordered_set<EncodingInfo> encodings;
   llvm::MapVector<TypedValue<TensorDescType>, const EncodingInfo *>
       valueToEncodingInfo;
   llvm::PriorityWorklist<TypedValue<triton::TensorDescType>> worklist;
+  llvm::DenseMap<Value, SmallVector<Value>> equivalentValues;
 
   auto updateEncoding = [&](ArrayRef<Value> descValues, EncodingInfo info) {
     for (auto value : descValues) {
@@ -276,54 +309,120 @@ void assignMemoryLayouts(FuncOp &func) {
     }
   };
 
-  // 1. Set seed values from either TMA ops, or device function boundaries for
-  // which we fallback to default encoding
-  auto isKernel = triton::isKernel(func);
-  for (auto blockArg : func.getBlocks().front().getArguments())
-    if (auto desc = dyn_cast<TypedValue<TensorDescType>>(blockArg))
-      updateEncoding({desc},
-                     EncodingInfo{{}, {}, {}, /*forcedToDefault=*/!isKernel});
+  auto connectEquivalentValues = [&](Value lhs, Value rhs) {
+    if (!isa<TensorDescType>(lhs.getType()) ||
+        !isa<TensorDescType>(rhs.getType()))
+      return;
+    equivalentValues[lhs].push_back(rhs);
+    equivalentValues[rhs].push_back(lhs);
+    updateEncoding({lhs, rhs}, EncodingInfo{});
+  };
 
-  func.walk([&](Operation *op) {
-    if (auto info = getUseInfo(op)) {
-      updateEncoding(info->descriptor,
-                     EncodingInfo{info->desiredSharedEncoding, info->ctaLayout,
-                                  info->shape});
-    } else {
-      bool forcedToDefault = isa<CallOp, ReturnOp, ReinterpretTensorDescOp>(op);
-      auto einfo =
-          internEncoding(encodings, EncodingInfo{{}, {}, {}, forcedToDefault});
+  // 1. Seed descriptor uses across the whole module. Function boundaries are
+  // connected below instead of forcing every device function to the fallback
+  // layout.
+  for (auto func : mod.getOps<FuncOp>()) {
+    if (!func.isExternal()) {
+      for (auto blockArg : func.getBlocks().front().getArguments())
+        if (auto desc = dyn_cast<TypedValue<TensorDescType>>(blockArg))
+          updateEncoding({desc}, EncodingInfo{});
+    }
+
+    func.walk([&](Operation *op) {
+      if (auto info = getUseInfo(op)) {
+        updateEncoding(
+            info->descriptor,
+            EncodingInfo{info->desiredSharedEncoding, info->ctaLayout,
+                         info->shape});
+      } else {
+        bool forcedToDefault = isa<ReinterpretTensorDescOp>(op);
 
 #ifdef __TLE__
-      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        for (auto [i, capture] : llvm::enumerate(wsOp.getExplicitCaptures())) {
-          if (!isa<TensorDescType>(capture.getType()))
-            continue;
-          updateEncoding(getWarpSpecializeTiedDescValues(wsOp, i),
-                         EncodingInfo{});
+        if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
+          for (auto [i, capture] :
+               llvm::enumerate(wsOp.getExplicitCaptures())) {
+            if (!isa<TensorDescType>(capture.getType()))
+              continue;
+            updateEncoding(getWarpSpecializeTiedDescValues(wsOp, i),
+                           EncodingInfo{});
+          }
         }
-      }
 #endif
 
-      auto setEncoding = [&](Value v) {
-        auto typedVal = cast<TypedValue<TensorDescType>>(v);
-        valueToEncodingInfo.try_emplace(typedVal, einfo);
-        if (forcedToDefault)
-          worklist.insert(typedVal);
-      };
-      for (auto result : op->getResults())
-        if (auto desc = dyn_cast<TypedValue<TensorDescType>>(result))
-          setEncoding(desc);
+        EncodingInfo defaultInfo{{}, {}, {}, forcedToDefault};
+        for (auto result : op->getResults())
+          if (auto desc = dyn_cast<TypedValue<TensorDescType>>(result))
+            updateEncoding({desc}, defaultInfo);
 
-      for (auto arg : op->getOperands())
-        if (auto desc = dyn_cast<TypedValue<TensorDescType>>(arg))
-          setEncoding(desc);
+        for (auto arg : op->getOperands())
+          if (auto desc = dyn_cast<TypedValue<TensorDescType>>(arg))
+            updateEncoding({desc}, defaultInfo);
+      }
+    });
+  }
+
+  // A tensor descriptor's shared encoding is part of the function ABI. Tie
+  // direct-call operands/results to the corresponding callee values so all
+  // call sites and the callee are solved together.
+  mod.walk([&](CallOp call) {
+    auto callee = mod.lookupSymbol<FuncOp>(call.getCallee());
+    if (!callee || callee.isExternal()) {
+      EncodingInfo fallback{{}, {}, {}, /*forcedToDefault=*/true};
+      for (Value value : call->getOperands())
+        if (isa<TensorDescType>(value.getType()))
+          updateEncoding({value}, fallback);
+      for (Value value : call->getResults())
+        if (isa<TensorDescType>(value.getType()))
+          updateEncoding({value}, fallback);
+      return;
+    }
+
+    Block &entry = callee.getBlocks().front();
+    for (auto [operand, argument] :
+         llvm::zip(call.getOperands(), entry.getArguments()))
+      connectEquivalentValues(operand, argument);
+
+    SmallVector<ReturnOp> returns;
+    callee.walk([&](ReturnOp ret) { returns.push_back(ret); });
+    for (auto [resultIndex, result] : llvm::enumerate(call.getResults())) {
+      if (!isa<TensorDescType>(result.getType()))
+        continue;
+      for (ReturnOp ret : returns)
+        connectEquivalentValues(result, ret.getOperand(resultIndex));
     }
   });
+
+  // Functions with no call sites still need all return sites to agree on one
+  // descriptor result ABI.
+  for (auto func : mod.getOps<FuncOp>()) {
+    if (func.isExternal())
+      continue;
+    SmallVector<ReturnOp> returns;
+    func.walk([&](ReturnOp ret) { returns.push_back(ret); });
+    for (unsigned resultIndex = 0;
+         resultIndex < func.getFunctionType().getNumResults(); ++resultIndex) {
+      Value representative;
+      for (ReturnOp ret : returns) {
+        Value value = ret.getOperand(resultIndex);
+        if (!isa<TensorDescType>(value.getType()))
+          continue;
+        if (representative)
+          connectEquivalentValues(representative, value);
+        else
+          representative = value;
+      }
+    }
+  }
 
   // 2. Propagate encoding info through the graph until fixed point
   while (!worklist.empty()) {
     auto desc = worklist.pop_back_val();
+
+    if (auto equivalent = equivalentValues.find(desc);
+        equivalent != equivalentValues.end()) {
+      for (Value value : equivalent->second)
+        updateEncoding({desc, value}, EncodingInfo{});
+    }
 
     // Propagate to users
     for (OpOperand &use : desc.getUses()) {
@@ -369,8 +468,8 @@ void assignMemoryLayouts(FuncOp &func) {
     }
   }
 
-  // 3. Transfer propagated encodings into the graph
-  auto ctx = func.getContext();
+  // 3. Transfer propagated encodings into the graph, then synchronize every
+  // function and call ABI from the rewritten SSA value types.
   for (auto &[desc, einfo] : valueToEncodingInfo) {
     auto existingTy = desc.getType().getBlockType();
     Attribute newEncoding;
@@ -386,26 +485,43 @@ void assignMemoryLayouts(FuncOp &func) {
                                                newEncoding));
   }
 
-  SmallVector<Type> argTys(func.getBlocks().front().getArgumentTypes());
-  SmallVector<Type> resultTys(func.getResultTypes());
-  for (auto [i, resultTy] : llvm::enumerate(resultTys)) {
-    if (auto descTy = dyn_cast<TensorDescType>(resultTy)) {
-      auto encoding = getFallbackSharedEncoding(descTy.getBlockType(), {}, {});
-      resultTys[i] = getTensorDescTypeWithEncoding(
-          nullptr, descTy.getBlockType(), encoding);
-    }
-  }
+  auto ctx = mod.getContext();
+  for (auto func : mod.getOps<FuncOp>()) {
 #ifdef __TLE__
-  syncWarpSpecializePartitionArgTypes(func);
+    syncWarpSpecializePartitionArgTypes(func);
 #endif
-  func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));
-}
+    SmallVector<Type> argTys(func.getFunctionType().getInputs());
+    if (!func.isExternal())
+      argTys.assign(func.getBlocks().front().getArgumentTypes().begin(),
+                    func.getBlocks().front().getArgumentTypes().end());
 
-void assignMemoryLayouts(ModuleOp &mod) {
-  for (auto &op : *mod.getBody()) {
-    if (auto func = dyn_cast<FuncOp>(&op)) {
-      assignMemoryLayouts(func);
+    SmallVector<Type> resultTys(func.getResultTypes());
+    if (!func.isExternal()) {
+      SmallVector<ReturnOp> returns;
+      func.walk([&](ReturnOp ret) { returns.push_back(ret); });
+      for (auto [resultIndex, resultTy] : llvm::enumerate(resultTys)) {
+        auto descTy = dyn_cast<TensorDescType>(resultTy);
+        if (!descTy)
+          continue;
+
+        bool foundReturnType = false;
+        for (ReturnOp ret : returns) {
+          if (auto returnTy =
+                  dyn_cast<TensorDescType>(ret.getOperand(resultIndex).getType())) {
+            resultTys[resultIndex] = returnTy;
+            foundReturnType = true;
+            break;
+          }
+        }
+        if (!foundReturnType) {
+          auto encoding =
+              getFallbackSharedEncoding(descTy.getBlockType(), {}, {});
+          resultTys[resultIndex] = getTensorDescTypeWithEncoding(
+              nullptr, descTy.getBlockType(), encoding);
+        }
+      }
     }
+    func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));
   }
 }
 

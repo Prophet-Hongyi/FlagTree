@@ -73,6 +73,7 @@ class CudaUtils(object):
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor = mod.fill_tma_descriptor
+        self.encode_tma_descriptor = mod.encode_tma_descriptor
 
 
 # ------------------------

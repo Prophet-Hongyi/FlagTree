@@ -5,10 +5,10 @@
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-// CHECK-DAG: #[[NVMMA_32:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+// CHECK-DAG: #[[NVTMA_32:.*]] = #ttg.nvtma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
 tt.func public @tma_gather(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: tensor<32xi32, #blocked> ) -> tensor<32x32xi8, #blocked1> {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <tensor<1x32xi8, #[[NVMMA_32]]>>
-  // CHECK: tt.descriptor_gather {{.*}} : (!tt.tensordesc<tensor<1x32xi8, #[[NVMMA_32]]>>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <tensor<1x32xi8, #[[NVTMA_32]]>>
+  // CHECK: tt.descriptor_gather {{.*}} : (!tt.tensordesc<tensor<1x32xi8, #[[NVTMA_32]]>>
   %c1_i64 = arith.constant 1 : i64
   %cst = arith.constant dense<32> : tensor<8x1xi32>
   %c64_i32 = arith.constant 64 : i32
@@ -22,14 +22,64 @@ tt.func public @tma_gather(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg
 
 // -----
 
+#generic_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+// CHECK-DAG: #[[$GENERIC_SHARED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+// CHECK-LABEL: tt.func public @tle_tma_copy_generic_shared(
+tt.func public @tle_tma_copy_generic_shared(
+    // CHECK-SAME: %arg0: !tt.tensordesc<tensor<32x64xf16, #[[$GENERIC_SHARED]]>>
+    %arg0: !tt.tensordesc<tensor<32x64xf16>>,
+    // CHECK-SAME: %arg1: !tt.tensordesc<tensor<32x64xf16, #[[$GENERIC_SHARED]]>>
+    %arg1: !tt.tensordesc<tensor<32x64xf16>>) {
+  %c0_i32 = arith.constant 0 : i32
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>
+  // CHECK: ttg.tma_copy %arg0, %0
+  ttg.tma_copy %arg0, %0, [%c0_i32, %c0_i32] : !tt.tensordesc<tensor<32x64xf16>>, !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>
+  // CHECK: ttg.tma_copy %0, %arg1
+  ttg.tma_copy %0, %arg1, [%c0_i32, %c0_i32] : !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>, !tt.tensordesc<tensor<32x64xf16>>
+  tt.return
+}
+}
+
+// -----
+
+#generic_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+// CHECK-DAG: #[[$INTERPROC_GENERIC_SHARED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+// CHECK-LABEL: tt.func private @generic_tma_producer(
+// CHECK-SAME: %arg0: !tt.tensordesc<tensor<32x64xf16, #[[$INTERPROC_GENERIC_SHARED]]>>
+tt.func private @generic_tma_producer(
+    %arg0: !tt.tensordesc<tensor<32x64xf16>>,
+    %arg1: !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>) attributes {noinline = true} {
+  %c0_i32 = arith.constant 0 : i32
+  ttg.tma_copy %arg0, %arg1, [%c0_i32, %c0_i32] : !tt.tensordesc<tensor<32x64xf16>>, !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>
+  tt.return
+}
+
+// CHECK-LABEL: tt.func public @generic_tma_caller(
+// CHECK-SAME: %arg0: !tt.tensordesc<tensor<32x64xf16, #[[$INTERPROC_GENERIC_SHARED]]>>
+tt.func public @generic_tma_caller(%arg0: !tt.tensordesc<tensor<32x64xf16>>) {
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>
+  // CHECK: tt.call @generic_tma_producer(%arg0, %0) : (!tt.tensordesc<tensor<32x64xf16, #[[$INTERPROC_GENERIC_SHARED]]>>
+  tt.call @generic_tma_producer(%arg0, %0) : (!tt.tensordesc<tensor<32x64xf16>>, !ttg.memdesc<32x64xf16, #generic_shared, #smem, mutable>) -> ()
+  tt.return
+}
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-// CHECK-DAG: #[[NVMMA_32:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+// CHECK-DAG: #[[NVTMA_32:.*]] = #ttg.nvtma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
 tt.func public @tma_scatter(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: tensor<32xi32, #blocked>, %arg4: tensor<32x32xi8, #blocked1>) {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <tensor<1x32xi8, #[[NVMMA_32]]>>
-  // CHECK: tt.descriptor_scatter {{.*}} : !tt.tensordesc<tensor<1x32xi8, #[[NVMMA_32]]>>, {{.*}}
+  // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <tensor<1x32xi8, #[[NVTMA_32]]>>
+  // CHECK: tt.descriptor_scatter {{.*}} : !tt.tensordesc<tensor<1x32xi8, #[[NVTMA_32]]>>, {{.*}}
   %c1_i64 = arith.constant 1 : i64
   %cst = arith.constant dense<32> : tensor<8x1xi32>
   %c64_i32 = arith.constant 64 : i32
@@ -49,11 +99,11 @@ tt.func public @tma_scatter(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %ar
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-DAG: #[[BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK-DAG: #[[SWIZZLE_MMA:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, rank = 3}>
+// CHECK-DAG: #[[TMA_GENERIC_3D:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 1, 0]}>
 // CHECK-DAG: #[[SWIZZLE_2D:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 tt.func public @tma_scatter(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32, %arg3: i64, %arg4: i64) {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f32>, <tensor<1x256x32xf32, #[[SWIZZLE_MMA]]>>
-  // CHECK: %[[LOAD:.*]] = tt.descriptor_load {{.*}} : !tt.tensordesc<tensor<1x256x32xf32, #[[SWIZZLE_MMA]]>> -> tensor<256x32xf32, #[[BLOCKED]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : <f32>, <tensor<1x256x32xf32, #[[TMA_GENERIC_3D]]>>
+  // CHECK: %[[LOAD:.*]] = tt.descriptor_load {{.*}} : !tt.tensordesc<tensor<1x256x32xf32, #[[TMA_GENERIC_3D]]>> -> tensor<256x32xf32, #[[BLOCKED]]>
   // CHECK: ttg.local_alloc %[[LOAD]] : (tensor<256x32xf32, #[[BLOCKED]]>) -> !ttg.memdesc<256x32xf32, #[[SWIZZLE_2D]], #smem>
   %c1_i32 = arith.constant 1 : i32
   %c1_i64 = arith.constant 1 : i64

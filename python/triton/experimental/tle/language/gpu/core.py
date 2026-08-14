@@ -392,6 +392,60 @@ class CopyDirection(Enum):
     LOCAL_TO_GM = "LOCALTOGM"  # Local memory to global memory
 
 
+TENSOR_MAP_ALIGNMENT_BYTES = 128
+
+
+@tl.builtin
+def tensor_map_table_entry(table, index, _semantic=None):
+    """Return the 128-byte-aligned tensor-map entry selected by ``index``."""
+    table = _semantic.to_tensor(table)
+    index = _semantic.to_tensor(index)
+    if getattr(index.type, "is_block", lambda: False)():
+        raise ValueError("tensor_map_table_entry index must be a scalar integer")
+    if not getattr(index.type, "is_int", lambda: False)():
+        raise ValueError(
+            f"tensor_map_table_entry index must be integer, got {index.type}"
+        )
+    byte_offset = _semantic.mul(index, TENSOR_MAP_ALIGNMENT_BYTES, False)
+    return _semantic.add(table, byte_offset, False)
+
+
+@tl.builtin
+def tensor_map_fenceproxy_acquire(entry, _semantic=None) -> None:
+    """Make one global-memory tensor-map entry visible to the TMA proxy."""
+    _semantic.builder.create_tensormap_fenceproxy_acquire(entry.handle)
+
+
+@tl.builtin
+def reinterpret_tensor_map(entry, destination, _semantic=None):
+    """Type a raw tensor-map entry from its TMA copy destination layout."""
+    if not isinstance(destination, tle.buffered_tensor):
+        raise ValueError(
+            "reinterpret_tensor_map destination must be a tle.buffered_tensor, "
+            f"got {type(destination).__name__}"
+        )
+    if destination.type.storage is not tle.smem:
+        raise ValueError(
+            "reinterpret_tensor_map destination must reside in shared memory"
+        )
+    if destination.type.layout is None:
+        raise ValueError(
+            "reinterpret_tensor_map destination requires an explicit shared layout"
+        )
+
+    block_shape = list(destination.shape)
+    handle = _semantic.builder.create_reinterpret_tensor_descriptor(
+        entry.handle,
+        block_shape,
+        destination.dtype.to_ir(_semantic.builder),
+        destination.type.layout.to_ir(_semantic.builder),
+    )
+    return tl.tensor_descriptor_base(
+        handle,
+        tl.block_type(destination.dtype, block_shape),
+    )
+
+
 @tl.builtin
 def copy(
     src,
@@ -521,7 +575,7 @@ def copy(
         _semantic=None,
     ) -> None:
         # Parameter validation
-        valid_types = (tle.buffered_tensor, tl.tensor_descriptor)
+        valid_types = (tle.buffered_tensor, tl.tensor_descriptor_base)
 
         if not isinstance(src, valid_types):
             raise ValueError(
@@ -533,9 +587,9 @@ def copy(
             )
 
         # Auto-determine copy direction based on operand types
-        if isinstance(src, tle.buffered_tensor) and isinstance(dst, tl.tensor_descriptor):
+        if isinstance(src, tle.buffered_tensor) and isinstance(dst, tl.tensor_descriptor_base):
             desc = dst
-        elif isinstance(src, tl.tensor_descriptor) and isinstance(dst, tle.buffered_tensor):
+        elif isinstance(src, tl.tensor_descriptor_base) and isinstance(dst, tle.buffered_tensor):
             desc = src
         else:
             raise ValueError(
@@ -559,7 +613,7 @@ def copy(
 
         # Note: Skip shape assertion at this level since it requires _semantic context
         # assert desc.shape == shape, "Shape mismatch between descriptor and provided shape"
-        assert len(offsets) == len(desc.shape), "Offsets and shape must have the same length"
+        assert len(offsets) == len(desc.block_shape), "Offsets and descriptor block shape must have the same rank"
         offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
         _semantic.builder.create_tma_copy(
             src.handle,
@@ -570,7 +624,7 @@ def copy(
         return
 
     # Parameter validation
-    valid_types = (tl.tensor, tle.buffered_tensor, tl.tensor_descriptor)
+    valid_types = (tl.tensor, tle.buffered_tensor, tl.tensor_descriptor_base)
 
     if not isinstance(src, valid_types):
         raise ValueError(
@@ -589,10 +643,10 @@ def copy(
     elif isinstance(src, tl.tensor) and isinstance(dst, tle.buffered_tensor):
         direction = CopyDirection.GM_TO_LOCAL
         is_normcopy = True
-    elif isinstance(src, tle.buffered_tensor) and isinstance(dst, tl.tensor_descriptor):
+    elif isinstance(src, tle.buffered_tensor) and isinstance(dst, tl.tensor_descriptor_base):
         direction = CopyDirection.LOCAL_TO_GM
         is_normcopy = False
-    elif isinstance(src, tl.tensor_descriptor) and isinstance(dst, tle.buffered_tensor):
+    elif isinstance(src, tl.tensor_descriptor_base) and isinstance(dst, tle.buffered_tensor):
         direction = CopyDirection.GM_TO_LOCAL
         is_normcopy = False
     else:

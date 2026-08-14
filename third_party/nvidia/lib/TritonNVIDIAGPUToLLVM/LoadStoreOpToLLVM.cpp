@@ -46,6 +46,7 @@ using ::mlir::LLVM::linearize;
 using ::mlir::triton::gpu::getCTALayout;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::NVMMASharedEncodingAttr;
+using ::mlir::triton::gpu::NVTMASharedEncodingAttr;
 
 // Toggle this to work around Cooperative Grid Launch ld.acquire optimized path
 static constexpr bool disableLDAcquireLowering = false;
@@ -1642,9 +1643,11 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty) {
 static LinearLayout
 getMsgToUnpackedOffsetLayout(const LinearLayout &packedLayout,
                              ttg::MemDescType ty) {
-  auto isFp4Padded =
-      cast<NVMMASharedEncodingAttr>(ty.getEncoding()).getFp4Padded();
-  if (!isFp4Padded) {
+  auto layoutInfo = ttng::getTMASharedLayoutInfo(
+      ty.getEncoding(), ty.getElementType());
+  assert(succeeded(layoutInfo) &&
+         "TMA lowering requires a TMA-compatible shared encoding");
+  if (!layoutInfo->fp4Padded) {
     return packedLayout;
   }
   auto ctx = ty.getContext();
@@ -1698,8 +1701,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     pred = b.and_(pred, LLVM::NVIDIA::createElectPredicate(loc, rewriter));
 
     auto smemTy = op.getResult().getType();
-    Attribute encoding = smemTy.getEncoding();
-    auto mmaEncoding = dyn_cast_or_null<NVMMASharedEncodingAttr>(encoding);
 
     auto shapePerCTA = ttg::getShapePerCTA(smemTy);
     int rank = op.getCoord().size();
@@ -1915,15 +1916,20 @@ struct AsyncTMAReduceOpConversion
 };
 
 static LinearLayout getUnswizzledLayout(triton::gpu::MemDescType type) {
-  auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(type.getEncoding());
-  if (!mmaEncoding) {
-    assert(isa<ttg::SwizzledSharedEncodingAttr>(type.getEncoding()));
-    return ttg::toLinearLayout(type);
+  if (auto mmaEncoding =
+          dyn_cast<NVMMASharedEncodingAttr>(type.getEncoding())) {
+    assert(type.getShape() == type.getAllocShape().take_back(type.getRank()));
+    return ttg::nvmmaSharedToLinearLayout(type.getShape(), mmaEncoding,
+                                          /*disableSwizzle=*/true);
   }
-  assert(type.getShape() == type.getAllocShape().take_back(type.getRank()));
-  return ttg::nvmmaSharedToLinearLayout(
-      type.getShape(), cast<NVMMASharedEncodingAttr>(type.getEncoding()),
-      /*disableSwizzle=*/true);
+  if (auto tmaEncoding =
+          dyn_cast<NVTMASharedEncodingAttr>(type.getEncoding())) {
+    assert(type.getShape() == type.getAllocShape().take_back(type.getRank()));
+    return ttg::nvtmaSharedToLinearLayout(type.getShape(), tmaEncoding,
+                                          /*disableSwizzle=*/true);
+  }
+  assert(isa<ttg::SwizzledSharedEncodingAttr>(type.getEncoding()));
+  return ttg::toLinearLayout(type);
 }
 
 // This function is shared between the TMA gather and scatter lowerings. It
@@ -1968,10 +1974,11 @@ static LogicalResult iterateGatherScatterIndices(
   ArrayRef<int64_t> allocShape = smemType.getAllocShape();
   if (allocShape.size() < 2 || smemType.getShape() != allocShape.take_back(2))
     return op->emitError("memdesc shape must match alloc shape");
-  // `NVMMASharedEncodingAttr` means the core matrix tiles are placed next to
-  // each other in shared memory, which lines up with how `gather4` loads data.
-  if (!isa<NVMMASharedEncodingAttr>(smemType.getEncoding()))
-    return op->emitError("requires dst encoding NVMMASharedEncodingAttr");
+  // NVIDIA TMA shared encodings place core matrix tiles next to each other in
+  // shared memory, which lines up with how `gather4` loads data.
+  if (!isa<NVMMASharedEncodingAttr, NVTMASharedEncodingAttr>(
+          smemType.getEncoding()))
+    return op->emitError("requires an NVIDIA TMA shared encoding");
   Type llvmElemTy = typeConverter.convertType(smemType.getElementType());
   Type elemPtrTy = ptr_ty(ctx, /*addrspace=*/3);
   auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, smemObjValue,

@@ -573,6 +573,34 @@ LogicalResult MemDescReshapeOp::verify() {
   return OpTrait::impl::verifyEquivalentType(expectedTy, dstType);
 }
 
+template <typename Encoding>
+static LogicalResult tryPreserveNvidiaTMASharedEncoding(
+    ArrayRef<int64_t> srcShape, Encoding encoding,
+    ArrayRef<int64_t> dstShape, Attribute &dstEnc) {
+  if (getNumCTAs(encoding) != 1)
+    return failure();
+
+  int innerDimDst =
+      encoding.getTransposed() ? dstShape.front() : dstShape.back();
+  int innerDimSrc =
+      encoding.getTransposed() ? srcShape.front() : srcShape.back();
+  if (innerDimDst != innerDimSrc)
+    return failure();
+
+  auto *ctx = encoding.getContext();
+  auto ctaLayout = CTAEncodingAttr::getDefault(ctx, dstShape.size());
+  auto candidateEncoding = Encoding::get(
+      ctx, encoding.getSwizzlingByteWidth(), encoding.getTransposed(),
+      encoding.getElementBitWidth(), encoding.getFp4Padded(), ctaLayout);
+  auto srcLL = toLinearLayout(srcShape, encoding);
+  auto dstLL = toLinearLayout(dstShape, candidateEncoding);
+  if (reshapeLayout(ctx, srcLL, dstShape) != dstLL)
+    return failure();
+
+  dstEnc = candidateEncoding;
+  return success();
+}
+
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
                                                    Attribute srcEnc,
                                                    ArrayRef<int64_t> dstShape,
@@ -580,28 +608,13 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
   auto *ctx = srcEnc.getContext();
   // TODO Delete this once SharedLinearEncodingAttr is more widely supported.
   if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(srcEnc)) {
-    if (getNumCTAs(mmaEncoding) == 1) {
-      int innerDimDst =
-          mmaEncoding.getTransposed() ? dstShape.front() : dstShape.back();
-      int innerDimSrc =
-          mmaEncoding.getTransposed() ? srcShape.front() : srcShape.back();
-      // We can keep an NVMMAShared encoding only if the innermost dimension is
-      // preserved. Otherwise fall back to the generic shared-linear encoding
-      // logic below.
-      if (innerDimDst == innerDimSrc) {
-        auto CTALayout = CTAEncodingAttr::getDefault(ctx, dstShape.size());
-        auto candidateEncoding = NVMMASharedEncodingAttr::get(
-            ctx, mmaEncoding.getSwizzlingByteWidth(),
-            mmaEncoding.getTransposed(), mmaEncoding.getElementBitWidth(),
-            mmaEncoding.getFp4Padded(), CTALayout);
-        auto srcLL = toLinearLayout(srcShape, srcEnc);
-        auto dstLL = toLinearLayout(dstShape, candidateEncoding);
-        if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
-          dstEnc = candidateEncoding;
-          return success();
-        }
-      }
-    }
+    if (succeeded(tryPreserveNvidiaTMASharedEncoding(
+            srcShape, mmaEncoding, dstShape, dstEnc)))
+      return success();
+  } else if (auto tmaEncoding = dyn_cast<NVTMASharedEncodingAttr>(srcEnc)) {
+    if (succeeded(tryPreserveNvidiaTMASharedEncoding(
+            srcShape, tmaEncoding, dstShape, dstEnc)))
+      return success();
   } else if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
     LinearLayout ll = padded.getLinearComponent();
     LinearLayout dst = reshapeLayout(ctx, ll, dstShape);

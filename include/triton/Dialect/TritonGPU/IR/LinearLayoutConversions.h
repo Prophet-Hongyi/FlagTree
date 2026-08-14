@@ -15,6 +15,7 @@ enum class ScaleDotElemType : uint32_t;
 namespace mlir::triton::gpu {
 class SwizzledSharedEncodingAttr;
 class NVMMASharedEncodingAttr;
+class NVTMASharedEncodingAttr;
 class TensorOrMemDesc;
 class MemDescType;
 class CTAEncodingAttr;
@@ -61,6 +62,12 @@ LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout);
 // swizzling.
 LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
                                        NVMMASharedEncodingAttr shared,
+                                       bool disableSwizzle = false);
+
+// Convert the shared encoding of a tensor with `nvtma_shared` layout to a
+// LinearLayout that maps from a linear shared memory offset to tensor index.
+LinearLayout nvtmaSharedToLinearLayout(ArrayRef<int64_t> shape,
+                                       NVTMASharedEncodingAttr shared,
                                        bool disableSwizzle = false);
 
 // Given a linear layout where the input dimensions contain a "block" dimension,

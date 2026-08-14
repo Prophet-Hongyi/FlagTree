@@ -109,6 +109,13 @@ void init_triton_musa_tle_ir(py::module m) {
              throw py::value_error("mthreads TLE alloc does not support "
                                    "nv_mma_shared_layout=True");
            })
+      .def("make_nv_tma_shared_encoding_attr",
+           [](TritonOpBuilder &, std::vector<int64_t>, std::vector<unsigned>,
+              mlir::Type &, std::vector<unsigned>, std::vector<unsigned>,
+              std::vector<unsigned>, bool, bool) -> mlir::Attribute {
+             throw py::value_error(
+                 "mthreads TLE does not support nv_tma_shared_layout");
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &, unsigned, unsigned, unsigned, unsigned,
               unsigned, bool) -> mlir::Attribute {

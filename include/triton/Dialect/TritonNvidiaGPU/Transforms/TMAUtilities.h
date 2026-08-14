@@ -6,6 +6,7 @@
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TMAEncodingUtils.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
 
 namespace mlir::triton::nvidia_gpu {
 
@@ -13,8 +14,11 @@ constexpr inline int TMA_SIZE_BYTES = 128;
 constexpr inline int TMA_ALIGN = 128;
 
 inline bool isFp4Padded(Attribute encoding) {
-  auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
-  return mmaEnc && mmaEnc.getFp4Padded();
+  if (auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding))
+    return mmaEnc.getFp4Padded();
+  if (auto tmaEnc = dyn_cast<gpu::NVTMASharedEncodingAttr>(encoding))
+    return tmaEnc.getFp4Padded();
+  return false;
 }
 
 SmallVector<Value> translateTMAIndices(OpBuilder &builder, Location loc,
@@ -38,24 +42,30 @@ SmallVector<int64_t> getTMABlockShape(ArrayRef<int64_t> shapePerCTA,
                                       bool packedSize);
 
 inline SmallVector<int64_t> getTMABlockShape(Attribute encoding,
+                                             Type elementType,
                                              ArrayRef<int64_t> shapePerCTA,
                                              bool packedSize) {
-  auto mmaEnc = cast<gpu::NVMMASharedEncodingAttr>(encoding);
-  return getTMABlockShape(shapePerCTA, mmaEnc.getElementBitWidth(),
-                          mmaEnc.getSwizzlingByteWidth(), mmaEnc.getFp4Padded(),
-                          mmaEnc.getTransposed(), packedSize);
+  auto info = getTMASharedLayoutInfo(encoding, elementType);
+  if (failed(info))
+    llvm::report_fatal_error("getTMABlockShape requires a TMA-compatible "
+                             "shared encoding");
+  return getTMABlockShape(shapePerCTA, info->elementBitWidth,
+                          info->swizzlingByteWidth, info->fp4Padded,
+                          info->transposed, packedSize);
 }
 
 inline SmallVector<int64_t> getTMABlockShape(RankedTensorType ty,
                                              bool packedSize) {
   auto shapePerCTA = gpu::getShapePerCTA(ty);
-  return getTMABlockShape(ty.getEncoding(), shapePerCTA, packedSize);
+  return getTMABlockShape(ty.getEncoding(), ty.getElementType(), shapePerCTA,
+                          packedSize);
 }
 
 inline SmallVector<int64_t> getTMABlockShape(triton::gpu::MemDescType ty,
                                              bool packedSize) {
   auto shapePerCTA = gpu::getShapePerCTA(ty);
-  return getTMABlockShape(ty.getEncoding(), shapePerCTA, packedSize);
+  return getTMABlockShape(ty.getEncoding(), ty.getElementType(), shapePerCTA,
+                          packedSize);
 }
 
 std::optional<int> getTMASwizzleMode(Operation *op, TensorDescType ty);

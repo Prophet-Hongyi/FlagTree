@@ -156,9 +156,9 @@ sharedToLinearLayoutAMDRotating(ArrayRef<int64_t> shape,
 
 } // namespace
 
-// Returns the layout of a single core matrix which tiles the nvmma layout
-LinearLayout getCoreMatrixLinearLayout(NVMMASharedEncodingAttr shared,
-                                       bool disableSwizzle) {
+template <typename Encoding>
+static LinearLayout
+getNvidiaTMACoreMatrixLinearLayout(Encoding shared, bool disableSwizzle) {
   auto *ctx = shared.getContext();
 
   int elemBitWidth = shared.getElementBitWidth();
@@ -200,15 +200,24 @@ LinearLayout getCoreMatrixLinearLayout(NVMMASharedEncodingAttr shared,
   return LinearLayout({{S("offset"), bases2D}}, outDimNames);
 }
 
-LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
-                                       NVMMASharedEncodingAttr shared,
+// Returns the layout of a single core matrix which tiles the nvmma layout.
+LinearLayout getCoreMatrixLinearLayout(NVMMASharedEncodingAttr shared,
                                        bool disableSwizzle) {
+  return getNvidiaTMACoreMatrixLinearLayout(shared, disableSwizzle);
+}
+
+template <typename Encoding>
+static LinearLayout nvidiaTMASharedToLinearLayout(ArrayRef<int64_t> shape,
+                                                  Encoding shared,
+                                                  bool disableSwizzle) {
   MLIRContext *ctx = shared.getContext();
   int rank = shape.size();
   auto shapePerCTA = getShapePerCTA(shared, shape);
   auto kOffset = S("offset");
-  auto tmaShape = triton::nvidia_gpu::getTMABlockShape(shared, shapePerCTA,
-                                                       /*packedSize=*/true);
+  auto tmaShape = triton::nvidia_gpu::getTMABlockShape(
+      shapePerCTA, shared.getElementBitWidth(),
+      shared.getSwizzlingByteWidth(), shared.getFp4Padded(),
+      shared.getTransposed(), /*packedSize=*/true);
   if (shared.getSwizzlingByteWidth() == 0) {
     auto outDimNames = standardOutDimNames(ctx, rank);
     LinearLayout layout = LinearLayout::identity1D(tmaShape[rank - 1], kOffset,
@@ -230,7 +239,8 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
     std::swap(collapsedTmaShape[0], collapsedTmaShape[1]);
   }
 
-  auto tileLayout = getCoreMatrixLinearLayout(shared, disableSwizzle);
+  auto tileLayout =
+      getNvidiaTMACoreMatrixLinearLayout(shared, disableSwizzle);
   auto outDimNames = standardOutDimNames(ctx, 2);
   auto kRow = outDimNames[0];
   auto kCol = outDimNames[1];
@@ -276,6 +286,18 @@ LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
       reshapedLayout, standardOutDimNames(ctx, shapePerCTA.size()),
       shapePerCTA);
   return combineCtaCgaWithShape(reshapedLayout, shared.getCTALayout(), shape);
+}
+
+LinearLayout nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
+                                       NVMMASharedEncodingAttr shared,
+                                       bool disableSwizzle) {
+  return nvidiaTMASharedToLinearLayout(shape, shared, disableSwizzle);
+}
+
+LinearLayout nvtmaSharedToLinearLayout(ArrayRef<int64_t> shape,
+                                       NVTMASharedEncodingAttr shared,
+                                       bool disableSwizzle) {
+  return nvidiaTMASharedToLinearLayout(shape, shared, disableSwizzle);
 }
 
 /// Function to generate lane and warp layout for dot operands.
@@ -1204,6 +1226,8 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
       result = shared.toLinearLayout(shape);
     } else if (auto shared = dyn_cast<NVMMASharedEncodingAttr>(layout)) {
       result = nvmmaSharedToLinearLayout(shape, shared);
+    } else if (auto shared = dyn_cast<NVTMASharedEncodingAttr>(layout)) {
+      result = nvtmaSharedToLinearLayout(shape, shared);
     } else if (auto sbl = dyn_cast<AMDRotatingSharedEncodingAttr>(layout)) {
       result = sharedToLinearLayoutAMDRotating(shape, sbl);
     } else if (auto tensorMemoryEncoding =

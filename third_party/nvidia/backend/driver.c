@@ -477,6 +477,18 @@ cleanup:
   return NULL;
 }
 
+static PyObject *encodeTMADescriptor(PyObject *self, PyObject *args) {
+  PyObject *descriptorObject = fillTMADescriptor(self, args);
+  if (!descriptorObject)
+    return NULL;
+
+  PyCUtensorMapObject *descriptor = (PyCUtensorMapObject *)descriptorObject;
+  PyObject *bytes = PyBytes_FromStringAndSize(
+      (const char *)&descriptor->tensorMap, sizeof(descriptor->tensorMap));
+  Py_DECREF(descriptorObject);
+  return bytes;
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -491,6 +503,8 @@ static PyMethodDef ModuleMethods[] = {
      "particular it's an error to change this value after launching any kernel "
      "that calls printf()."},
     {"fill_tma_descriptor", fillTMADescriptor, METH_VARARGS, "doc"},
+    {"encode_tma_descriptor", encodeTMADescriptor, METH_VARARGS,
+     "Encode one CUDA tensor map as its 128-byte device representation."},
 
     {NULL, NULL, 0, NULL} // sentinel
 };

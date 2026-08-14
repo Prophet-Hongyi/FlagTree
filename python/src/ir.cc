@@ -244,8 +244,9 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
     auto encoding = blockType.getEncoding();
 
     py::dict metadata;
-    if (isa<ttg::NVMMASharedEncodingAttr>(encoding)) {
-      auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding);
+    auto tmaLayout = ttng::getTMASharedLayoutInfo(
+        encoding, blockType.getElementType());
+    if (succeeded(tmaLayout)) {
       auto swizzle = ttng::getTMASwizzleMode(nullptr, descTy);
       auto elemType = ttng::getTMAElementType(nullptr, descTy);
       assert(swizzle.has_value());
@@ -257,7 +258,7 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
       metadata["elem_type"] = *elemType;
       metadata["block_size"] =
           std::vector<int>(blockSize.begin(), blockSize.end());
-      metadata["fp4_padded"] = mmaEncoding && mmaEncoding.getFp4Padded();
+      metadata["fp4_padded"] = tmaLayout->fp4Padded;
     } else {
       auto blockShape = blockType.getShape();
       metadata["block_size"] =
@@ -1642,6 +1643,23 @@ void init_triton_ir(py::module &&m) {
              return triton::TensorDescType::get(
                  ctx, cast<RankedTensorType>(blockTy), isSigned);
            })
+#ifdef __TLE__
+      .def("create_reinterpret_tensor_descriptor",
+           [](TritonOpBuilder &self, Value rawDesc,
+              std::vector<int64_t> &blockShape, Type elementType,
+              Attribute encoding) -> Value {
+             auto blockType =
+                 RankedTensorType::get(blockShape, elementType, encoding);
+             auto descriptorType = triton::TensorDescType::get(
+                 self.getContext(), blockType, elementType.isSignedInteger());
+             return self.create<ttng::ReinterpretTensorDescOp>(descriptorType,
+                                                                rawDesc);
+           })
+      .def("create_tensormap_fenceproxy_acquire",
+           [](TritonOpBuilder &self, Value descPtr) {
+             self.create<ttng::TensormapFenceproxyAcquireOp>(descPtr);
+           })
+#endif
       .def("create_descriptor_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
               CacheModifier cacheModifier,

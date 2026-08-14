@@ -202,6 +202,12 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
     }
     return getMatrixOrder(shape.size(), !sharedLayout.getTransposed());
   }
+  if (auto sharedLayout = dyn_cast<NVTMASharedEncodingAttr>(layout)) {
+    if (shape.size() == 1) {
+      return {0};
+    }
+    return getMatrixOrder(shape.size(), !sharedLayout.getTransposed());
+  }
   if (auto sharedLayout = dyn_cast<AMDRotatingSharedEncodingAttr>(layout)) {
     return llvm::to_vector(sharedLayout.getOrder());
   }
@@ -315,6 +321,12 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
   if (auto sharedMMALayout = dyn_cast<NVMMASharedEncodingAttr>(layout)) {
     if (sharedMMALayout.getFp4Padded()) {
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
+      shape[packedAxis] *= 2;
+    }
+  }
+  if (auto sharedTMALayout = dyn_cast<NVTMASharedEncodingAttr>(layout)) {
+    if (sharedTMALayout.getFp4Padded()) {
+      auto packedAxis = getOrder(sharedTMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
     }
   }
@@ -2056,10 +2068,11 @@ CTAEncodingAttr PaddedSharedEncodingAttr::getCTALayout() const {
   return linearToCTAEncodingAttr(getLinearComponent(), splitNum);
 }
 //===----------------------------------------------------------------------===//
-// NVMMAShared encoding
+// NVIDIA TMA-compatible shared encodings
 //===----------------------------------------------------------------------===//
 
-Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
+template <typename Encoding>
+static Attribute parseNvidiaTMASharedEncoding(AsmParser &parser, Type type) {
   if (parser.parseLess().failed())
     return {};
   // Parse the data as a dictionary
@@ -2106,51 +2119,127 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
   if (!CTALayout.has_value())
     return {};
 
-  return parser.getChecked<NVMMASharedEncodingAttr>(
+  return parser.getChecked<Encoding>(
       parser.getContext(), swizzlingByteWidth, transposed, elementBitWidth,
       fp4Padded, *CTALayout);
 }
 
-void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
+template <typename Encoding>
+static void printNvidiaTMASharedEncoding(Encoding encoding,
+                                         AsmPrinter &printer) {
   printer << "<{"
-          << "swizzlingByteWidth = " << getSwizzlingByteWidth() //
-          << ", transposed = " << getTransposed()               //
-          << ", elementBitWidth = " << getElementBitWidth();
-  if (getFp4Padded()) {
+          << "swizzlingByteWidth = " << encoding.getSwizzlingByteWidth() //
+          << ", transposed = " << encoding.getTransposed()               //
+          << ", elementBitWidth = " << encoding.getElementBitWidth();
+  if (encoding.getFp4Padded()) {
     // Print only in this case to reduce the noise for the more common case.
     printer << ", fp4Padded = true";
   }
-  unsigned rank = getCTALayout().getCTAOrder().size();
-  auto *ctx = getContext();
+  unsigned rank = encoding.getCTALayout().getCTAOrder().size();
+  auto *ctx = encoding.getContext();
   auto defaultLayout = CTAEncodingAttr::getDefault(ctx, rank);
-  if (getCTALayout() == defaultLayout && rank != 2) {
+  if (encoding.getCTALayout() == defaultLayout && rank != 2) {
     printer << ", rank = " << rank;
   } else {
-    maybePrintCTALayout(ctx, printer, getCTALayout(), rank);
+    maybePrintCTALayout(ctx, printer, encoding.getCTALayout(), rank);
   }
   printer << "}>";
 }
 
-int NVMMASharedEncodingAttr::getVec() const {
-  if (getSwizzlingByteWidth() == 0)
+template <typename Encoding>
+static int getNvidiaTMASharedVec(Encoding encoding) {
+  if (encoding.getSwizzlingByteWidth() == 0)
     return 1;
-  return 128 / getElementBitWidth();
+  return 128 / encoding.getElementBitWidth();
+}
+
+template <typename Encoding>
+static int getNvidiaTMASharedPerPhase(Encoding encoding) {
+  if (encoding.getSwizzlingByteWidth() == 0)
+    return 1;
+  return 128 / encoding.getSwizzlingByteWidth();
+}
+
+template <typename Encoding>
+static int getNvidiaTMASharedMaxPhase(Encoding encoding) {
+  if (encoding.getSwizzlingByteWidth() == 0)
+    return 1;
+  return encoding.getSwizzlingByteWidth() / 16;
+}
+
+template <typename Encoding>
+static int32_t getNvidiaTMASharedAlignment(Encoding encoding) {
+  return 128 * getNvidiaTMASharedMaxPhase(encoding);
+}
+
+Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
+  return parseNvidiaTMASharedEncoding<NVMMASharedEncodingAttr>(parser, type);
+}
+
+void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
+  printNvidiaTMASharedEncoding(*this, printer);
+}
+
+int NVMMASharedEncodingAttr::getVec() const {
+  return getNvidiaTMASharedVec(*this);
 }
 
 int NVMMASharedEncodingAttr::getPerPhase() const {
-  if (getSwizzlingByteWidth() == 0)
-    return 1;
-  return 128 / getSwizzlingByteWidth();
+  return getNvidiaTMASharedPerPhase(*this);
 }
 
 int NVMMASharedEncodingAttr::getMaxPhase() const {
-  if (getSwizzlingByteWidth() == 0)
-    return 1;
-  return getSwizzlingByteWidth() / 16;
+  return getNvidiaTMASharedMaxPhase(*this);
 }
 
 int32_t NVMMASharedEncodingAttr::getAlignment() const {
-  return 128 * getMaxPhase();
+  return getNvidiaTMASharedAlignment(*this);
+}
+
+LogicalResult
+NVTMASharedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                unsigned swizzlingByteWidth, bool transposed,
+                                unsigned elementBitWidth, bool fp4Padded,
+                                CTAEncodingAttr ctaLayout) {
+  (void)transposed;
+  (void)fp4Padded;
+  if (!llvm::is_contained(ArrayRef<unsigned>{0, 32, 64, 128},
+                          swizzlingByteWidth))
+    return emitError() << "swizzlingByteWidth must be one of 0, 32, 64, or "
+                          "128, got "
+                       << swizzlingByteWidth;
+  if (elementBitWidth == 0 || 128 % elementBitWidth != 0)
+    return emitError() << "elementBitWidth must be a non-zero divisor of 128, "
+                          "got "
+                       << elementBitWidth;
+  if (swizzlingByteWidth != 0 && ctaLayout.getRank() < 2)
+    return emitError() << "a swizzled NVIDIA TMA shared layout requires rank "
+                          "of at least two";
+  return success();
+}
+
+Attribute NVTMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
+  return parseNvidiaTMASharedEncoding<NVTMASharedEncodingAttr>(parser, type);
+}
+
+void NVTMASharedEncodingAttr::print(AsmPrinter &printer) const {
+  printNvidiaTMASharedEncoding(*this, printer);
+}
+
+int NVTMASharedEncodingAttr::getVec() const {
+  return getNvidiaTMASharedVec(*this);
+}
+
+int NVTMASharedEncodingAttr::getPerPhase() const {
+  return getNvidiaTMASharedPerPhase(*this);
+}
+
+int NVTMASharedEncodingAttr::getMaxPhase() const {
+  return getNvidiaTMASharedMaxPhase(*this);
+}
+
+int32_t NVTMASharedEncodingAttr::getAlignment() const {
+  return getNvidiaTMASharedAlignment(*this);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2658,6 +2747,19 @@ struct TritonGPUInferLayoutInterface
 
         CTAEncodingAttr ctaLayout = permuteCTALayout(enc.getCTALayout(), order);
         resultEncoding = NVMMASharedEncodingAttr::get(
+            ctx, enc.getSwizzlingByteWidth(), !enc.getTransposed(),
+            enc.getElementBitWidth(), enc.getFp4Padded(), ctaLayout);
+        return success();
+      }
+    }
+
+    if (auto enc = dyn_cast<NVTMASharedEncodingAttr>(operandEncoding)) {
+      if (order == ArrayRef<int32_t>({1, 0})) {
+        if (failed(checkRank(enc.getCTALayout().getRank())))
+          return failure();
+
+        CTAEncodingAttr ctaLayout = permuteCTALayout(enc.getCTALayout(), order);
+        resultEncoding = NVTMASharedEncodingAttr::get(
             ctx, enc.getSwizzlingByteWidth(), !enc.getTransposed(),
             enc.getElementBitWidth(), enc.getFp4Padded(), ctaLayout);
         return success();

@@ -319,21 +319,21 @@ class tensor_memory_layout(shared_layout):
         )
 
 
-class nv_mma_shared_layout(shared_layout):
+class _nv_tma_shared_layout_base(shared_layout):
 
     def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded, swizzled):
         super().__init__()
-        self.shape = shape
-        self.order = order
-        self.elemType = elemType
-        self.numCTAsPerCGA = numCTAsPerCGA
-        self.numCTASplit = numCTASplit
-        self.numCTAOrder = numCTAOrder
-        self.fp4Padded = fp4Padded
-        self.swizzled = swizzled
+        self.shape = [int(tl._unwrap_if_constexpr(x)) for x in shape]
+        self.order = [int(tl._unwrap_if_constexpr(x)) for x in order]
+        self.elemType = tl._unwrap_if_constexpr(elemType)
+        self.numCTAsPerCGA = [int(tl._unwrap_if_constexpr(x)) for x in numCTAsPerCGA]
+        self.numCTASplit = [int(tl._unwrap_if_constexpr(x)) for x in numCTASplit]
+        self.numCTAOrder = [int(tl._unwrap_if_constexpr(x)) for x in numCTAOrder]
+        self.fp4Padded = bool(tl._unwrap_if_constexpr(fp4Padded))
+        self.swizzled = bool(tl._unwrap_if_constexpr(swizzled))
 
     """
-    Make a default NVMMA shared layout encoding.
+    Make a default NVIDIA TMA-compatible shared layout encoding.
     """
 
     @classmethod
@@ -356,7 +356,7 @@ class nv_mma_shared_layout(shared_layout):
 
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
-        return nv_mma_shared_layout(
+        return type(self)(
             self.shape,
             permuted_order,
             self.elemType,
@@ -366,6 +366,18 @@ class nv_mma_shared_layout(shared_layout):
             self.fp4Padded,
             self.swizzled,
         )
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__}<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
+
+    def __eq__(self, other) -> bool:
+        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
+                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
+                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
+                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
+
+
+class nv_mma_shared_layout(_nv_tma_shared_layout_base):
 
     def to_ir(self, builder: ir.builder) -> None:
         return builder.make_nv_mma_shared_encoding_attr(
@@ -379,14 +391,20 @@ class nv_mma_shared_layout(shared_layout):
             self.swizzled,
         )
 
-    def __str__(self) -> str:
-        return f"nv_mma_shared_layout<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
 
-    def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
-                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
-                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
-                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
+class nv_tma_shared_layout(_nv_tma_shared_layout_base):
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_nv_tma_shared_encoding_attr(
+            [int(x) for x in self.shape],
+            self.order,
+            self.elemType.to_ir(builder),
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+            self.fp4Padded,
+            self.swizzled,
+        )
 
 
 def _drop_leading_dim_order(order):
@@ -411,6 +429,17 @@ def _make_slot_layout(src_layout: shared_layout, slot_shape: List[int]) -> share
         )
     if isinstance(src_layout, nv_mma_shared_layout):
         return nv_mma_shared_layout(
+            list(slot_shape),
+            _drop_leading_dim_order(src_layout.order),
+            src_layout.elemType,
+            _drop_leading_dim_values(src_layout.numCTAsPerCGA),
+            _drop_leading_dim_values(src_layout.numCTASplit),
+            _drop_leading_dim_order(src_layout.numCTAOrder),
+            src_layout.fp4Padded,
+            src_layout.swizzled,
+        )
+    if isinstance(src_layout, nv_tma_shared_layout):
+        return nv_tma_shared_layout(
             list(slot_shape),
             _drop_leading_dim_order(src_layout.order),
             src_layout.elemType,

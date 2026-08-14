@@ -69,6 +69,16 @@ updateEncodingForShape(Operation *op, ttg::SharedEncodingTrait encoding,
         ctx, nvmmaEnc.getSwizzlingByteWidth(), nvmmaEnc.getTransposed(),
         nvmmaEnc.getElementBitWidth(), nvmmaEnc.getFp4Padded(), newCtaEnc);
   }
+  if (auto nvtmaEnc = dyn_cast<ttg::NVTMASharedEncodingAttr>(encoding)) {
+    auto existingCta = nvtmaEnc.getCTALayout();
+    if (!existingCta)
+      return nvtmaEnc;
+
+    auto newCtaEnc = updateCTALayoutForShape(ctaLayout, tensorType.getShape());
+    return ttg::NVTMASharedEncodingAttr::get(
+        ctx, nvtmaEnc.getSwizzlingByteWidth(), nvtmaEnc.getTransposed(),
+        nvtmaEnc.getElementBitWidth(), nvtmaEnc.getFp4Padded(), newCtaEnc);
+  }
   if (auto swizEnc = dyn_cast<ttg::SwizzledSharedEncodingAttr>(encoding)) {
     auto existingCta = swizEnc.getCTALayout();
     if (!existingCta)
@@ -259,8 +269,8 @@ LogicalResult createTMADesc(Value tmaPtr, MakeTensorDescOp op,
 
   int paddingScale = fp4Padded ? 2 : 1;
   auto shapePerCTA = gpu::getShapePerCTA(encoding, op.getTensorShape());
-  auto blockShape =
-      getTMABlockShape(encoding, shapePerCTA, /*packedSize=*/false);
+  auto blockShape = getTMABlockShape(encoding, elemType, shapePerCTA,
+                                     /*packedSize=*/false);
   auto contigDimSize = blockShape.back();
 
   llvm::SmallVector<Value> boxDim;

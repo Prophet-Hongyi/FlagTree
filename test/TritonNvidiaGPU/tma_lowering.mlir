@@ -18,6 +18,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
+
+#generic_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$GENERIC_SHARED:[A-Za-z0-9_]+]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+// CHECK-DAG: #[[$SHARED_MEMORY:[A-Za-z0-9_]+]] = #ttg.shared_memory
+// CHECK-LABEL: tma_load_generic_shared
+// CHECK: ttg.local_alloc : () -> !ttg.memdesc<32x64xf16, #[[$GENERIC_SHARED]], #[[$SHARED_MEMORY]], mutable>
+// CHECK: ttng.async_tma_copy_global_to_local
+// CHECK: ttg.local_load
+  tt.func public @tma_load_generic_shared(%arg0: !tt.tensordesc<tensor<32x64xf16, #generic_shared>>, %arg1: i32) -> tensor<32x64xf16, #blocked> {
+    %result = tt.descriptor_load %arg0[%arg1, %arg1] : !tt.tensordesc<tensor<32x64xf16, #generic_shared>> -> tensor<32x64xf16, #blocked>
+    tt.return %result : tensor<32x64xf16, #blocked>
+  }
+}
+
+// -----
 #nvmma_128 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>

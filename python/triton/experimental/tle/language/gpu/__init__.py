@@ -8,10 +8,14 @@ from .core import (
     memory_space,
     local_ptr,
     rematerialize_index,
+    reinterpret_tensor_map,
+    tensor_map_fenceproxy_acquire,
+    tensor_map_table_entry,
     warp_specialize,
 )
 from .types import (layout, distributed_encoding, BlockEncoding, MmaEncoding, DotOperandEncoding, SlicedEncoding,
-                    shared_layout, swizzled_shared_layout, tensor_memory_layout, nv_mma_shared_layout, scope,
+                    shared_layout, swizzled_shared_layout, tensor_memory_layout, nv_mma_shared_layout,
+                    nv_tma_shared_layout, scope,
                     buffered_tensor, buffered_tensor_type, smem, tmem)
 
 # Backward-compat alias expected by existing tests/tutorials.
@@ -25,6 +29,9 @@ __all__ = [
     "copy",
     "local_ptr",
     "rematerialize_index",
+    "reinterpret_tensor_map",
+    "tensor_map_fenceproxy_acquire",
+    "tensor_map_table_entry",
     "warp_specialize",
     "storage_kind",
     "layout",
@@ -38,6 +45,7 @@ __all__ = [
     "swizzled_shared_layout",
     "tensor_memory_layout",
     "nv_mma_shared_layout",
+    "nv_tma_shared_layout",
     "scope",
     "buffered_tensor",
     "buffered_tensor_type",
