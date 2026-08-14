@@ -6,12 +6,15 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
+
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 if WORLD_SIZE % LOCAL_WORLD_SIZE != 0:
     raise ValueError("WORLD_SIZE must be divisible by LOCAL_WORLD_SIZE")
 
-DEVICE_MESH = tle.device_mesh(tle.MeshConfig(node=WORLD_SIZE // LOCAL_WORLD_SIZE, device=LOCAL_WORLD_SIZE))
+DEVICE_MESH = tle.device_mesh(
+    tle.MeshConfig(node=WORLD_SIZE // LOCAL_WORLD_SIZE, device=LOCAL_WORLD_SIZE)
+)
 
 
 @triton.jit
@@ -49,7 +52,7 @@ def test_tle_get_node_rank():
     torch.cuda.synchronize()
 
     rank = dist.get_rank()
-    expected_node_rank = int(os.environ["GROUP_RANK"])
+    expected_node_rank = rank // LOCAL_WORLD_SIZE
     actual_node_ranks = node_rank_out.cpu().tolist()
     try:
         torch.testing.assert_close(
@@ -73,4 +76,5 @@ def test_tle_get_node_rank():
         tle.cleanup_communicator()
 
 
-test_tle_get_node_rank()
+if __name__ == "__main__":
+    test_tle_get_node_rank()
