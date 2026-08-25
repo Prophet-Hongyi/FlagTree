@@ -47,6 +47,9 @@ def ConvertTritonGPUToLLVMPPU : Pass<"convert-triton-gpu-to-llvm-ppu", "mlir::Mo
         Option<"computeCapability", "compute-capability",
                "int32_t", /*default*/"80",
                "device compute capability">,
+        Option<"enableFp8E4M3", "enable-fp8-e4m3",
+               "bool", /*default*/"false",
+               "enable OCP FP8 E4M3 conversions on the PPU target">,
     ];
 }
 

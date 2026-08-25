@@ -31,6 +31,8 @@
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
+#include <array>
+
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::ppu;
 
@@ -316,6 +318,169 @@ typedef std::function<SmallVector<Value>(Location, ConversionPatternRewriter &,
                                          const SmallVector<Value> &)>
     ConverterT;
 
+template <typename SrcFPType>
+static Value downcastToFp8E4M3FNRTNEOneValue(
+    Location loc, ConversionPatternRewriter &rewriter, Value value) {
+  static_assert(std::is_same_v<SrcFPType, Float32Type> ||
+                std::is_same_v<SrcFPType, Float16Type> ||
+                std::is_same_v<SrcFPType, BFloat16Type>);
+
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  constexpr bool isFp32 = std::is_same_v<SrcFPType, Float32Type>;
+  constexpr bool isFp16 = std::is_same_v<SrcFPType, Float16Type>;
+  IntegerType intType = isFp32 ? i32_ty : i16_ty;
+  constexpr unsigned srcWidth = isFp32 ? 32 : 16;
+  constexpr unsigned srcMantissaBits = isFp32 ? 23 : (isFp16 ? 10 : 7);
+  constexpr unsigned srcExponentBits = isFp32 ? 8 : (isFp16 ? 5 : 8);
+  constexpr unsigned srcBias = (1U << (srcExponentBits - 1)) - 1;
+  constexpr unsigned dstMantissaBits = 3;
+  constexpr unsigned dstBias = 7;
+  constexpr unsigned reducedMantissaBits = srcMantissaBits - dstMantissaBits;
+
+  auto intValue = [&](uint32_t constant) -> Value {
+    if constexpr (isFp32)
+      return b.i32_val(static_cast<int32_t>(constant));
+    return b.i16_val(static_cast<int16_t>(constant));
+  };
+
+  Value bits = b.bitcast(value, intType);
+  constexpr uint32_t signMask = 1U << (srcWidth - 1);
+  constexpr uint32_t absoluteMask = signMask - 1;
+  Value absolute = b.and_(bits, intValue(absoluteMask));
+  Value sign = b.trunc(
+      i8_ty, b.lshr(b.and_(bits, intValue(signMask)), intValue(srcWidth - 8)));
+
+  constexpr uint32_t exponentMask = ((1U << srcExponentBits) - 1)
+                                    << srcMantissaBits;
+  constexpr uint32_t mantissaMask = (1U << srcMantissaBits) - 1;
+  Value isNaN =
+      b.and_(b.icmp_eq(b.and_(absolute, intValue(exponentMask)),
+                       intValue(exponentMask)),
+             b.icmp_ne(b.and_(absolute, intValue(mantissaMask)), intValue(0)));
+
+  constexpr uint32_t baseRoundingBias = (1U << (reducedMantissaBits - 1)) - 1;
+  constexpr uint32_t mantissaLSB = 1U << reducedMantissaBits;
+  Value roundingBias = b.add(b.lshr(b.and_(absolute, intValue(mantissaLSB)),
+                                    intValue(reducedMantissaBits)),
+                             intValue(baseRoundingBias));
+  Value fp8 = b.add(absolute, roundingBias);
+
+  constexpr uint32_t reduceMantissaMask = static_cast<uint32_t>(
+      ((1ULL << (1 + srcExponentBits + dstMantissaBits + 1)) - 1)
+      << reducedMantissaBits);
+  fp8 = b.and_(fp8, intValue(reduceMantissaMask));
+
+  constexpr uint32_t dstMinimal =
+      isFp32 ? 0x3c800000 : (isFp16 ? 0x2400 : 0x3c80);
+  fp8 = b.umax(fp8, intValue(dstMinimal));
+
+  constexpr uint32_t exponentBias = (srcBias - dstBias) << srcMantissaBits;
+  fp8 = b.sub(fp8, intValue(exponentBias));
+  fp8 = b.trunc(i8_ty, b.lshr(fp8, intValue(reducedMantissaBits)));
+
+  constexpr uint32_t dstMaxOfSrcType = isFp32   ? 0x43e7ffff
+                                       : isFp16 ? 0x5f40
+                                                : 0x43e7;
+  fp8 = b.select(b.icmp_ugt(absolute, intValue(dstMaxOfSrcType)),
+                 b.i8_val(0x7e), fp8);
+
+  constexpr std::array<uint32_t, 8> halfwayPoints =
+      isFp32
+          ? std::array<uint32_t, 8>{0x3a800000, 0x3b400000, 0x3ba00000,
+                                    0x3be00000, 0x3c100000, 0x3c300000,
+                                    0x3c500000, 0x3c700000}
+          : (isFp16 ? std::array<uint32_t, 8>{0x1400, 0x1a00, 0x1d00, 0x1f00,
+                                              0x2080, 0x2180, 0x2280, 0x2380}
+                    : std::array<uint32_t, 8>{0x3a80, 0x3b40, 0x3ba0, 0x3be0,
+                                              0x3c10, 0x3c30, 0x3c50, 0x3c70});
+  for (int i = halfwayPoints.size() - 1; i >= 0; --i) {
+    Value belowHalfway = i % 2 == 0
+                             ? b.icmp_ule(absolute, intValue(halfwayPoints[i]))
+                             : b.icmp_ult(absolute, intValue(halfwayPoints[i]));
+    fp8 = b.select(belowHalfway, b.i8_val(i), fp8);
+  }
+
+  fp8 = b.select(isNaN, b.i8_val(0x7f), fp8);
+  return b.or_(fp8, sign);
+}
+
+template <typename SrcFPType>
+static SmallVector<Value>
+downcastToFp8E4M3FNRTNESoftware(Location loc,
+                                ConversionPatternRewriter &rewriter,
+                                const SmallVector<Value> &values) {
+  assert(values.size() == 4);
+  SmallVector<Value> results;
+  results.reserve(values.size());
+  for (Value value : values)
+    results.push_back(
+        downcastToFp8E4M3FNRTNEOneValue<SrcFPType>(loc, rewriter, value));
+  return results;
+}
+
+static Value upcastFp8E4M3FNToFp16OneValue(Location loc,
+                                           ConversionPatternRewriter &rewriter,
+                                           Value value) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto fp8x2VecTy = vec_ty(i8_ty, 2);
+  Value bits = b.undef(fp8x2VecTy);
+  bits = b.insert_element(fp8x2VecTy, bits, b.i8_val(0), b.i32_val(0));
+  bits = b.insert_element(fp8x2VecTy, bits, value, b.i32_val(1));
+  bits = b.bitcast(bits, i16_ty);
+
+  Value sign = b.and_(bits, b.i16_val(0x8000));
+  bits = b.and_(bits, b.i16_val(0x7fff));
+  bits = b.lshr(bits, b.i16_val(1));
+  bits = b.add(bits, b.i16_val(0x2000));
+
+  Value absolute = b.and_(b.bitcast(value, i8_ty), b.i8_val(0x7f));
+  bits = b.select(b.icmp_eq(absolute, b.i8_val(0x7f)), b.i16_val(0x7e00), bits);
+
+  constexpr std::array<uint16_t, 8> denormalsAndZero = {
+      0x0000, 0x1800, 0x1c00, 0x1e00, 0x2000, 0x2100, 0x2200, 0x2300};
+  for (int i = 0; i < denormalsAndZero.size(); ++i)
+    bits = b.select(b.icmp_eq(absolute, b.i8_val(i)),
+                    b.i16_val(denormalsAndZero[i]), bits);
+
+  bits = b.or_(bits, sign);
+  return b.bitcast(bits, f16_ty);
+}
+
+static SmallVector<Value>
+upcastFp8E4M3FNToFp16Software(Location loc, ConversionPatternRewriter &rewriter,
+                              const SmallVector<Value> &values) {
+  assert(values.size() == 4);
+  SmallVector<Value> results;
+  results.reserve(values.size());
+  for (Value value : values)
+    results.push_back(upcastFp8E4M3FNToFp16OneValue(loc, rewriter, value));
+  return results;
+}
+
+static Value convertFp32ToBf16RTNE(Location loc,
+                                   ConversionPatternRewriter &rewriter,
+                                   Value value) {
+  TIXBuilder builder;
+  auto &cvt = *builder.create("ppu.cvt.rn.bf16.f32");
+  auto result = builder.newOperand("=h");
+  auto operand = builder.newOperand(value, "f");
+  cvt(result, operand);
+  return builder.launch(rewriter, loc, bf16_ty, false);
+}
+
+static SmallVector<Value>
+upcastFp8E4M3FNToBf16Software(Location loc, ConversionPatternRewriter &rewriter,
+                              const SmallVector<Value> &values) {
+  SmallVector<Value> results;
+  results.reserve(values.size());
+  for (Value value : values) {
+    Value fp16 = upcastFp8E4M3FNToFp16OneValue(loc, rewriter, value);
+    Value fp32 = LLVM::FPExtOp::create(rewriter, loc, f32_ty, fp16);
+    results.push_back(convertFp32ToBf16RTNE(loc, rewriter, fp32));
+  }
+  return results;
+}
+
 static ConverterT makeConverterFromTIX(const std::string &tixAsm, Type inType,
                                        Type outType,
                                        const int inVecWidthBits = 32,
@@ -386,10 +551,10 @@ struct FpToFpOpConversion
 
   explicit FpToFpOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
-                              int computeCapability,
+                              int computeCapability, bool enableFp8E4M3,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
-        computeCapability(computeCapability) {}
+        computeCapability(computeCapability), enableFp8E4M3(enableFp8E4M3) {}
 
   static Value convertFp16ToFp32(Location loc,
                                  ConversionPatternRewriter &rewriter,
@@ -461,6 +626,30 @@ struct FpToFpOpConversion
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
+    if (!enableFp8E4M3 && (llvm::isa<Float8E4M3FNType>(srcTy) ||
+                           llvm::isa<Float8E4M3FNType>(dstTy))) {
+      llvm::report_fatal_error(
+          "Conversion from/to f8e4m3nv is disabled for this PPU target\n");
+    }
+
+    if (computeCapability < 89) {
+      if (llvm::isa<Float8E4M3FNType>(dstTy) &&
+          roundingMode == RoundingMode::RTNE) {
+        if (srcTy.isF32())
+          return {downcastToFp8E4M3FNRTNESoftware<Float32Type>, 4};
+        if (srcTy.isF16())
+          return {downcastToFp8E4M3FNRTNESoftware<Float16Type>, 4};
+        if (srcTy.isBF16())
+          return {downcastToFp8E4M3FNRTNESoftware<BFloat16Type>, 4};
+      }
+      if (llvm::isa<Float8E4M3FNType>(srcTy)) {
+        if (dstTy.isF16())
+          return {upcastFp8E4M3FNToFp16Software, 4};
+        if (dstTy.isBF16())
+          return {upcastFp8E4M3FNToBf16Software, 4};
+      }
+    }
+
     static DenseMap<std::tuple<TypeID, TypeID, RoundingMode>, Fp8ConversionDesc>
         srcMap = {
             // F8 -> F16
@@ -497,11 +686,6 @@ struct FpToFpOpConversion
                      << stringifyRoundingMode(roundingMode.value());
       llvm::errs() << "\n";
       llvm::report_fatal_error("Unsupported rounding mode for conversion.");
-    }
-    if (computeCapability < 89 && (llvm::isa<Float8E4M3FNType>(srcTy) ||
-                                   llvm::isa<Float8E4M3FNType>(dstTy))) {
-      llvm::report_fatal_error("Conversion from/to f8e4m3nv is only supported "
-                               "on compute capability >= 89\n");
     }
     auto convDesc = srcMap.lookup(key);
     return {makeConverterFromTIX(
@@ -561,8 +745,11 @@ struct FpToFpOpConversion
       return outVals;
     }
 
+    bool useSoftwareFp8E4M3Downcast =
+        enableFp8E4M3 && computeCapability < 89 &&
+        llvm::isa<Float8E4M3FNType>(dstElementType);
     bool useFP16IntermediateSrc =
-        srcElementType.isF32() &&
+        srcElementType.isF32() && !useSoftwareFp8E4M3Downcast &&
         (!(computeCapability >= 89 &&
            (llvm::isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType))) ||
          roundingMode.value() == RoundingMode::RTZ);
@@ -591,6 +778,7 @@ struct FpToFpOpConversion
 
 private:
   int computeCapability;
+  bool enableFp8E4M3;
 };
 
 struct FDivOpConversion
@@ -886,7 +1074,7 @@ private:
 void mlir::triton::ppu::populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, int computeCapability,
-    const TargetInfo &targetInfo, PatternBenefit benefit) {
+    bool enableFp8E4M3, const TargetInfo &targetInfo, PatternBenefit benefit) {
   using namespace mlir::triton::gpu;
 
   mlir::triton::populateElementwiseOpToLLVMPatterns(
@@ -914,7 +1102,7 @@ void mlir::triton::ppu::populateElementwiseOpToLLVMPatterns(
   patterns.add<SIToFPOpConversion>(typeConverter, axisInfoAnalysis,
                                    computeCapability, benefit);
   patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
-                                   computeCapability, benefit);
+                                   computeCapability, enableFp8E4M3, benefit);
 
   // ExpOpConversionApprox will try using ex2.approx if the input type is
   // FP32. For other input types, ExpOpConversionApprox will return failure and

@@ -228,7 +228,9 @@ class PPUBackend(BaseBackend):
 
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(HGGCOptions.supported_fp8_dtypes)
-            if capability >= 89:
+            # ppu0010 uses the software conversion lowering added by this backend;
+            # newer targets keep using their existing native conversion path.
+            if capability == 80 or capability >= 89:
                 supported_fp8_dtypes.add("fp8e4nv")
             args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
 
@@ -392,7 +394,8 @@ class PPUBackend(BaseBackend):
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if PPUBackend.instrumentation:
             PPUBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
-        ppu.passes.ttgpuir.add_to_llvmir(pm, capability)
+        enable_fp8e4m3 = "fp8e4nv" in options.supported_fp8_dtypes
+        ppu.passes.ttgpuir.add_to_llvmir(pm, capability, enable_fp8e4m3)
         ppu.passes.ttgpuir.add_convert_libdevice_func_to_ppu(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)

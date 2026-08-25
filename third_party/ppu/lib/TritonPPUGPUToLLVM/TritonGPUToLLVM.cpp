@@ -240,8 +240,8 @@ struct ConvertTritonGPUToLLVMPPU
           ConvertTritonGPUToLLVMPPU> {
   using ConvertTritonGPUToLLVMPPUBase::ConvertTritonGPUToLLVMPPUBase;
 
-  ConvertTritonGPUToLLVMPPU(int32_t computeCapability)
-      : ConvertTritonGPUToLLVMPPUBase({computeCapability}) {}
+  ConvertTritonGPUToLLVMPPU(int32_t computeCapability, bool enableFp8E4M3)
+      : ConvertTritonGPUToLLVMPPUBase({computeCapability, enableFp8E4M3}) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -320,7 +320,7 @@ struct ConvertTritonGPUToLLVMPPU
                                 benefit);
     populateElementwiseOpToLLVMPatterns(typeConverter, patterns,
                                         axisInfoAnalysis, computeCapability,
-                                        targetInfo, benefit);
+                                        enableFp8E4M3, targetInfo, benefit);
     populateClampFOpToLLVMPattern(typeConverter, patterns, axisInfoAnalysis,
                                   computeCapability,
                                   patternBenefitClampOptimizedPattern);
@@ -425,8 +425,10 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertTritonGPUToLLVMPPUPass() {
   return std::make_unique<ConvertTritonGPUToLLVMPPU>();
 }
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertTritonGPUToLLVMPPUPass(int32_t computeCapability) {
-  return std::make_unique<ConvertTritonGPUToLLVMPPU>(computeCapability);
+createConvertTritonGPUToLLVMPPUPass(int32_t computeCapability,
+                                    bool enableFp8E4M3) {
+  return std::make_unique<ConvertTritonGPUToLLVMPPU>(computeCapability,
+                                                     enableFp8E4M3);
 }
 
 } // namespace triton
