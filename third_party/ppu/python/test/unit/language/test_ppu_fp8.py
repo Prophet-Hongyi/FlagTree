@@ -8,6 +8,7 @@ from triton.backends.compiler import GPUTarget
 from triton.backends.ppu.compiler import PPUBackend
 
 _PPU0010_TARGET = GPUTarget("cuda", 80, 32)
+_NATIVE_FP8_COMPAT_TARGET = GPUTarget("cuda", 90, 32)
 _SIGNATURE = {"src": "*fp32", "dst": "*fp8e4nv", "BLOCK": "constexpr"}
 _CONSTANTS = {"BLOCK": 64}
 
@@ -26,7 +27,7 @@ def _fp8e4m3_to_fp32(src, dst, BLOCK: tl.constexpr):
     tl.store(dst + offsets, values.to(tl.float32))
 
 
-def _compile_through_llir(kernel, signature):
+def _compile_through_llir(kernel, signature, target=_PPU0010_TARGET):
     previous_hook = knobs.runtime.add_stages_inspection_hook
 
     def stop_before_hgbin(_backend, stages, _options, _language, _capability):
@@ -35,14 +36,30 @@ def _compile_through_llir(kernel, signature):
     knobs.runtime.add_stages_inspection_hook = stop_before_hgbin
     try:
         src = triton.compiler.ASTSource(fn=kernel, signature=signature, constexprs=_CONSTANTS)
-        return triton.compile(src, target=_PPU0010_TARGET)
+        return triton.compile(src, target=target)
     finally:
         knobs.runtime.add_stages_inspection_hook = previous_hook
 
 
-def test_ppu0010_advertises_fp8e4m3():
-    options = PPUBackend(_PPU0010_TARGET).parse_options({})
-    assert "fp8e4nv" in options.supported_fp8_dtypes
+@pytest.mark.parametrize(
+    "capability, expected",
+    [
+        (80, True),
+        (88, False),
+        (89, True),
+        (90, True),
+    ],
+)
+def test_ppu_advertises_fp8e4m3_by_capability(capability, expected):
+    target = GPUTarget("cuda", capability, 32)
+    options = PPUBackend(target).parse_options({})
+    assert ("fp8e4nv" in options.supported_fp8_dtypes) is expected
+
+
+def test_ppu_rejects_fp8e4m3_override_on_unsupported_capability():
+    target = GPUTarget("cuda", 88, 32)
+    with pytest.raises(ValueError, match="only supported on PPU capability 80 or >= 89"):
+        PPUBackend(target).parse_options({"supported_fp8_dtypes": ("fp8e4nv", )})
 
 
 def test_ppu0010_lowers_fp8e4m3_conversions_to_llir():
@@ -54,6 +71,12 @@ def test_ppu0010_lowers_fp8e4m3_conversions_to_llir():
     upcast = _compile_through_llir(_fp8e4m3_to_fp32, upcast_signature)
     assert "f8E4M3FN" in upcast.asm["ttir"]
     assert "e4m3x2" not in upcast.asm["llir"]
+
+
+def test_newer_ppu_capability_keeps_native_fp8e4m3_lowering():
+    compiled = _compile_through_llir(_fp_to_fp8e4m3, _SIGNATURE, target=_NATIVE_FP8_COMPAT_TARGET)
+    assert "f8E4M3FN" in compiled.asm["ttir"]
+    assert "e4m3x2" in compiled.asm["llir"]
 
 
 def test_issue_975_fp32_to_fp8e4m3fn_store(device):

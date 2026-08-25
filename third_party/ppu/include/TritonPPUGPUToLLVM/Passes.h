@@ -42,8 +42,7 @@ namespace triton {
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertTritonGPUToLLVMPPUPass();
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertTritonGPUToLLVMPPUPass(int32_t computeCapability,
-                                    bool enableFp8E4M3);
+createConvertTritonGPUToLLVMPPUPass(int32_t computeCapability);
 std::unique_ptr<OperationPass<ModuleOp>>
 createAllocateSharedMemoryPPUPass(int32_t computeCapability);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertLibdeviceFuncToPPUPass();

@@ -226,13 +226,16 @@ class PPUBackend(BaseBackend):
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
 
+        supports_fp8e4m3 = capability == 80 or capability >= 89
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(HGGCOptions.supported_fp8_dtypes)
             # ppu0010 uses the software conversion lowering added by this backend;
             # newer targets keep using their existing native conversion path.
-            if capability == 80 or capability >= 89:
+            if supports_fp8e4m3:
                 supported_fp8_dtypes.add("fp8e4nv")
             args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
+        elif "fp8e4nv" in args["supported_fp8_dtypes"] and not supports_fp8e4m3:
+            raise ValueError("fp8e4nv is only supported on PPU capability 80 or >= 89")
 
         if "deprecated_fp8_dot_operand_dtypes" not in args:
             if capability >= 90:
@@ -394,8 +397,7 @@ class PPUBackend(BaseBackend):
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if PPUBackend.instrumentation:
             PPUBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
-        enable_fp8e4m3 = "fp8e4nv" in options.supported_fp8_dtypes
-        ppu.passes.ttgpuir.add_to_llvmir(pm, capability, enable_fp8e4m3)
+        ppu.passes.ttgpuir.add_to_llvmir(pm, capability)
         ppu.passes.ttgpuir.add_convert_libdevice_func_to_ppu(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)

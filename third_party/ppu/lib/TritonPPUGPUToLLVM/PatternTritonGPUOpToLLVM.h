@@ -53,7 +53,7 @@ void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
 void populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, int computeCapability,
-    bool enableFp8E4M3, const TargetInfo &targetInfo, PatternBenefit benefit);
+    const TargetInfo &targetInfo, PatternBenefit benefit);
 
 void populateFp4ToFpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                    RewritePatternSet &patterns,

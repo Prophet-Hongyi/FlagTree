@@ -551,10 +551,10 @@ struct FpToFpOpConversion
 
   explicit FpToFpOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
-                              int computeCapability, bool enableFp8E4M3,
+                              int computeCapability,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
-        computeCapability(computeCapability), enableFp8E4M3(enableFp8E4M3) {}
+        computeCapability(computeCapability) {}
 
   static Value convertFp16ToFp32(Location loc,
                                  ConversionPatternRewriter &rewriter,
@@ -626,13 +626,9 @@ struct FpToFpOpConversion
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
-    if (!enableFp8E4M3 && (llvm::isa<Float8E4M3FNType>(srcTy) ||
-                           llvm::isa<Float8E4M3FNType>(dstTy))) {
-      llvm::report_fatal_error(
-          "Conversion from/to f8e4m3nv is disabled for this PPU target\n");
-    }
-
-    if (computeCapability < 89) {
+    bool involvesFp8E4M3 = llvm::isa<Float8E4M3FNType>(srcTy) ||
+                           llvm::isa<Float8E4M3FNType>(dstTy);
+    if (computeCapability == 80) {
       if (llvm::isa<Float8E4M3FNType>(dstTy) &&
           roundingMode == RoundingMode::RTNE) {
         if (srcTy.isF32())
@@ -648,6 +644,16 @@ struct FpToFpOpConversion
         if (dstTy.isBF16())
           return {upcastFp8E4M3FNToBf16Software, 4};
       }
+    }
+    if (involvesFp8E4M3 && computeCapability < 89) {
+      if (computeCapability == 80) {
+        llvm::report_fatal_error(
+            "Unsupported f8e4m3nv conversion on PPU capability 80; only "
+            "FP32/FP16/BF16 RTNE encode and FP16/BF16 decode are supported\n");
+      }
+      llvm::report_fatal_error(
+          "Conversion from/to f8e4m3nv is only supported on PPU capability "
+          "80 or >= 89\n");
     }
 
     static DenseMap<std::tuple<TypeID, TypeID, RoundingMode>, Fp8ConversionDesc>
@@ -746,8 +752,7 @@ struct FpToFpOpConversion
     }
 
     bool useSoftwareFp8E4M3Downcast =
-        enableFp8E4M3 && computeCapability < 89 &&
-        llvm::isa<Float8E4M3FNType>(dstElementType);
+        computeCapability == 80 && llvm::isa<Float8E4M3FNType>(dstElementType);
     bool useFP16IntermediateSrc =
         srcElementType.isF32() && !useSoftwareFp8E4M3Downcast &&
         (!(computeCapability >= 89 &&
@@ -778,7 +783,6 @@ struct FpToFpOpConversion
 
 private:
   int computeCapability;
-  bool enableFp8E4M3;
 };
 
 struct FDivOpConversion
@@ -1074,7 +1078,7 @@ private:
 void mlir::triton::ppu::populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, int computeCapability,
-    bool enableFp8E4M3, const TargetInfo &targetInfo, PatternBenefit benefit) {
+    const TargetInfo &targetInfo, PatternBenefit benefit) {
   using namespace mlir::triton::gpu;
 
   mlir::triton::populateElementwiseOpToLLVMPatterns(
@@ -1102,7 +1106,7 @@ void mlir::triton::ppu::populateElementwiseOpToLLVMPatterns(
   patterns.add<SIToFPOpConversion>(typeConverter, axisInfoAnalysis,
                                    computeCapability, benefit);
   patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
-                                   computeCapability, enableFp8E4M3, benefit);
+                                   computeCapability, benefit);
 
   // ExpOpConversionApprox will try using ex2.approx if the input type is
   // FP32. For other input types, ExpOpConversionApprox will return failure and
