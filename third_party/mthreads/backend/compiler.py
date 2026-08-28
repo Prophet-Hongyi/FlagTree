@@ -109,6 +109,14 @@ def _max_static_shared_memory_from_arch(arch: object) -> Optional[int]:
     return None
 
 
+def _effective_atomic_writeback_ratio() -> int:
+    """Return the atomic policy only when its owning RLC phase can run."""
+    musa = knobs.musa
+    if not musa.rlc_enhance or not (int(musa.rlc_phase_mask) & 0b0100):
+        return 0
+    return int(getattr(musa, "rlc_atomic_writeback_max_elements_per_thread_ratio", 0) or 0)
+
+
 def _apply_musa_rlc_policy(mod) -> None:
     """Set optional ttg.rlc-* module attrs. Zero keeps C++ conservative defaults."""
     if not knobs.musa.rlc_enhance:
@@ -123,6 +131,8 @@ def _apply_musa_rlc_policy(mod) -> None:
         ("ttg.rlc-cached-load-cost-per-byte", getattr(musa, "rlc_cached_load_cost_per_byte", 0)),
         ("ttg.rlc-expensive-math-cost-per-byte", getattr(musa, "rlc_expensive_math_cost_per_byte", 0)),
         ("ttg.rlc-inter-warp-reduce-cost", getattr(musa, "rlc_inter_warp_reduce_cost", 0)),
+        ("ttg.rlc-atomic-writeback-max-elements-per-thread-ratio",
+         _effective_atomic_writeback_ratio()),
     )
     for name, value in overrides:
         if value and int(value) > 0:
@@ -146,6 +156,7 @@ def _rlc_policy_signature() -> str:
         str(int(getattr(musa, "rlc_cached_load_cost_per_byte", 0) or 0)),
         str(int(getattr(musa, "rlc_expensive_math_cost_per_byte", 0) or 0)),
         str(int(getattr(musa, "rlc_inter_warp_reduce_cost", 0) or 0)),
+        str(_effective_atomic_writeback_ratio()),
     ])
 
 

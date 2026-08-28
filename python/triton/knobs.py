@@ -723,6 +723,11 @@ class musa_knobs(base_knobs):
     rlc_cached_load_cost_per_byte: env_int = env_int("FLAGTREE_MUSA_RLC_CACHED_LOAD_COST_PER_BYTE", 0)
     rlc_expensive_math_cost_per_byte: env_int = env_int("FLAGTREE_MUSA_RLC_EXPENSIVE_MATH_COST_PER_BYTE", 0)
     rlc_inter_warp_reduce_cost: env_int = env_int("FLAGTREE_MUSA_RLC_INTER_WARP_REDUCE_COST", 0)
+    # MUSA scalarizes atomic tensor elements in one thread. Keep Phase 2 from
+    # increasing that per-thread atomic count; the RLC master switch remains
+    # default-off, and Phase 3 MMA atomic rematerialization is unaffected.
+    rlc_atomic_writeback_max_elements_per_thread_ratio: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_ATOMIC_WRITEBACK_MAX_ELEMS_PER_THREAD_RATIO", 1)
 
 
 # flagtree ppu
