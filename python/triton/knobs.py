@@ -649,6 +649,10 @@ class metax_knobs(base_knobs):
     mlir_translate_path = os.path.join(mxgpu_llvm_path, "mlir-translate") if mxgpu_llvm_path and use_maca else None
     mxcc_path = os.path.join(mxgpu_llvm_path, "mxcc") if mxgpu_llvm_path and use_maca else None
     mlir_opt_path = os.path.join(maca_path, "mxgpu_llvm", "bin", "mlir-opt") if use_maca else None
+    # Compile the portable RLC phases into MetaX builds, but keep them disabled
+    # until backend-specific IR, correctness, and performance gates pass.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_METAX_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_METAX_RLC_PHASE_MASK", 0xF)
 
 
 # flagtree mthreads

@@ -86,6 +86,10 @@ macro(flagtree_configure_options)
     set(FLAGTREE_TLE OFF)
     remove_definitions(-D__TLE__)
     list(REMOVE_ITEM LLVM_TABLEGEN_FLAGS -D__TLE__)
+    # Build the portable phased RLC implementation for MetaX. The MetaX
+    # runtime knob remains default-off until IR, device, and performance
+    # gates are qualified on MC550.
+    add_definitions(-D__FLAGTREE_RLC_ENHANCE__)
   elseif(FLAGTREE_BACKEND STREQUAL "sunrise")
     find_package(Python3 3.10 REQUIRED COMPONENTS Development.Module Interpreter)
   elseif(FLAGTREE_BACKEND STREQUAL "ppu")
