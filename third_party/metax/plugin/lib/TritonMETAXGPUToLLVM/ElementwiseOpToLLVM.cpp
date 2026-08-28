@@ -637,13 +637,17 @@ struct FpToFpOpConversion
     : public ElementwiseOpConversionBase<triton::FpToFpOp, FpToFpOpConversion> {
   using ElementwiseOpConversionBase<
       triton::FpToFpOp, FpToFpOpConversion>::ElementwiseOpConversionBase;
+  using ConversionKey = std::tuple<TypeID, TypeID, RoundingMode>;
+  using ConversionMap =
+      DenseMap<ConversionKey, std::pair<ConverterT, size_t>>;
 
   explicit FpToFpOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
                               int computeCapability,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
-        computeCapability(computeCapability) {}
+        computeCapability(computeCapability),
+        conversionFuncs(buildConversionMap(computeCapability)) {}
 
   static Value convertFp16ToFp32(Location loc,
                                  ConversionPatternRewriter &rewriter,
@@ -1471,9 +1475,7 @@ struct FpToFpOpConversion
                : std::make_pair(Bf16_to_Fp8E4M3FN_RTNE_SW, 2);
   }
 
-  std::pair<ConverterT, size_t>
-  getConversionFunc(Type srcTy, Type dstTy,
-                    std::optional<RoundingMode> roundingMode) const {
+  static ConversionMap buildConversionMap(int computeCapability) {
     auto F8E4M3B15TyID = TypeID::get<mlir::Float8E4M3B11FNUZType>();
     auto F8E4M3FNUZTyID = TypeID::get<mlir::Float8E4M3FNUZType>();
     auto F8E5M2FNUZTyID = TypeID::get<mlir::Float8E5M2FNUZType>();
@@ -1486,56 +1488,62 @@ struct FpToFpOpConversion
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
-    static DenseMap<std::tuple<TypeID, TypeID, RoundingMode>,
-                    std::pair<ConverterT, size_t>>
-        srcMap = {
-            // F8 -> F16
-            {{F8E4M3FNTyID, F16TyID, undefRounding},
-             Fp8E4M3FN_to_Fp16(computeCapability)},
-            {{F8E4M3FNUZTyID, F16TyID, undefRounding},
-             std::make_pair(Fp8E4M3FNUZ_to_Fp16, 2)},
-            {{F8E5M2TyID, F16TyID, undefRounding},
-             Fp8E5M2_to_Fp16(computeCapability)},
-            {{F8E5M2FNUZTyID, F16TyID, undefRounding},
-             std::make_pair(Fp8E5M2FNUZ_to_Fp16, 2)},
-            // F8 -> BF16
-            {{F8E5M2TyID, BF16TyID, undefRounding},
-             std::make_pair(Fp8E5M2_to_Bf16, 4)},
-            {{F8E4M3FNTyID, BF16TyID, undefRounding},
-             Fp8E4M3FN_to_Bf16(computeCapability)},
-            // F16 -> F8
-            {{F16TyID, F8E4M3FNTyID, RoundingMode::RTNE},
-             Fp16_to_Fp8E4M3FN(computeCapability)},
-            {{F16TyID, F8E5M2TyID, RoundingMode::RTNE},
-             Fp16_to_Fp8E5M2(computeCapability)},
-            // BF16 -> F8
-            {{BF16TyID, F8E4M3FNTyID, RoundingMode::RTNE},
-             Bf16_to_Fp8E4M3FN(computeCapability)},
-            // F32 <-> F8
-            {{F32TyID, F8E4M3FNTyID, RoundingMode::RTNE},
-             Fp32_to_Fp8E4M3FN_RTNE(computeCapability)},
-            {{F32TyID, F8E5M2TyID, RoundingMode::RTNE},
-             Fp32_to_Fp8E5M2_RTNE(computeCapability)},
-            {{F32TyID, F8E4M3FNUZTyID, RoundingMode::RTNE},
-             Fp32_to_Fp8E4M3FNUZ_RTNE(computeCapability)},
-            {{F32TyID, F8E5M2FNUZTyID, RoundingMode::RTNE},
-             Fp32_to_Fp8E5M2FNUZ_RTNE(computeCapability)},
-            {{F32TyID, F8E5M2TyID, RoundingMode::RTZ},
-             std::make_pair(Fp32ToFp8E5M2RTZ, 2)},
-            {{F8E4M3FNUZTyID, F32TyID, undefRounding},
-             std::make_pair(Fp8E4M3FNUZ_to_Fp32, 2)},
-            {{F8E4M3FNTyID, F32TyID, undefRounding},
-             std::make_pair(Fp8E4M3FN_to_Fp32, 2)},
-            {{F8E5M2FNUZTyID, F32TyID, undefRounding},
-             std::make_pair(Fp8E5M2FNUZ_to_Fp32, 2)},
-            {{F8E5M2TyID, F32TyID, undefRounding},
-             std::make_pair(Fp8E5M2_to_Fp32, 4)},
-        };
+    ConversionMap srcMap = {
+        // F8 -> F16
+        {{F8E4M3FNTyID, F16TyID, undefRounding},
+         Fp8E4M3FN_to_Fp16(computeCapability)},
+        {{F8E4M3FNUZTyID, F16TyID, undefRounding},
+         std::make_pair(Fp8E4M3FNUZ_to_Fp16, 2)},
+        {{F8E5M2TyID, F16TyID, undefRounding},
+         Fp8E5M2_to_Fp16(computeCapability)},
+        {{F8E5M2FNUZTyID, F16TyID, undefRounding},
+         std::make_pair(Fp8E5M2FNUZ_to_Fp16, 2)},
+        // F8 -> BF16
+        {{F8E5M2TyID, BF16TyID, undefRounding},
+         std::make_pair(Fp8E5M2_to_Bf16, 4)},
+        {{F8E4M3FNTyID, BF16TyID, undefRounding},
+         Fp8E4M3FN_to_Bf16(computeCapability)},
+        // F16 -> F8
+        {{F16TyID, F8E4M3FNTyID, RoundingMode::RTNE},
+         Fp16_to_Fp8E4M3FN(computeCapability)},
+        {{F16TyID, F8E5M2TyID, RoundingMode::RTNE},
+         Fp16_to_Fp8E5M2(computeCapability)},
+        // BF16 -> F8
+        {{BF16TyID, F8E4M3FNTyID, RoundingMode::RTNE},
+         Bf16_to_Fp8E4M3FN(computeCapability)},
+        // F32 <-> F8
+        {{F32TyID, F8E4M3FNTyID, RoundingMode::RTNE},
+         Fp32_to_Fp8E4M3FN_RTNE(computeCapability)},
+        {{F32TyID, F8E5M2TyID, RoundingMode::RTNE},
+         Fp32_to_Fp8E5M2_RTNE(computeCapability)},
+        {{F32TyID, F8E4M3FNUZTyID, RoundingMode::RTNE},
+         Fp32_to_Fp8E4M3FNUZ_RTNE(computeCapability)},
+        {{F32TyID, F8E5M2FNUZTyID, RoundingMode::RTNE},
+         Fp32_to_Fp8E5M2FNUZ_RTNE(computeCapability)},
+        {{F32TyID, F8E5M2TyID, RoundingMode::RTZ},
+         std::make_pair(Fp32ToFp8E5M2RTZ, 2)},
+        {{F8E4M3FNUZTyID, F32TyID, undefRounding},
+         std::make_pair(Fp8E4M3FNUZ_to_Fp32, 2)},
+        {{F8E4M3FNTyID, F32TyID, undefRounding},
+         std::make_pair(Fp8E4M3FN_to_Fp32, 2)},
+        {{F8E5M2FNUZTyID, F32TyID, undefRounding},
+         std::make_pair(Fp8E5M2FNUZ_to_Fp32, 2)},
+        {{F8E5M2TyID, F32TyID, undefRounding},
+         std::make_pair(Fp8E5M2_to_Fp32, 4)},
+    };
 
-    std::tuple<TypeID, TypeID, RoundingMode> key = {
+    return srcMap;
+  }
+
+  std::pair<ConverterT, size_t>
+  getConversionFunc(Type srcTy, Type dstTy,
+                    std::optional<RoundingMode> roundingMode) const {
+    auto undefRounding = static_cast<RoundingMode>(-1);
+
+    ConversionKey key = {
         srcTy.getTypeID(), dstTy.getTypeID(),
         roundingMode.value_or(undefRounding)};
-    if (srcMap.count(key) == 0) {
+    if (conversionFuncs.count(key) == 0) {
       llvm::errs() << "Unsupported conversion from " << srcTy << " to "
                    << dstTy;
       if (roundingMode.has_value())
@@ -1544,7 +1552,7 @@ struct FpToFpOpConversion
       llvm::errs() << "\n";
       llvm::report_fatal_error("Unsupported rounding mode for conversion.");
     }
-    auto cvtPair = srcMap.lookup(key);
+    auto cvtPair = conversionFuncs.lookup(key);
     return cvtPair;
   }
 
@@ -1624,6 +1632,7 @@ struct FpToFpOpConversion
 
 private:
   int computeCapability;
+  ConversionMap conversionFuncs;
 };
 
 template <typename OP>

@@ -32,6 +32,14 @@ _FP8_FORMATS = (
         torch.tensor([0xC0, 0xBC, 0x00, 0x3C, 0x40], dtype=torch.uint8),
     ),
 )
+_FP8_TORCH_DTYPES = {
+    "fp8e4nv": torch.float8_e4m3fn,
+    "fp8e5": torch.float8_e5m2,
+}
+_FP8_DOWNCAST_CASES = (
+    ("fp8e4nv", "llvm.mxc.cvt.pk4.f32tof8.cfg"),
+    ("fp8e5", "llvm.mxc.cvt.pk4.f32tobf8.cfg"),
+)
 
 
 @triton.jit
@@ -46,6 +54,35 @@ def _metax_fp8_dot_kernel(lhs, rhs, out):
     tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _metax_fp8_dot_fp8_output_kernel(lhs, rhs, out, OUTPUT_DTYPE: tl.constexpr):
+    offsets_m = tl.arange(0, 16)
+    offsets_n = tl.arange(0, 16)
+    offsets_k = tl.arange(0, 32)
+    a = tl.load(lhs + offsets_m[:, None] * 32 + offsets_k[None, :])
+    b = tl.load(rhs + offsets_k[:, None] * 16 + offsets_n[None, :])
+    acc = tl.zeros((16, 16), dtype=tl.float32)
+    result = tl.dot(a, b, acc, out_dtype=tl.float32)
+    result = result.to(OUTPUT_DTYPE, fp_downcast_rounding="rtne")
+    tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
+
+
+@triton.jit
+def _metax_downcast_e4(src, dst):
+    offsets = tl.arange(0, 128)
+    values = tl.load(src + offsets)
+    result = values.to(tl.float8e4nv, fp_downcast_rounding="rtne")
+    tl.store(dst + offsets, result)
+
+
+@triton.jit
+def _metax_downcast_e5(src, dst):
+    offsets = tl.arange(0, 128)
+    values = tl.load(src + offsets)
+    result = values.to(tl.float8e5, fp_downcast_rounding="rtne")
+    tl.store(dst + offsets, result)
+
+
 def _compile_c550(dtype_name):
     src = ASTSource(
         fn=_metax_fp8_dot_kernel,
@@ -58,6 +95,19 @@ def _compile_c550(dtype_name):
     )
 
 
+def _compile_downcast(dtype_name, arch):
+    kernel = _metax_downcast_e4 if dtype_name == "fp8e4nv" else _metax_downcast_e5
+    src = ASTSource(
+        fn=kernel,
+        signature={"src": "*fp32", "dst": f"*{dtype_name}"},
+    )
+    return triton.compile(
+        src,
+        target=GPUTarget("maca", arch, 64),
+        options={"num_warps": 4, "num_stages": 1},
+    )
+
+
 @pytest.mark.parametrize("dtype_name", [case[0] for case in _FP8_FORMATS])
 def test_c550_fp8_dot_uses_software_upcast_and_fp16_mma(dtype_name):
     compiled = _compile_c550(dtype_name)
@@ -66,6 +116,17 @@ def test_c550_fp8_dot_uses_software_upcast_and_fp16_mma(dtype_name):
     assert "llvm.mxc.mma.f32.16x16x32f8" not in compiled.asm["llir"]
     assert "llvm.mxc.mma.f32.16x16x32bf8" not in compiled.asm["llir"]
     assert compiled.asm["mcfatbin"]
+
+
+@pytest.mark.parametrize("dtype_name,hardware_intrinsic", _FP8_DOWNCAST_CASES)
+def test_fp8_conversion_selector_is_target_local(dtype_name, hardware_intrinsic):
+    native = _compile_downcast(dtype_name, 89)
+    c550 = _compile_downcast(dtype_name, 80)
+
+    assert hardware_intrinsic in native.asm["llir"]
+    assert hardware_intrinsic not in c550.asm["llir"]
+    assert native.asm["mcfatbin"]
+    assert c550.asm["mcfatbin"]
 
 
 @pytest.mark.parametrize("dtype_name,triton_dtype,codes", _FP8_FORMATS)
@@ -100,3 +161,43 @@ def test_c550_fp8_dot_device(dtype_name, triton_dtype, codes):
     assert "llvm.mxc.mma.f32.16x16x16f16" in compiled.asm["llir"]
     assert "llvm.mxc.mma.f32.16x16x32f8" not in compiled.asm["llir"]
     assert "llvm.mxc.mma.f32.16x16x32bf8" not in compiled.asm["llir"]
+
+
+@pytest.mark.parametrize("dtype_name,triton_dtype,codes", _FP8_FORMATS)
+def test_c550_fp8_dot_fp8_output_device(dtype_name, triton_dtype, codes):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a MetaX device")
+
+    target = triton.runtime.driver.active.get_current_target()
+    if target.backend != "maca" or target.arch != 80:
+        pytest.skip("requires a C550 / maca arch 80 target")
+
+    values = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    lhs_index = ((torch.arange(16 * 32) * 7 + 3) % len(codes)).reshape(16, 32)
+    rhs_index = ((torch.arange(32 * 16) * 11 + 1) % len(codes)).reshape(32, 16)
+    lhs_raw = codes[lhs_index].to("cuda")
+    rhs_raw = codes[rhs_index].to("cuda")
+    output_raw = torch.empty((16, 16), dtype=torch.uint8, device="cuda")
+
+    compiled = _metax_fp8_dot_fp8_output_kernel[(1, )](
+        triton.reinterpret(lhs_raw, triton_dtype),
+        triton.reinterpret(rhs_raw, triton_dtype),
+        triton.reinterpret(output_raw, triton_dtype),
+        OUTPUT_DTYPE=triton_dtype,
+        num_warps=4,
+        num_stages=1,
+    )
+    torch.cuda.synchronize()
+
+    expected = values[lhs_index] @ values[rhs_index]
+    expected_raw = expected.to(_FP8_TORCH_DTYPES[dtype_name]).view(torch.uint8)
+    actual_raw = output_raw.cpu()
+    raw_mismatch = actual_raw != expected_raw
+    both_are_zero = ((actual_raw & 0x7F) == 0) & ((expected_raw & 0x7F) == 0)
+    assert not torch.any(raw_mismatch & ~both_are_zero)
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 3
+    assert "llvm.mxc.mma.f32.16x16x16f16" in compiled.asm["llir"]
+    assert "llvm.mxc.mma.f32.16x16x32f8" not in compiled.asm["llir"]
+    assert "llvm.mxc.mma.f32.16x16x32bf8" not in compiled.asm["llir"]
+    for _, hardware_intrinsic in _FP8_DOWNCAST_CASES:
+        assert hardware_intrinsic not in compiled.asm["llir"]
