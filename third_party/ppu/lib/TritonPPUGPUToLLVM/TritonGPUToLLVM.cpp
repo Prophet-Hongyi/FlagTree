@@ -321,6 +321,8 @@ struct ConvertTritonGPUToLLVMPPU
     populateElementwiseOpToLLVMPatterns(typeConverter, patterns,
                                         axisInfoAnalysis, computeCapability,
                                         targetInfo, benefit);
+    populateFpCastOpToLLVMPatterns(typeConverter, patterns, axisInfoAnalysis,
+                                   computeCapability, benefit);
     populateClampFOpToLLVMPattern(typeConverter, patterns, axisInfoAnalysis,
                                   computeCapability,
                                   patternBenefitClampOptimizedPattern);
