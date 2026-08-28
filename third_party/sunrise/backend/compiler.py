@@ -16,6 +16,14 @@ import math
 import subprocess
 from pathlib import Path
 
+from ._rlc import (
+    RLC_OPTION_NAMES,
+    RLC_POLICY_FIELDS,
+    rlc_policy_signature as _make_rlc_policy_signature,
+    validate_rlc_arch,
+    validate_rlc_phase_mask,
+)
+
 
 class sunrise_knobs(base_knobs):
     lld_path: env_opt_str = env_opt_str("TRITON_SUNRISE_LLD_PATH")
@@ -26,6 +34,26 @@ class sunrise_knobs(base_knobs):
 
 
 knobs_sunrise = sunrise_knobs()
+
+
+def _rlc_policy_signature():
+    """Return the live RLC identity consulted before options are packed."""
+    return _make_rlc_policy_signature(knobs.sunrise)
+
+
+def _apply_sunrise_rlc_policy(mod, options):
+    """Attach Sunrise legality and positive cost policy to the TTGPU module."""
+    builder = ir.builder(mod.context)
+    mod.set_attr(
+        "ttg.rlc-preserve-narrowing-trunc-layouts",
+        builder.get_bool_attr(options.rlc_preserve_narrowing_trunc_layouts),
+    )
+    if not options.rlc_enhance:
+        return
+    for option_name, attribute_name in RLC_POLICY_FIELDS:
+        value = int(getattr(options, option_name))
+        if value > 0:
+            mod.set_attr(attribute_name, builder.get_int32_attr(value))
 
 
 def min_dot_size(target: GPUTarget):
@@ -50,11 +78,25 @@ class SunriseOptions:
     sanitize_overflow: bool = True
     arch: str = None
     instrumentation_mode: str = ""
+    rlc_enhance: bool = False
+    rlc_phase_mask: int = 0xF
+    rlc_minimum_writeback_bits: int = 0
+    rlc_convert_minimum_elements: int = 0
+    rlc_convert_minimum_element_bits: int = 0
+    rlc_convert_cost_per_byte: int = 0
+    rlc_cached_load_cost_per_byte: int = 0
+    rlc_expensive_math_cost_per_byte: int = 0
+    rlc_inter_warp_reduce_cost: int = 0
+    rlc_preserve_narrowing_trunc_layouts: bool = True
+    rlc_policy: str = ""
 
     # libdivice库,需要区分S2/S3；
     def __post_init__(self):
         warp_size = 32
         object.__setattr__(self, 'warp_size', warp_size)
+        object.__setattr__(self, 'rlc_phase_mask', validate_rlc_phase_mask(self.rlc_phase_mask))
+        validate_rlc_arch(self.arch, self.rlc_enhance)
+        object.__setattr__(self, 'rlc_policy', _make_rlc_policy_signature(self))
         default_libdir = Path(__file__).parent / 'lib'
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         lib_ver = 'S2'
@@ -105,6 +147,11 @@ class SunriseBackend(BaseBackend):
         args["max_num_imprecise_acc_default"] = 0  # TODO
         args.update({k: opts[k] for k in SunriseOptions.__dataclass_fields__.keys() \
                      if k in opts and opts[k] is not None})
+        for name in RLC_OPTION_NAMES:
+            args.setdefault(name, getattr(knobs.sunrise, name))
+        # This is target legality, not an experiment knob. Keep the historical
+        # Sunrise 32->16/8-bit truncation protection in every cell, including off.
+        args["rlc_preserve_narrowing_trunc_layouts"] = True
         return SunriseOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -210,6 +257,8 @@ class SunriseBackend(BaseBackend):
     @staticmethod
     def make_ttgir(mod, metadata, opt):
         num_stages = opt.num_stages if opt.num_stages <= 3 else 3
+        validate_rlc_arch(opt.arch, opt.rlc_enhance)
+        _apply_sunrise_rlc_policy(mod, opt)
         # TTIR -> TTGIR
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -229,7 +278,7 @@ class SunriseBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_process_shared_memory_hint(pm)  # flagtree hints (#@hint: shared_memory)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, opt.rlc_enhance, opt.rlc_phase_mask)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         # begin flagtree tle: local pointer (tle.gpu.local_ptr / alloc) support.
         # These passes are target-independent (live in third_party/tle) and lower
@@ -251,7 +300,7 @@ class SunriseBackend(BaseBackend):
         else:
             sunrise.passes.ttgpuir.add_accelerate_matmul(pm, 1, 0)  # 版本：1.0
             # sunrise.passes.ttgpuir.add_mma_direct_store(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, opt.rlc_enhance, opt.rlc_phase_mask)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttir.add_loop_aware_cse(pm)
 
@@ -453,8 +502,9 @@ class SunriseBackend(BaseBackend):
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
-    @functools.lru_cache()
     def hash(self):
         version = subprocess.check_output([SunriseBackend.path_to_clang_offload_bundler(), "--version"],
                                           encoding='utf-8')
-        return f'{version}-{self.target.arch}'
+        # JIT queries backend.hash() before SunriseOptions is materialized, so
+        # this must remain live across off/mask/all benchmark processes.
+        return f'{version}-{self.target.arch}-rlc{_rlc_policy_signature()}'
