@@ -1484,7 +1484,11 @@ PLUGIN_EXPORT void init_triton_ir(py::module &&m) {
       // Input/Output
       .def("create_load",
            [](TritonOpBuilder &self, Value &ptrs, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              std::optional<std::string> flagtree_hints) -> Value {
+             // Keep the unified Python builder ABI while targeting the older
+             // MetaX LoadOp, whose ODS does not yet carry flagtree_hints.
+             (void)flagtree_hints;
              return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
                                         isVolatile);
            })
@@ -1499,7 +1503,11 @@ PLUGIN_EXPORT void init_triton_ir(py::module &&m) {
               std::vector<int32_t> &boundaryCheck,
               std::optional<PaddingOption> paddingOption,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> Value {
+              bool isVolatile,
+              std::optional<std::string> flagtree_hints) -> Value {
+             // MetaX accepts the unified frontend argument at the binding
+             // boundary; its older LoadOp intentionally ignores the hint.
+             (void)flagtree_hints;
              return self.create<LoadOp>(ptr, boundaryCheck, paddingOption,
                                         cacheModifier, evictionPolicy,
                                         isVolatile);
@@ -1514,7 +1522,11 @@ PLUGIN_EXPORT void init_triton_ir(py::module &&m) {
       .def("create_masked_load",
            [](TritonOpBuilder &self, Value &ptrs, Value &mask,
               std::optional<Value> &other, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              std::optional<std::string> flagtree_hints) -> Value {
+             // See create_load: preserve call compatibility without claiming
+             // that this vendor IR revision implements hint semantics.
+             (void)flagtree_hints;
              return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
                                         cacheModifier, evictionPolicy,
                                         isVolatile);

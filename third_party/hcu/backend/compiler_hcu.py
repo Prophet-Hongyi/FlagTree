@@ -14,6 +14,11 @@ import warnings
 import os
 from pathlib import Path
 
+from .llvm17_compat import (
+    LLVM17ContractBridgeStats,
+    bridge_gfx936_llvm17_contract,
+)
+
 
 def get_min_dot_size(target: GPUTarget):
     # We fallback to use FMA and cast arguments if certain configurations is
@@ -28,6 +33,74 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 def is_in_thread_transpose_enabled(arch):
     return (arch == "gfx942") if knobs.hcu.use_in_thread_transpose is None else knobs.hcu.use_in_thread_transpose
+
+
+def _rlc_policy_signature() -> str:
+    """Live RLC identity for disk and in-memory compile keys.
+
+    Must be read on every compile. Do not cache this string across
+    FLAGTREE_HCU_RLC_* environment changes in the same process.
+    """
+    return (f"{int(bool(knobs.hcu.rlc_enhance))}-{int(knobs.hcu.rlc_phase_mask)}-"
+            f"{int(bool(knobs.hcu.rlc_allow_atomic_writeback_order_change))}-"
+            f"{int(bool(knobs.hcu.gfx936_f16_pair_materialize))}-"
+            f"{int(bool(knobs.hcu.gfx936_f32_box_muller_pair_materialize))}")
+
+
+def _apply_hcu_rlc_policy(mod) -> None:
+    """Attach only explicitly enabled HCU policy relaxations to fresh TTGIR."""
+    if knobs.hcu.rlc_allow_atomic_writeback_order_change:
+        mod.set_attr(
+            "ttg.rlc-allow-atomic-writeback-order-change",
+            ir.builder(mod.context).get_int32_attr(1),
+        )
+
+
+def _gfx936_codegen_signature() -> str:
+    """Live identity for the opt-in DTK17 contract bridge."""
+    return (
+        f"{int(bool(knobs.hcu.gfx936_llvm17_contract_bridge))}-"
+        f"{int(bool(knobs.hcu.gfx936_i64_vector_load_materialize))}-"
+        f"{int(bool(knobs.hcu.gfx936_i64_vector_store_materialize))}-"
+        f"{int(bool(knobs.hcu.gfx936_i64_scalar_load_materialize))}-"
+        f"{int(bool(knobs.hcu.gfx936_i64_scalar_store_materialize))}-"
+        f"{int(bool(knobs.hcu.gfx936_resource_phi_materialize))}"
+    )
+
+
+def _validate_gfx936_llvm17_bridge_assembly(
+    amdgcn: str, bridge_stats: LLVM17ContractBridgeStats
+) -> None:
+    """Prove that every bridged MMAC variant selected its DTK17 opcode."""
+    unresolved = re.search(
+        r"llvm\.(?:hcu\.mmac|amdgcn\.(?:mmac|make\.buffer|raw\.ptr\.buffer|raw\.buffer))",
+        amdgcn,
+    )
+    if unresolved is not None:
+        raise HSACOError(
+            "LLVM17 contract bridge left an unresolved intrinsic: "
+            + unresolved.group(0)
+        )
+
+    expected = {
+        "f16": bridge_stats.mmac_f16_calls,
+        "bf16": bridge_stats.mmac_bf16_calls,
+    }
+    if sum(expected.values()) != bridge_stats.mmac_calls:
+        raise HSACOError(
+            "LLVM17 contract bridge MMAC statistics are inconsistent: "
+            f"total={bridge_stats.mmac_calls} variants={expected}"
+        )
+
+    actual = {
+        "f16": amdgcn.count("v_mmac_f32_16x16x16_f16"),
+        "bf16": amdgcn.count("v_mmac_f32_16x16x16_bf16"),
+    }
+    if actual != expected:
+        raise HSACOError(
+            "LLVM17 contract bridge MMAC lowering mismatch: "
+            f"llir={expected} asm={actual}"
+        )
 
 
 @dataclass(frozen=True)
@@ -104,6 +177,13 @@ class HIPOptions:
     wdra_num_load_regs: int = None
     wdra_num_mma_regs_main: int = None
     wdra_num_mma_regs_tail: int = None
+    rlc_policy: str = ""
+    gfx936_llvm17_contract_bridge: bool = False
+    gfx936_i64_vector_load_materialize: bool = False
+    gfx936_i64_vector_store_materialize: bool = False
+    gfx936_i64_scalar_load_materialize: bool = False
+    gfx936_i64_scalar_store_materialize: bool = False
+    gfx936_resource_phi_materialize: bool = False
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -206,6 +286,76 @@ class HIPBackend(BaseBackend):
             args.pop("wdra_num_mma_regs_main", None)
             args.pop("wdra_num_mma_regs_tail", None)
 
+        args["rlc_policy"] = _rlc_policy_signature()
+        if "gfx936_llvm17_contract_bridge" not in opts:
+            args["gfx936_llvm17_contract_bridge"] = bool(knobs.hcu.gfx936_llvm17_contract_bridge)
+        if "gfx936_i64_vector_load_materialize" not in opts:
+            args["gfx936_i64_vector_load_materialize"] = bool(
+                knobs.hcu.gfx936_i64_vector_load_materialize
+            )
+        if "gfx936_i64_vector_store_materialize" not in opts:
+            args["gfx936_i64_vector_store_materialize"] = bool(
+                knobs.hcu.gfx936_i64_vector_store_materialize
+            )
+        if "gfx936_i64_scalar_load_materialize" not in opts:
+            args["gfx936_i64_scalar_load_materialize"] = bool(
+                knobs.hcu.gfx936_i64_scalar_load_materialize
+            )
+        if "gfx936_resource_phi_materialize" not in opts:
+            args["gfx936_resource_phi_materialize"] = bool(
+                knobs.hcu.gfx936_resource_phi_materialize
+            )
+        if "gfx936_i64_scalar_store_materialize" not in opts:
+            args["gfx936_i64_scalar_store_materialize"] = bool(
+                knobs.hcu.gfx936_i64_scalar_store_materialize
+            )
+        if args["gfx936_llvm17_contract_bridge"] and args["arch"] != "gfx936":
+            raise ValueError("gfx936 LLVM17 contract bridge is only valid for gfx936")
+        if args["gfx936_i64_vector_load_materialize"]:
+            if not args["gfx936_llvm17_contract_bridge"]:
+                raise ValueError(
+                    "gfx936 i64 vector-load materialization requires the LLVM17 contract bridge"
+                )
+            if args["arch"] != "gfx936":
+                raise ValueError(
+                    "gfx936 i64 vector-load materialization is only valid for gfx936"
+                )
+        if args["gfx936_i64_vector_store_materialize"]:
+            if not args["gfx936_llvm17_contract_bridge"]:
+                raise ValueError(
+                    "gfx936 i64 vector-store materialization requires the LLVM17 contract bridge"
+                )
+            if args["arch"] != "gfx936":
+                raise ValueError(
+                    "gfx936 i64 vector-store materialization is only valid for gfx936"
+                )
+        if args["gfx936_i64_scalar_load_materialize"]:
+            if not args["gfx936_llvm17_contract_bridge"]:
+                raise ValueError(
+                    "gfx936 i64 scalar-load materialization requires the LLVM17 contract bridge"
+                )
+            if args["arch"] != "gfx936":
+                raise ValueError(
+                    "gfx936 i64 scalar-load materialization is only valid for gfx936"
+                )
+        if args["gfx936_resource_phi_materialize"]:
+            if not args["gfx936_llvm17_contract_bridge"]:
+                raise ValueError(
+                    "gfx936 resource-phi materialization requires the LLVM17 contract bridge"
+                )
+            if args["arch"] != "gfx936":
+                raise ValueError(
+                    "gfx936 resource-phi materialization is only valid for gfx936"
+                )
+        if args["gfx936_i64_scalar_store_materialize"]:
+            if not args["gfx936_llvm17_contract_bridge"]:
+                raise ValueError(
+                    "gfx936 i64 scalar-store materialization requires the LLVM17 contract bridge"
+                )
+            if args["arch"] != "gfx936":
+                raise ValueError(
+                    "gfx936 i64 scalar-store materialization is only valid for gfx936"
+                )
         return HIPOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -320,6 +470,24 @@ class HIPBackend(BaseBackend):
                         "Set 'TRITON_HIP_CLANG_PATH' to its path.")
 
     @staticmethod
+    def path_to_llvm17_llc():
+        """Resolve the explicit DTK17 llc used by the gfx936 contract bridge."""
+        configured = os.getenv("TRITON_HIP_LLC_PATH")
+        if configured:
+            llc = Path(configured)
+            if llc.is_file():
+                return llc
+            raise Exception(f"TRITON_HIP_LLC_PATH is not a file: {llc}")
+        clang = HIPBackend.path_to_rocm_clang()
+        sibling = clang.parent / "llc"
+        if sibling.is_file():
+            return sibling
+        raise Exception(
+            "DTK17 llc not found next to the configured HCU clang. "
+            "Set TRITON_HIP_LLC_PATH to the product llc binary."
+        )
+
+    @staticmethod
     def _get_clang_args(metadata, options):
         arch_args = {
             "gfx928": [
@@ -414,13 +582,14 @@ class HIPBackend(BaseBackend):
         # distributed.passes.ttir.add_convert_to_ttgpuir_ext(pm, f"hip:{options.arch}", options.num_warps,
         #                                                    options.warp_size, options.num_ctas)
         pm.run(mod, 'make_ttgir_early')
+        _apply_hcu_rlc_policy(mod)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         emuTF32 = False
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_process_shared_memory_hint(pm)  # flagtree hints
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         # begin flagtree tle
         tle.passes.add_select_encodings(pm)
@@ -430,13 +599,13 @@ class HIPBackend(BaseBackend):
         # end flagtree tle
         hcu.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack,
                                                  options.mmac_layout_force)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         if options.optimize_epilogue:
             hcu.passes.ttgpuir.add_optimize_epilogue(pm)
         hcu.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
 
         hcu.passes.ttgpuir.add_mls_encoding_insertion(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
 
         hcu.passes.ttgpuir.add_hoist_layout_conversions(pm)
 
@@ -472,14 +641,14 @@ class HIPBackend(BaseBackend):
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
                 hcu.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
 
         hcu.passes.ttgpuir.add_mls_lowering_pass(pm)
 
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
             hcu.passes.ttgpuir.add_in_thread_transpose(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         hcu.passes.ttgpuir.add_reorder_instructions(pm)
         if use_block_pingpong and options.num_stages > 1:
             hcu.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -489,7 +658,7 @@ class HIPBackend(BaseBackend):
                                                    options.wasp_num_mma_warps)
             hcu.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack,
                                                      options.mmac_layout_force)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
             if options.optimize_epilogue:
                 hcu.passes.ttgpuir.add_optimize_epilogue(pm)
             passes.ttgpuir.add_optimize_dot_operands(pm, True)
@@ -636,6 +805,7 @@ class HIPBackend(BaseBackend):
         hcu.set_bool_control_constant(llvm_mod, "__oclc_finite_only_opt", False)
         hcu.set_bool_control_constant(llvm_mod, "__oclc_correctly_rounded_sqrt32", True)
         hcu.set_bool_control_constant(llvm_mod, "__oclc_unsafe_math_opt", False)
+        hcu.set_bool_control_constant(llvm_mod, "__oclc_daz_opt", options.allow_flush_denorm)
         hcu.set_bool_control_constant(llvm_mod, "__oclc_wavefrontsize64", options.warp_size == 64)
 
         # WarpSpecialize Passes would set this attribute
@@ -730,7 +900,8 @@ class HIPBackend(BaseBackend):
         # Find kernel names (there should only be one)
         # We get the name at the last possible step to accommodate `triton.compile`
         # on user-provided LLVM
-        names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", src)
+        llvm_source = str(src)
+        names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", llvm_source)
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
@@ -744,18 +915,58 @@ class HIPBackend(BaseBackend):
         # features = '-real-true16' if 'gfx11' in options.arch else ''
         # amdgcn = llvm.translate_to_asm(src, hcu.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
         #                                False)
+        llir_file = None
+        asm_file = None
         try:
+            bridge_stats = None
+            if options.gfx936_llvm17_contract_bridge:
+                if options.arch != "gfx936":
+                    raise HSACOError("LLVM17 contract bridge is only supported on gfx936")
+                llvm_source, bridge_stats = bridge_gfx936_llvm17_contract(
+                    llvm_source,
+                    materialize_i64_vector_loads=(
+                        options.gfx936_i64_vector_load_materialize
+                    ),
+                    materialize_i64_vector_stores=(
+                        options.gfx936_i64_vector_store_materialize
+                    ),
+                    materialize_i64_scalar_loads=(
+                        options.gfx936_i64_scalar_load_materialize
+                    ),
+                    materialize_i64_scalar_stores=(
+                        options.gfx936_i64_scalar_store_materialize
+                    ),
+                    materialize_resource_phis=(
+                        options.gfx936_resource_phi_materialize
+                    ),
+                )
+
             with tempfile.NamedTemporaryFile(mode='w', suffix=".ll", delete=False) as f:
                 llir_file = f.name
-                f.write(str(src))
+                f.write(llvm_source)
 
             asm_file = tempfile.mktemp(suffix=".amdgcn")
 
-            clang_path = HIPBackend.path_to_rocm_clang()
-            clang_args = HIPBackend._get_clang_args(metadata, options) + flags
+            if options.gfx936_llvm17_contract_bridge:
+                llc_path = HIPBackend.path_to_llvm17_llc()
+                target_features = "+xnack" if knobs.compilation.enable_asan else "-xnack"
+                asm_command = [
+                    llc_path,
+                    "-mtriple=amdgcn-amd-amdhsa",
+                    f"-mcpu={options.arch}",
+                    f"-mattr={target_features}",
+                    "-O3",
+                    "-filetype=asm",
+                    llir_file,
+                    "-o",
+                    asm_file,
+                ]
+            else:
+                clang_path = HIPBackend.path_to_rocm_clang()
+                clang_args = HIPBackend._get_clang_args(metadata, options) + flags
+                asm_command = [clang_path] + clang_args + [llir_file, "-S", "-o", asm_file]
 
-            # Compile to ASM
-            asm_command = [clang_path] + clang_args + [llir_file, "-S", "-o", asm_file]
+            # Compile to ASM.
             result = subprocess.run(asm_command, check=True, capture_output=True, text=True)
             if options.wdra_enabled:
                 log = result.stdout + result.stderr
@@ -763,6 +974,9 @@ class HIPBackend(BaseBackend):
 
             with open(asm_file, "r") as fd_out:
                 amdgcn = fd_out.read()
+
+            if bridge_stats is not None:
+                _validate_gfx936_llvm17_bridge_assembly(amdgcn, bridge_stats)
 
         except subprocess.CalledProcessError as e:
             print(f"Compilation failed: {e.stderr}")
@@ -773,7 +987,7 @@ class HIPBackend(BaseBackend):
         finally:
             # Clean up temporary files
             for file in [llir_file, asm_file]:
-                if os.path.exists(file):
+                if file and os.path.exists(file):
                     os.remove(file)
         if knobs.hcu.dump_amdgcn:
             print("// -----// HCUGCN Dump //----- //")
@@ -824,7 +1038,14 @@ class HIPBackend(BaseBackend):
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
-    @functools.lru_cache()
     def hash(self):
+        # Do not lru_cache: RLC knobs are process environment. A no-arg cache
+        # freezes the first FLAGTREE_HCU_RLC_ENHANCE value for the backend
+        # instance and makes later enhance flips a disk-cache no-op.
         version = subprocess.check_output([HIPBackend.path_to_rocm_clang(), "--version"], encoding='utf-8')
-        return f'{version}-{self.target}'
+        codegen = _gfx936_codegen_signature()
+        if codegen == "1":
+            version += subprocess.check_output(
+                [HIPBackend.path_to_llvm17_llc(), "--version"], encoding="utf-8"
+            )
+        return f'{version}-{self.target}-rlc{_rlc_policy_signature()}-gfx936llvm17{codegen}'

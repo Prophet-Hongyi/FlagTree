@@ -27,6 +27,17 @@ def is_in_thread_transpose_enabled(arch):
     return (arch == "gfx942") if knobs.hcu.use_in_thread_transpose is None else knobs.hcu.use_in_thread_transpose
 
 
+def _rlc_policy_signature() -> str:
+    """Live RLC identity for disk and in-memory compile keys.
+
+    Must be read on every compile. Do not cache this string across
+    FLAGTREE_HCU_RLC_* environment changes in the same process.
+    """
+    return (f"{int(bool(knobs.hcu.rlc_enhance))}-{int(knobs.hcu.rlc_phase_mask)}-"
+            f"{int(bool(knobs.hcu.gfx936_f16_pair_materialize))}-"
+            f"{int(bool(knobs.hcu.gfx936_f32_box_muller_pair_materialize))}")
+
+
 @dataclass(frozen=True)
 class HIPOptions:
     num_warps: int = 4
@@ -74,6 +85,7 @@ class HIPOptions:
     # Option allows to set multiple variants divided by commas:
     # schedule_hint="attention,memory-bound-attention"
     schedule_hint: str = 'none'
+    rlc_policy: str = ""
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -138,6 +150,7 @@ class HIPBackend(BaseBackend):
         if "enable_fp_fusion" not in opts:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
         args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() if k in opts and opts[k] is not None})
+        args["rlc_policy"] = _rlc_policy_signature()
         return HIPOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -214,10 +227,10 @@ class HIPBackend(BaseBackend):
         emuTF32 = False
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         hcu.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         hcu.passes.ttgpuir.add_optimize_epilogue(pm)
         hcu.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
         hcu.passes.ttgpuir.add_hoist_layout_conversions(pm)
@@ -238,11 +251,11 @@ class HIPBackend(BaseBackend):
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
                 hcu.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
             hcu.passes.ttgpuir.add_in_thread_transpose(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance, knobs.hcu.rlc_phase_mask)
         hcu.passes.ttgpuir.add_reorder_instructions(pm)
         if use_block_pingpong and options.num_stages > 1:
             hcu.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -490,9 +503,11 @@ class HIPBackend(BaseBackend):
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
-    @functools.lru_cache()
     def hash(self):
-        return f'{self.target}'
+        # Do not lru_cache: RLC knobs are process environment. A no-arg cache
+        # freezes the first FLAGTREE_HCU_RLC_ENHANCE value for the backend
+        # instance and makes later enhance flips a disk-cache no-op.
+        return f'{self.target}-rlc{_rlc_policy_signature()}'
 
 
 # HCU: Modify to use compiler_hcu.py for HCU backend, will refine the code after new backend support.

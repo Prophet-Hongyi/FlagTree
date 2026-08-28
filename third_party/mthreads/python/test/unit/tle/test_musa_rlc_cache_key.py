@@ -9,9 +9,11 @@ The 2026-08-18 FlagGems 4→4 result was a harness false negative: site
 from __future__ import annotations
 
 import os
+import inspect
 
 from triton.backends.compiler import GPUTarget
 from triton.backends.mthreads.compiler import MUSABackend, _rlc_policy_signature
+from triton.runtime import jit
 
 
 def _backend():
@@ -64,3 +66,9 @@ def test_options_include_live_rlc_policy():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def test_installed_jit_cache_key_includes_backend_identity():
+    """The MThreads spec overlay, not the common file, owns this runtime."""
+    source = inspect.getsource(jit.JITFunction.run)
+    assert 'key = f"{key}-{backend.hash()}"' in source

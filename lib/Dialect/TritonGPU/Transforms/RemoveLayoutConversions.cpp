@@ -25,6 +25,7 @@
 
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
@@ -43,6 +44,9 @@
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #include "triton/Analysis/AxisInfo.h"
 #endif // __FLAGTREE_RLC_ENHANCE__
+#ifdef __FLAGTREE_HCU_RLC__
+#include "triton/Tools/Sys/GetEnv.hpp"
+#endif // __FLAGTREE_HCU_RLC__
 #include "triton/Analysis/Utility.h"
 #if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 #include "tle/dialect/include/Transforms/TransformAttrs.h"
@@ -50,12 +54,14 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
-#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__) &&                  \
+    !defined(__FLAGTREE_HCU_RLC__)
 #include "tle/dialect/include/Transforms/EncodingRematerialization.h"
 #endif
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include <cstdlib>
 #include <deque>
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #include <optional>
@@ -70,6 +76,29 @@ namespace mlir::triton::gpu {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+#ifdef __FLAGTREE_MTHREADS_RLC__
+// The MThreads fork carries PassthroughWaitLike and the maxSliceSize overload
+// together. Other FlagTree backend snapshots still expose the older pair of
+// APIs, including the frozen NVIDIA/H20 source and the MetaX/HCU forks.
+static inline bool flagtreeRlcPassthroughWait(Operation *op) {
+  return op->hasTrait<OpTrait::PassthroughWaitLike>();
+}
+#elif defined(__NVIDIA__)
+// NVIDIA's frozen pass predates PassthroughWaitLike but treats
+// WarpGroupDotWaitOp as layout-transparent. Preserve that exact behavior.
+static inline bool flagtreeRlcPassthroughWait(Operation *op) {
+  return isa<nvidia_gpu::WarpGroupDotWaitOp>(op);
+}
+#else
+// Treat wait-like operations as boundaries when the backend does not expose
+// the trait. This is conservative compile compatibility, not backend-policy
+// calibration; off and mask0 still isolate the runtime phase switch.
+static inline bool flagtreeRlcPassthroughWait(Operation *op) {
+  (void)op;
+  return false;
+}
+#endif
+
 #ifdef __FLAGTREE_RLC_ENHANCE__
 // Internal phase bits, AND-ed with the runtime master switch (rlcEnhance).
 // Backward-propagation and small-component solving depend on cost-based
@@ -83,9 +112,287 @@ static constexpr unsigned kRlcStoreLayoutRematerialization = 1u << 3;
 static constexpr unsigned kRlcAllPhases =
     kRlcCostBasedResolution | kRlcBackwardPropagation |
     kRlcSmallComponentSolving | kRlcStoreLayoutRematerialization;
+
+// Read-only diagnostics for source-bound phase attribution. This flag is
+// intentionally absent from compiler/cache identity: it emits decisions only
+// and must never alter the generated IR. Use a fresh kernel cache when tracing
+// because a cache hit does not execute this pass.
+static bool isRlcRejectTraceEnabled() {
+  const char *value = std::getenv("FLAGTREE_RLC_TRACE_REJECTS");
+  if (!value)
+    return false;
+  StringRef setting(value);
+  return setting == "1" || setting.equals_insensitive("true") ||
+         setting.equals_insensitive("on");
+}
+
+static void traceRlcDecision(StringRef phase, StringRef outcome,
+                             StringRef reason, Operation *op = nullptr,
+                             int64_t proposalSize = -1,
+                             int64_t removedConverts = -1,
+                             int64_t beforeCost = -1,
+                             int64_t afterCost = -1) {
+  if (!isRlcRejectTraceEnabled())
+    return;
+  llvm::raw_ostream &os = llvm::errs();
+  os << "FLAGTREE_RLC_TRACE phase=" << phase << " outcome=" << outcome
+     << " reason=" << reason;
+  if (op) {
+    os << " op=" << op->getName() << " loc=";
+    op->getLoc().print(os);
+    if (auto convertOp = dyn_cast<ConvertLayoutOp>(op)) {
+      auto srcType = dyn_cast<RankedTensorType>(convertOp.getSrc().getType());
+      auto dstType =
+          dyn_cast<RankedTensorType>(convertOp.getResult().getType());
+      if (srcType && srcType.getEncoding()) {
+        os << " src_encoding=";
+        srcType.getEncoding().print(os);
+      }
+      if (dstType && dstType.getEncoding()) {
+        os << " dst_encoding=";
+        dstType.getEncoding().print(os);
+      }
+    }
+  }
+  if (proposalSize >= 0)
+    os << " proposal_size=" << proposalSize;
+  if (removedConverts >= 0)
+    os << " removed_converts=" << removedConverts;
+  if (beforeCost >= 0)
+    os << " before_cost=" << beforeCost;
+  if (afterCost >= 0)
+    os << " after_cost=" << afterCost;
+  os << '\n';
+}
 #endif // __FLAGTREE_RLC_ENHANCE__
 
 namespace {
+
+#ifdef __FLAGTREE_HCU_RLC__
+// On gfx936, independently materializing fp16 values is not sufficient for
+// the two-output Box-Muller boundary.  Keep corresponding values paired until
+// one opaque i32 materialization point, then restore the original row-major
+// fp16 ABI.  This experimental rewrite is HCU-only and cache-key gated.
+static bool isHcuGfx936Target(ModuleOp module) {
+  auto target = module->getAttrOfType<StringAttr>("ttg.target");
+  return target && target.getValue() == "hip:gfx936";
+}
+
+static Operation *getHcuF16PairStoreSink(Value value) {
+  if (!value.hasOneUse())
+    return nullptr;
+  Operation *user = *value.getUsers().begin();
+  if (auto convert = dyn_cast<ConvertLayoutOp>(user)) {
+    if (!convert.getResult().hasOneUse())
+      return nullptr;
+    user = *convert.getResult().getUsers().begin();
+  }
+  return isa<triton::StoreOp>(user) ? user : nullptr;
+}
+
+struct HcuGfx936F16PairMaterializationPattern
+    : OpRewritePattern<arith::TruncFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::TruncFOp first,
+                                PatternRewriter &rewriter) const override {
+    auto firstInputTy = dyn_cast<RankedTensorType>(first.getIn().getType());
+    auto firstResultTy = dyn_cast<RankedTensorType>(first.getOut().getType());
+    if (!firstInputTy || !firstResultTy ||
+        !firstInputTy.getElementType().isF32() ||
+        !firstResultTy.getElementType().isF16())
+      return failure();
+
+    // Store lowering may interleave the first truncation/store with address
+    // preparation for the second result.  Search a small, bounded window for
+    // the next compatible store-bound truncation instead of requiring the two
+    // truncations to be adjacent.
+    arith::TruncFOp second;
+    constexpr unsigned kMaxPairSearchDistance = 32;
+    unsigned searchDistance = 0;
+    for (Operation *candidate = first->getNextNode();
+         candidate && searchDistance < kMaxPairSearchDistance;
+         candidate = candidate->getNextNode(), ++searchDistance) {
+      auto trunc = dyn_cast<arith::TruncFOp>(candidate);
+      if (!trunc || trunc.getIn().getType() != first.getIn().getType() ||
+          trunc.getOut().getType() != first.getOut().getType() ||
+          !getHcuF16PairStoreSink(trunc.getOut()))
+        continue;
+      second = trunc;
+      break;
+    }
+    if (!second)
+      return failure();
+
+    Operation *firstStore = getHcuF16PairStoreSink(first.getOut());
+    Operation *secondStore = getHcuF16PairStoreSink(second.getOut());
+    if (!firstStore || !secondStore || firstStore == secondStore ||
+        firstStore->getBlock() != secondStore->getBlock() ||
+        !firstStore->isBeforeInBlock(secondStore))
+      return failure();
+
+    // The gfx936 discriminator is order-sensitive even when convert, inline
+    // asm, mixlo and store counts are identical: materializing the pair after
+    // address/mask preparation is unstable, while doing so immediately after
+    // both value producers is repeatable.  TruncFOp is pure, so move the two
+    // truncations together to the first point where both inputs are available.
+    Operation *firstProducer = first.getIn().getDefiningOp();
+    Operation *secondProducer = second.getIn().getDefiningOp();
+    if (!firstProducer || !secondProducer ||
+        firstProducer->getBlock() != first->getBlock() ||
+        secondProducer->getBlock() != first->getBlock())
+      return failure();
+    Operation *pairAnchor = firstProducer;
+    if (firstProducer != secondProducer &&
+        firstProducer->isBeforeInBlock(secondProducer))
+      pairAnchor = secondProducer;
+    if (!pairAnchor->isBeforeInBlock(first) ||
+        !pairAnchor->isBeforeInBlock(second))
+      return failure();
+    first->moveAfter(pairAnchor);
+    second->moveAfter(first);
+
+    PatternRewriter::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointAfter(second);
+    Location loc = first.getLoc();
+    Type i16Ty = firstResultTy.cloneWith(std::nullopt, rewriter.getI16Type());
+    Type i32Ty = firstResultTy.cloneWith(std::nullopt, rewriter.getI32Type());
+
+    auto firstBits16 =
+        BitcastOp::create(rewriter, loc, i16Ty, first.getOut());
+    auto secondBits16 =
+        BitcastOp::create(rewriter, loc, i16Ty, second.getOut());
+    Value firstBits =
+        arith::ExtUIOp::create(rewriter, loc, i32Ty, firstBits16);
+    Value secondBits =
+        arith::ExtUIOp::create(rewriter, loc, i32Ty, secondBits16);
+    Value shift = arith::ConstantOp::create(
+        rewriter, loc, i32Ty,
+        DenseElementsAttr::get(cast<ShapedType>(i32Ty), APInt(32, 16)));
+    Value packed = arith::OrIOp::create(
+        rewriter, loc, firstBits,
+        arith::ShLIOp::create(rewriter, loc, secondBits, shift));
+    Value anchored =
+        ElementwiseInlineAsmOp::create(
+            rewriter, loc, i32Ty, "v_mov_b32 $0, $1", "=v,v",
+            /*isPure=*/false, /*pack=*/1, ArrayRef<Value>{packed})
+            .getResult()[0];
+
+    Value restoredFirstBits =
+        arith::TruncIOp::create(rewriter, loc, i16Ty, anchored);
+    Value restoredSecondBits = arith::TruncIOp::create(
+        rewriter, loc, i16Ty,
+        arith::ShRUIOp::create(rewriter, loc, anchored, shift));
+    Value restoredFirst =
+        BitcastOp::create(rewriter, loc, firstResultTy, restoredFirstBits);
+    Value restoredSecond =
+        BitcastOp::create(rewriter, loc, firstResultTy, restoredSecondBits);
+
+    rewriter.replaceAllUsesExcept(first.getOut(), restoredFirst, firstBits16);
+    rewriter.replaceAllUsesExcept(second.getOut(), restoredSecond,
+                                  secondBits16);
+    return success();
+  }
+};
+
+// The same gfx936 boundary also affects a direct f32 Box-Muller cos/sin pair
+// after RLC removes both store-layout conversions.  Do not anchor arbitrary f32
+// stores: require two ordered direct-store products that share the same radius
+// and whose other operands are cos/sin of the same angle.
+static Operation *getHcuDirectStoreSink(Value value) {
+  if (!value.hasOneUse())
+    return nullptr;
+  Operation *user = *value.getUsers().begin();
+  return isa<triton::StoreOp>(user) ? user : nullptr;
+}
+
+static bool matchHcuBoxMullerProduct(arith::MulFOp product, bool cosine,
+                                     Value &radius, Value &angle) {
+  for (unsigned trigIndex = 0; trigIndex < 2; ++trigIndex) {
+    Value trigValue = product->getOperand(trigIndex);
+    Operation *trig = trigValue.getDefiningOp();
+    if (!trig || (cosine ? !isa<math::CosOp>(trig)
+                         : !isa<math::SinOp>(trig)))
+      continue;
+    radius = product->getOperand(1 - trigIndex);
+    angle = trig->getOperand(0);
+    return true;
+  }
+  return false;
+}
+
+struct HcuGfx936F32BoxMullerPairMaterializationPattern
+    : OpRewritePattern<arith::MulFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::MulFOp first,
+                                PatternRewriter &rewriter) const override {
+    auto resultTy = dyn_cast<RankedTensorType>(first.getType());
+    Operation *firstStore = getHcuDirectStoreSink(first.getResult());
+    if (!resultTy || !resultTy.getElementType().isF32() || !firstStore)
+      return failure();
+
+    constexpr unsigned kMaxPairSearchDistance = 32;
+    Value radius;
+    Value angle;
+    if (!matchHcuBoxMullerProduct(first, /*cosine=*/true, radius, angle))
+      return failure();
+
+    arith::MulFOp second;
+    unsigned searchDistance = 0;
+    for (Operation *candidate = first->getNextNode();
+         candidate && searchDistance < kMaxPairSearchDistance;
+         candidate = candidate->getNextNode(), ++searchDistance) {
+      auto product = dyn_cast<arith::MulFOp>(candidate);
+      if (!product || product.getType() != first.getType() ||
+          !getHcuDirectStoreSink(product.getResult()))
+        continue;
+      Value secondRadius;
+      Value secondAngle;
+      if (!matchHcuBoxMullerProduct(product, /*cosine=*/false, secondRadius,
+                                    secondAngle) ||
+          secondRadius != radius || secondAngle != angle)
+        continue;
+      second = product;
+      break;
+    }
+    if (!second)
+      return failure();
+
+    Operation *secondStore = getHcuDirectStoreSink(second.getResult());
+    if (!firstStore || !secondStore || firstStore == secondStore ||
+        firstStore->getBlock() != secondStore->getBlock() ||
+        !firstStore->isBeforeInBlock(secondStore) ||
+        !second->isBeforeInBlock(firstStore))
+      return failure();
+
+    PatternRewriter::InsertionGuard guard(rewriter);
+    // Keep the first pair from spanning the second Box-Muller pair in a
+    // four-output kernel.  gfx936 loses a deterministic subset of those
+    // long-lived anchored values under the higher VGPR pressure, while the
+    // same unary anchors are correct when materialized at their store edge.
+    // The asm is side-effecting, so this placement is also preserved by the
+    // downstream lowering pipeline.
+    rewriter.setInsertionPoint(firstStore);
+    // HCU lowers a multi-result elementwise inline asm through an LLVM struct.
+    // The gfx936 four-output discriminator shows deterministic channel/lane
+    // corruption on that path.  Keep each value opaque independently so the
+    // lowering has exactly one scalar result and never constructs the struct.
+    auto firstAnchor = ElementwiseInlineAsmOp::create(
+        rewriter, first.getLoc(), first.getType(), "v_mov_b32 $0, $1", "=v,v",
+        /*isPure=*/false, /*pack=*/1, ArrayRef<Value>{first.getResult()});
+    auto secondAnchor = ElementwiseInlineAsmOp::create(
+        rewriter, second.getLoc(), second.getType(), "v_mov_b32 $0, $1",
+        "=v,v", /*isPure=*/false, /*pack=*/1,
+        ArrayRef<Value>{second.getResult()});
+    rewriter.replaceAllUsesExcept(first.getResult(), firstAnchor.getResult()[0],
+                                  firstAnchor);
+    rewriter.replaceAllUsesExcept(second.getResult(),
+                                  secondAnchor.getResult()[0], secondAnchor);
+    return success();
+  }
+};
+#endif // __FLAGTREE_HCU_RLC__
 
 // Large rematerialization slices can lead to steep compile-time blowups.
 // Bail out once the backward slice exceeds this cap and keep the conversion.
@@ -105,6 +412,7 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-cached-load-cost-per-byte
 //   ttg.rlc-expensive-math-cost-per-byte
 //   ttg.rlc-inter-warp-reduce-cost
+//   ttg.rlc-allow-atomic-writeback-order-change
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -116,6 +424,7 @@ struct RlcBackendPolicy {
   int64_t cachedLoadCostPerByte = 8;
   int64_t expensiveMathCostPerByte = 8;
   int64_t interWarpReduceCost = 8;
+  bool allowAtomicWritebackOrderChange = false;
 
   static RlcBackendPolicy fromOperation(Operation *op) {
     RlcBackendPolicy policy;
@@ -142,6 +451,9 @@ struct RlcBackendPolicy {
                      policy.expensiveMathCostPerByte);
     overridePositive("ttg.rlc-inter-warp-reduce-cost",
                      policy.interWarpReduceCost);
+    if (auto attr = module->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-allow-atomic-writeback-order-change"))
+      policy.allowAtomicWritebackOrderChange = attr.getInt() > 0;
     return policy;
   }
 };
@@ -344,7 +656,9 @@ private:
                               bool stopAtConvertSrc = false,
                               bool allowBlockArgs = false) const;
   Attribute getProposalEncoding(const Proposal &proposal, Value value) const;
-  bool shouldAcceptProposal(const Proposal &proposal) const;
+  bool shouldAcceptProposal(const Proposal &proposal,
+                            int64_t *beforeCostOut = nullptr,
+                            int64_t *afterCostOut = nullptr) const;
   int countConvertsRemovedByProposal(const Proposal &proposal) const;
   bool proposalAmplifiesScatterStore(const Proposal &proposal) const;
   bool proposalDecoalescesContiguousStore(const Proposal &proposal) const;
@@ -645,7 +959,7 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
       setEncoding({afterArg, result}, info, changed, user);
       continue;
     }
-    if (user->hasTrait<OpTrait::PassthroughWaitLike>()) {
+    if (flagtreeRlcPassthroughWait(user)) {
       unsigned opIndex = use.getOperandNumber();
       Value result = user->getResult(opIndex);
       setEncoding(result, info, changed, user);
@@ -730,7 +1044,8 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
                                            RankedTensorType valueType,
                                            Attribute targetEncoding,
                                            bool allowNarrowerContiguity,
-                                           const RlcBackendPolicy &policy);
+                                           const RlcBackendPolicy &policy,
+                                           bool allowOrderChange = false);
 static unsigned getContigAlongMemoryOrder(RankedTensorType type);
 static bool isOrderIndifferentAccess(ModuleAxisInfoAnalysis *axisInfo,
                                      Value ptr);
@@ -1050,7 +1365,9 @@ static int64_t getLoopFrequencyWeight(Value value) {
 // proposal value's uses and defining-op operands under the current encodings
 // versus the proposed ones (each convert weighted by its loop depth), and
 // accept only when the proposal strictly lowers the total.
-bool LayoutPropagation::shouldAcceptProposal(const Proposal &proposal) const {
+bool LayoutPropagation::shouldAcceptProposal(const Proposal &proposal,
+                                             int64_t *beforeCostOut,
+                                             int64_t *afterCostOut) const {
   int64_t beforeCost = 0;
   int64_t afterCost = 0;
 
@@ -1166,6 +1483,10 @@ bool LayoutPropagation::shouldAcceptProposal(const Proposal &proposal) const {
                                         /*useProposal=*/true);
   }
 
+  if (beforeCostOut)
+    *beforeCostOut = beforeCost;
+  if (afterCostOut)
+    *afterCostOut = afterCost;
   return afterCost < beforeCost;
 }
 
@@ -1577,7 +1898,7 @@ bool LayoutPropagation::commitProposal(const Proposal &proposal) {
 }
 
 static bool isBackwardPropagationBoundaryOp(Operation *op) {
-  return isLayoutAnchor(op) || op->hasTrait<OpTrait::PassthroughWaitLike>() ||
+  return isLayoutAnchor(op) || flagtreeRlcPassthroughWait(op) ||
          isa<LoadOp, LocalLoadOp, AtomicRMWOp, AtomicCASOp,
              nvidia_gpu::TMEMLoadOp, DescriptorLoadOp, DescriptorGatherOp,
              ReduceOp, scf::ForOp, scf::WhileOp, scf::IfOp, ReshapeOp, TransOp,
@@ -1766,45 +2087,124 @@ static bool producerConeReachesReduce(Value value, int depth) {
   return false;
 }
 
+// Phase 1b removes one writeback convert, but its backward preference can cross
+// shared producer values and force conversions on their other branches. Follow
+// the same inferred producer encodings as backward propagation and reject any
+// use outside that path. Even one external branch is unsafe: Phase 1b collects
+// seeds from the pre-rewrite IR, so a locally neutral seed can perturb forward
+// conflict resolution and resurrect a convert that legacy RLC would remove.
+static bool producerConeExceedsExternalUseBudget(ConvertLayoutOp seed) {
+  constexpr unsigned kMaxVisitedStates = 2048;
+  constexpr unsigned kExternalUseBudget = 0;
+
+  using WorkItem = std::tuple<Value, Attribute, Operation *>;
+  SmallVector<WorkItem> worklist;
+  Attribute dstEncoding = getTensorEncoding(seed.getResult());
+  if (!dstEncoding)
+    return false;
+  worklist.emplace_back(seed.getSrc(), dstEncoding, seed.getOperation());
+
+  DenseMap<Value, Attribute> visitedEncoding;
+  DenseSet<std::pair<Value, Operation *>> externalUseEdges;
+  while (!worklist.empty()) {
+    if (visitedEncoding.size() >= kMaxVisitedStates)
+      return true;
+
+    auto [value, desiredEncoding, pathUser] = worklist.pop_back_val();
+    auto [it, inserted] = visitedEncoding.try_emplace(value, desiredEncoding);
+    if (!inserted) {
+      // Reaching one producer with competing target encodings is itself a
+      // branching conflict. Fail closed rather than choosing one arbitrarily.
+      if (it->second != desiredEncoding)
+        return true;
+      continue;
+    }
+
+    // Count only values that Phase 1b can actually retag. Block arguments,
+    // loads, and other anchors stop propagation and cannot fan the preference
+    // out to their users.
+    if (!canCreateBackwardLayout(value))
+      continue;
+    Attribute currentEncoding = getTensorEncoding(value);
+    if (!currentEncoding)
+      continue;
+    if (currentEncoding != desiredEncoding) {
+      DenseSet<Operation *> distinctExternalUsers;
+      for (Operation *user : value.getUsers()) {
+        if (user == pathUser || !distinctExternalUsers.insert(user).second)
+          continue;
+        // An existing conversion to the desired encoding is already a covered
+        // boundary; retagging the source removes it rather than creating a new
+        // external conversion.
+        if (auto convertOp = dyn_cast<ConvertLayoutOp>(user))
+          if (getTensorEncoding(convertOp.getResult()) == desiredEncoding)
+            continue;
+        if (externalUseEdges.insert({value, user}).second &&
+            externalUseEdges.size() > kExternalUseBudget)
+          return true;
+      }
+    }
+
+    Operation *defOp = value.getDefiningOp();
+    Attribute srcEncoding = inferSrcEncoding(defOp, desiredEncoding);
+    if (!srcEncoding)
+      continue;
+    for (Value operand : defOp->getOperands()) {
+      if (isa<RankedTensorType>(operand.getType()))
+        worklist.emplace_back(operand, srcEncoding, defOp);
+    }
+  }
+  return false;
+}
+
 // A convert_layout is a Phase 1b candidate when it is a single-use,
 // blocked-to-blocked writeback-tail convert whose source is a non-frozen local
 // producer and whose result reaches a store/atomic through a short, single-use
 // local chain. This covers cheap cast/index tails without changing reductions,
 // scans, anchors, or control-flow-carried values.
 static bool isBackwardPropagationSeedCandidate(ConvertLayoutOp cvtOp) {
-  if (isInsideStructuredControlFlow(cvtOp))
+  auto reject = [&](StringRef reason) {
+    traceRlcDecision("1b", "reject", reason, cvtOp.getOperation());
     return false;
+  };
+  if (isInsideStructuredControlFlow(cvtOp))
+    return reject("structured-control-flow");
 
   Attribute srcEncoding = getTensorEncoding(cvtOp.getSrc());
   Attribute dstEncoding = getTensorEncoding(cvtOp.getResult());
   if (!isa_and_nonnull<BlockedEncodingAttr>(srcEncoding) ||
       !isa_and_nonnull<BlockedEncodingAttr>(dstEncoding))
-    return false;
+    return reject("non-blocked-to-blocked");
   if (isSliceEncoding(srcEncoding) || isSliceEncoding(dstEncoding))
-    return false;
+    return reject("slice-encoding");
 
   Value src = cvtOp.getSrc();
   if (isFrozenLayoutValue(src))
-    return false;
+    return reject("frozen-source");
 #if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
   // Do not seed backward propagation on a TLE cluster remote-address chain (see
   // valueOnTleRemotePointerPath); retagging it corrupts the distributed access.
   if (valueOnTleRemotePointerPath(src) ||
       valueOnTleRemotePointerPath(cvtOp.getResult()))
-    return false;
+    return reject("tle-remote-pointer");
 #endif
   if (!isBackwardPropagationSourceCandidate(src.getDefiningOp()))
-    return false;
+    return reject("unsupported-source");
   if (!hasSingleUse(src) || !hasSingleUse(cvtOp.getResult()))
-    return false;
+    return reject("source-or-result-multi-use");
 
   constexpr int kMaxReduceConeDepth = 5;
   if (producerConeReachesReduce(src, kMaxReduceConeDepth))
-    return false;
+    return reject("reduction-producer-cone");
+  if (producerConeExceedsExternalUseBudget(cvtOp))
+    return reject("producer-external-use-fanout");
 
   constexpr int kMaxBackwardWritebackTailDepth = 4;
-  return reachesBackwardPropagationWriteback(cvtOp.getResult(),
-                                             kMaxBackwardWritebackTailDepth);
+  if (!reachesBackwardPropagationWriteback(cvtOp.getResult(),
+                                           kMaxBackwardWritebackTailDepth))
+    return reject("no-writeback-tail");
+  traceRlcDecision("1b", "accept", "seed-candidate", cvtOp.getOperation());
+  return true;
 }
 
 SmallVector<Value> LayoutPropagation::propagateToOperands(Value value,
@@ -1879,7 +2279,7 @@ bool LayoutPropagation::propagateLayoutBackward() {
 }
 
 static bool isSmallComponentForbiddenOp(Operation *op) {
-  return op->hasTrait<OpTrait::PassthroughWaitLike>() ||
+  return flagtreeRlcPassthroughWait(op) ||
          isa<mlir::triton::DotOpInterface, AtomicRMWOp, AtomicCASOp,
              nvidia_gpu::TMEMLoadOp, DescriptorLoadOp, DescriptorGatherOp,
              DescriptorOpInterface, ReduceOp, ScanOp>(op);
@@ -1946,7 +2346,8 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
                                            RankedTensorType valueType,
                                            Attribute targetEncoding,
                                            bool allowNarrowerContiguity,
-                                           const RlcBackendPolicy &policy) {
+                                           const RlcBackendPolicy &policy,
+                                           bool allowOrderChange) {
   if (!ptrType || !valueType || !targetEncoding ||
       !isa<DistributedEncodingTrait>(targetEncoding))
     return false;
@@ -1959,8 +2360,9 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
   RankedTensorType targetType = valueType.cloneWithEncoding(targetEncoding);
   SmallVector<unsigned> currentOrder = getOrderForMemory(ptrType);
   SmallVector<unsigned> targetOrder = getOrderForMemory(targetType);
-  if (currentOrder.empty() || targetOrder.empty() ||
-      currentOrder.front() != targetOrder.front())
+  if (currentOrder.empty() || targetOrder.empty())
+    return false;
+  if (currentOrder.front() != targetOrder.front() && !allowOrderChange)
     return false;
 
   unsigned targetContig = getContigAlongMemoryOrder(targetType);
@@ -2106,18 +2508,31 @@ bool LayoutPropagation::solveSmallComponents() {
   auto commitIfProfitable = [&](Proposal &proposal, bool requireBenefit,
                                 bool rejectReachableReductionOrScan = true,
                                 bool restrictWeakStoreProposals = false) {
-    if (proposal.empty())
+    int removedConverts = -1;
+    auto traceProposal = [&](StringRef outcome, StringRef reason,
+                             int64_t beforeCost = -1,
+                             int64_t afterCost = -1) {
+      traceRlcDecision("2", outcome, reason, funcOp.getOperation(),
+                       static_cast<int64_t>(proposal.size()), removedConverts,
+                       beforeCost, afterCost);
+    };
+    auto reject = [&](StringRef reason, int64_t beforeCost = -1,
+                      int64_t afterCost = -1) {
+      traceProposal("reject", reason, beforeCost, afterCost);
       return false;
+    };
+    if (proposal.empty())
+      return reject("empty-proposal");
 #if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     // Skip any component on a TLE cluster remote-address chain; retagging it
     // corrupts the remote access (see valueOnTleRemotePointerPath).
     for (auto &it : proposal)
       if (valueOnTleRemotePointerPath(it.first))
-        return false;
+        return reject("tle-remote-pointer");
 #endif
-    int removedConverts = countConvertsRemovedByProposal(proposal);
+    removedConverts = countConvertsRemovedByProposal(proposal);
     if (removedConverts == 0)
-      return false;
+      return reject("no-convert-removed");
     // A "weak" proposal removes a single one-shot convert outside any loop; its
     // layout ripple can cost more than it saves, so only loop-resident or
     // multi-convert components are admitted.
@@ -2125,7 +2540,7 @@ bool LayoutPropagation::solveSmallComponents() {
         removedConverts < 2 && !proposalHasLoopResidentValue(proposal);
     if (isWeakProposal &&
         (restrictWeakStoreProposals || proposalAmplifiesScatterStore(proposal)))
-      return false;
+      return reject("weak-one-shot-proposal");
     // In a pure data-movement kernel, amplifying a scatter store to remove a
     // convert is a loss when the stored value is only a copy of a coalesced
     // load (the bridging convert is an on-chip reshuffle cheaper than the
@@ -2134,30 +2549,37 @@ bool LayoutPropagation::solveSmallComponents() {
     if (restrictWeakStoreProposals && memoryMovementOnly &&
         proposalAmplifiesScatterStore(proposal) &&
         proposalStoresOnlyLoadCopies(proposal))
-      return false;
+      return reject("memory-movement-load-store-copy");
     // In a pure data-movement kernel a tt.join/tt.split radix butterfly has no
     // compute anchor to amortize a relayout; collapsing its bridging convert
     // only shifts the layout boundary (unpriced by the convert-only cost model)
     // and can turn a register-local pack/unpack into a decoalescing shuffle.
     if (memoryMovementOnly && proposalBridgesRadixSplitMerge(proposal))
-      return false;
+      return reject("memory-movement-radix-bridge");
     if (removedConverts < 2 && proposalDecoalescesContiguousStore(proposal))
-      return false;
+      return reject("decoalesces-contiguous-store");
     if (!proposalHasOnlyPairedForBlockArgs(proposal))
-      return false;
+      return reject("unpaired-loop-block-argument");
     if (proposalHasRiskyScalarSideOutput(proposal))
-      return false;
+      return reject("risky-scalar-side-output");
     if (rejectReachableReductionOrScan
             ? proposalTouchesReductionOrScan(proposal)
             : proposalDirectlyTouchesReductionOrScan(proposal))
-      return false;
+      return reject("reduction-or-scan-boundary");
     if (!rejectReachableReductionOrScan &&
         proposalHasRankChangingLayoutBridge(proposal) &&
         proposalTouchesReductionOrScan(proposal))
-      return false;
-    if (requireBenefit && !shouldAcceptProposal(proposal))
-      return false;
-    return commitProposal(proposal);
+      return reject("rank-changing-reduction-bridge");
+    int64_t beforeCost = -1;
+    int64_t afterCost = -1;
+    if (requireBenefit &&
+        !shouldAcceptProposal(proposal, &beforeCost, &afterCost))
+      return reject("cost-not-lower", beforeCost, afterCost);
+    bool committed = commitProposal(proposal);
+    traceProposal(committed ? "accept" : "reject",
+                  committed ? "committed" : "commit-no-change", beforeCost,
+                  afterCost);
+    return committed;
   };
 
   auto collectRetaggableStoreValue = [&](Proposal &proposal, Value value,
@@ -2402,10 +2824,13 @@ bool LayoutPropagation::solveSmallComponents() {
     }
   };
 
-  auto commitMergedProposals = [&](SmallVector<Proposal> proposals,
+  auto commitMergedProposals = [&](StringRef stage,
+                                   SmallVector<Proposal> proposals,
                                    bool rejectReachableReductionOrScan = true,
                                    bool restrictWeakStoreProposals = false) {
     bool localChanged = false;
+    if (proposals.empty())
+      traceRlcDecision("2", "no-proposal", stage, funcOp.getOperation());
     bool merged = true;
     while (merged) {
       merged = false;
@@ -2456,7 +2881,7 @@ bool LayoutPropagation::solveSmallComponents() {
       return;
     collectResultStoreTailProposals(reduceOp, reduceTailProposals);
   });
-  changed |= commitMergedProposals(std::move(reduceTailProposals),
+  changed |= commitMergedProposals("reduce-tail", std::move(reduceTailProposals),
                                    /*rejectReachableReductionOrScan=*/true,
                                    /*restrictWeakStoreProposals=*/true);
 
@@ -2467,7 +2892,7 @@ bool LayoutPropagation::solveSmallComponents() {
       return;
     collectResultStoreTailProposals(forOp, loopTailProposals);
   });
-  changed |= commitMergedProposals(std::move(loopTailProposals),
+  changed |= commitMergedProposals("loop-tail", std::move(loopTailProposals),
                                    /*rejectReachableReductionOrScan=*/true,
                                    /*restrictWeakStoreProposals=*/true);
 
@@ -2485,7 +2910,7 @@ bool LayoutPropagation::solveSmallComponents() {
         collectConvertStoreTail(proposal, cvtOp))
       storeTailProposals.push_back(std::move(proposal));
   });
-  changed |= commitMergedProposals(std::move(storeTailProposals),
+  changed |= commitMergedProposals("store-tail", std::move(storeTailProposals),
                                    /*rejectReachableReductionOrScan=*/true,
                                    /*restrictWeakStoreProposals=*/true);
 
@@ -2496,7 +2921,8 @@ bool LayoutPropagation::solveSmallComponents() {
     if (collectProducerSideConvert(proposal, cvtOp))
       producerSideProposals.push_back(std::move(proposal));
   });
-  changed |= commitMergedProposals(std::move(producerSideProposals),
+  changed |= commitMergedProposals("producer-side",
+                                   std::move(producerSideProposals),
                                    /*rejectReachableReductionOrScan=*/false);
 
   return changed;
@@ -2539,7 +2965,7 @@ collectUseTargets(OpOperand &use, Attribute enc,
     targets.push_back({whileOp->getResult(argIndex), enc});
     return;
   }
-  if (user->hasTrait<OpTrait::PassthroughWaitLike>()) {
+  if (flagtreeRlcPassthroughWait(user)) {
     Value result = user->getResult(use.getOperandNumber());
     if (getTensorEncoding(result))
       targets.push_back({result, enc});
@@ -2612,7 +3038,7 @@ LayoutPropagation::getDefiningOpConversionCost(Value value,
 
   if (!(defOp->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
         defOp->hasTrait<OpTrait::Elementwise>() ||
-        defOp->hasTrait<OpTrait::PassthroughWaitLike>() ||
+        flagtreeRlcPassthroughWait(defOp) ||
         isa<LoadOp, ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
             GatherOp>(defOp)))
     return 0;
@@ -3260,7 +3686,7 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
 #endif // __FLAGTREE_RLC_ENHANCE__
   if (op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<OpTrait::Elementwise>() ||
-      op->hasTrait<OpTrait::PassthroughWaitLike>() ||
+      flagtreeRlcPassthroughWait(op) ||
       isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp, GatherOp,
 #ifdef __FLAGTREE_RLC_ENHANCE__
           ConvertLayoutOp>(op) ||
@@ -3628,9 +4054,15 @@ LogicalResult LayoutRematerialization::getConvertBackwardSlice(
     return Value();
   };
 
+#ifdef __FLAGTREE_MTHREADS_RLC__
   return mlir::getConvertBackwardSlice(root, slice, rootEncoding, layout,
                                        stopPropagation, getExistingConversion,
                                        maxSliceSize);
+#else
+  (void)maxSliceSize;
+  return mlir::getConvertBackwardSlice(root, slice, rootEncoding, layout,
+                                       stopPropagation, getExistingConversion);
+#endif
 }
 
 LogicalResult LayoutRematerialization::getRematerializableSlice(
@@ -3638,12 +4070,19 @@ LogicalResult LayoutRematerialization::getRematerializableSlice(
     DenseMap<Value, Attribute> &layoutArg,
     std::function<bool(Operation *)> stopPropagation, unsigned maxSliceSize,
     bool allowDuplicableLoads) {
+#ifdef __NVIDIA__
+  // Preserve the frozen NVIDIA mutation contract. Legacy hoist paths observe
+  // the partial slice/layout left by a failed attempt.
+  auto &slice = sliceArg;
+  auto &layout = layoutArg;
+#else
   // A failed attempt must not leak a partial slice/layout into a later branch
   // or hoist decision. This transaction-like behavior was already present in
   // the MThreads fork and is required when both sides of a conditional share
   // the same candidate state.
   auto slice = sliceArg;
   auto layout = layoutArg;
+#endif
   LogicalResult result = getConvertBackwardSlice(
       root, rootEncoding, slice, layout, stopPropagation, maxSliceSize);
   if (result.failed() || slice.empty())
@@ -3688,8 +4127,10 @@ LogicalResult LayoutRematerialization::getRematerializableSlice(
     }
   }
 #endif // __FLAGTREE_RLC_ENHANCE__
+#ifndef __NVIDIA__
   sliceArg = std::move(slice);
   layoutArg = std::move(layout);
+#endif
   return success();
 }
 
@@ -3994,25 +4435,29 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   auto valueConvert = valueOperand.get().getDefiningOp<ConvertLayoutOp>();
   if (!valueConvert)
     return false;
+  auto reject = [&](StringRef reason) {
+    traceRlcDecision("3", "reject", reason, writebackOp);
+    return false;
+  };
   // The conversion must feed this writeback exclusively; otherwise it stays
   // live for its other users and we gain nothing.
   if (!hasSingleUse(valueConvert.getResult()))
-    return false;
+    return reject("shared-value-convert");
 
   auto ptrType = dyn_cast<RankedTensorType>(ptrOperand.get().getType());
   auto valueType = dyn_cast<RankedTensorType>(valueOperand.get().getType());
   auto targetType = dyn_cast<RankedTensorType>(valueConvert.getSrc().getType());
   if (!ptrType || !valueType || !targetType)
-    return false;
+    return reject("non-ranked-writeback-operand");
   Attribute targetEncoding = targetType.getEncoding();
   if (!targetEncoding || targetEncoding == valueType.getEncoding())
-    return false;
+    return reject("missing-or-unchanged-target-encoding");
 
   // Only target tensor-core (MMA) value layouts. These are the layouts whose
   // conversion is expensive (it round-trips through shared memory) and that
   // the earlier blocked-to-blocked phases intentionally leave untouched.
   if (!isa<MmaEncodingTrait>(targetEncoding))
-    return false;
+    return reject("non-mma-target");
   // Trading per-thread store width for the removed convert only pays off on a
   // hot path: a writeback inside a loop (the convert serializes every
   // iteration) or an atomic (element-granular anyway). One-shot epilogues must
@@ -4020,10 +4465,13 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   bool allowNarrowerContiguity = isa<AtomicRMWOp>(writebackOp) ||
                                  writebackOp->getParentOfType<scf::ForOp>() ||
                                  writebackOp->getParentOfType<scf::WhileOp>();
+  RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(writebackOp);
+  bool allowAtomicOrderChange =
+      isa<AtomicRMWOp>(writebackOp) && policy.allowAtomicWritebackOrderChange;
   if (!preservesWritebackMemoryAccess(
-          ptrType, valueType, targetEncoding, allowNarrowerContiguity,
-          RlcBackendPolicy::fromOperation(writebackOp)))
-    return false;
+          ptrType, valueType, targetEncoding, allowNarrowerContiguity, policy,
+          allowAtomicOrderChange))
+    return reject("memory-access-change");
 
   // A contiguous (coalesced) store moves consecutive addresses across a warp
   // even at sizePerThread=1, so the contiguity comparison above understates its
@@ -4033,7 +4481,7 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   // exemption above would otherwise admit.
   if (!isa<AtomicRMWOp>(writebackOp) && axisInfoAnalysis &&
       !isOrderIndifferentAccess(axisInfoAnalysis, ptrOperand.get()))
-    return false;
+    return reject("coalesced-global-store");
 
   // The address (and optional mask) chains must be cheaply rematerializable in
   // the value's layout. Requiring pure index/mask math guarantees that moving
@@ -4066,10 +4514,10 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   SetVector<Value> ptrSlice, maskSlice;
   DenseMap<Value, Attribute> ptrLayout, maskLayout;
   if (!collectWritebackOperandSlice(ptrOperand, ptrSlice, ptrLayout))
-    return false;
+    return reject("ptr-slice-not-rematerializable");
   if (maskOperand &&
       !collectWritebackOperandSlice(*maskOperand, maskSlice, maskLayout))
-    return false;
+    return reject("mask-slice-not-rematerializable");
 
   // All checks passed: commit. Insert a temporary convert on each address/mask
   // operand, then reuse the existing slice-rewrite machinery to push the
@@ -4097,6 +4545,7 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
     atomicOp.getResult().setType(targetType);
   if (valueConvert.getResult().use_empty())
     opToDelete.insert(valueConvert);
+  traceRlcDecision("3", "accept", "writeback-rematerialized", writebackOp);
   return true;
 }
 
@@ -4333,6 +4782,39 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   for (unsigned i = 0; i < sliceSize; i++) {
     Value v = slice[i];
     Operation *op = v.getDefiningOp();
+#ifdef __NVIDIA__
+    if (!op)
+      continue;
+    if (isExtOrBroadcastOp(op)) {
+      SetVector<Value> tempSlice;
+      DenseMap<Value, Attribute> tempLayout;
+      Attribute srcEncoding = inferSrcEncoding(op, layout[v]);
+      if (!srcEncoding)
+        return;
+      LogicalResult result = getRematerializableSlice(
+          op->getOpOperand(0), srcEncoding, tempSlice, tempLayout,
+          /*stopPropagation=*/nullptr, kMaxRematSliceSize);
+
+      // Keep the frozen NVIDIA conflict check before merging the temporary
+      // backward slice into the root slice.
+      for (auto [val, enc] : tempLayout) {
+        auto preexistingLayout = layout.find(val);
+        if (preexistingLayout != layout.end() &&
+            preexistingLayout->second != enc) {
+          result = failure();
+          break;
+        }
+      }
+      if (result.succeeded()) {
+        slice.insert(tempSlice.begin(), tempSlice.end());
+        layout.insert(tempLayout.begin(), tempLayout.end());
+        continue;
+      }
+      if (extOrBroadcastOp != nullptr)
+        return;
+      extOrBroadcastOp = op;
+    }
+#else
     if (!op || !isExtOrBroadcastOp(op))
       continue;
 
@@ -4353,6 +4835,7 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
     if (extOrBroadcastOp != nullptr)
       return;
     extOrBroadcastOp = op;
+#endif
   }
 
   if (extOrBroadcastOp == nullptr)
@@ -4423,6 +4906,17 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
     OpOperand &thenRes = thenYield.getResultsMutable()[resIdx];
     OpOperand &elseRes = elseYield.getResultsMutable()[resIdx];
 
+#ifdef __NVIDIA__
+    SetVector<Value> thenSlice, elseSlice;
+    DenseMap<Value, Attribute> thenLayout, elseLayout;
+
+    LogicalResult thenResult = getRematerializableSlice(
+        thenRes, rootLayout, thenSlice, thenLayout, isIfOp,
+        kMaxRematSliceSize);
+    LogicalResult elseResult = getRematerializableSlice(
+        elseRes, rootLayout, elseSlice, elseLayout, isIfOp,
+        kMaxRematSliceSize);
+#else
     auto newSlice = slice;
     auto newLayout = layout;
 
@@ -4430,12 +4924,20 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
         thenRes, rootLayout, newSlice, newLayout, isIfOp, kMaxRematSliceSize);
     LogicalResult elseResult = getRematerializableSlice(
         elseRes, rootLayout, newSlice, newLayout, isIfOp, kMaxRematSliceSize);
+#endif
 
     // If propagation across both edges of this conditional succeeded, then we
     // don't need to hoist across it. Merge into the current slice.
     if (succeeded(thenResult) && succeeded(elseResult)) {
+#ifdef __NVIDIA__
+      slice.insert(thenSlice.begin(), thenSlice.end());
+      slice.insert(elseSlice.begin(), elseSlice.end());
+      layout.insert(thenLayout.begin(), thenLayout.end());
+      layout.insert(elseLayout.begin(), elseLayout.end());
+#else
       slice = std::move(newSlice);
       layout = std::move(newLayout);
+#endif
       continue;
     }
 
@@ -4454,16 +4956,27 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
       continue;
     }
 
-    slice = std::move(newSlice);
-    layout = std::move(newLayout);
-
     // The layout conversion can be rematerialized along one edge but not the
     // other. We can hoist the conversion into the other branch. Push this
     // into the subslice list for analysis.
     if (succeeded(thenResult)) {
       hoistAbove.emplace_back(v, &elseRes);
+#ifdef __NVIDIA__
+      slice.insert(thenSlice.begin(), thenSlice.end());
+      layout.insert(thenLayout.begin(), thenLayout.end());
+#else
+      slice = std::move(newSlice);
+      layout = std::move(newLayout);
+#endif
     } else {
       hoistAbove.emplace_back(v, &thenRes);
+#ifdef __NVIDIA__
+      slice.insert(elseSlice.begin(), elseSlice.end());
+      layout.insert(elseLayout.begin(), elseLayout.end());
+#else
+      slice = std::move(newSlice);
+      layout = std::move(newLayout);
+#endif
     }
   }
 
@@ -4589,7 +5102,11 @@ bool retargetTleSqmmaStores(ModuleOp module) {
 }
 #endif
 
-#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__) &&                  \
+    !defined(__FLAGTREE_HCU_RLC__)
+// HCU plugin TritonGPUTransforms does not link TLE EncodingRematerialization
+// (NVIDIA MMA remat APIs). Skipping is compile/link compatibility, same spirit
+// as MThreads; not RlcBackendPolicy calibration.
 static void eraseOpsCreatedAfter(Operation *previous, Operation *insertBefore) {
   Operation *cur =
       previous ? previous->getNextNode() : &insertBefore->getBlock()->front();
@@ -4869,7 +5386,7 @@ public:
         changed |= retargetTleSqmmaStores(m);
         cleanupConvertOps();
       }
-#elif defined(__TLE__)
+#elif defined(__TLE__) && !defined(__FLAGTREE_HCU_RLC__)
       if (m->hasAttr(
               ::mlir::triton::tle::kTleEnableEncodingRematerializationAttr)) {
         changed |= rematerializeStoreLayoutDemands(m);
@@ -4904,6 +5421,27 @@ public:
     if (applyPatternsGreedily(m, std::move(cleanUpPatterns2)).failed()) {
       signalPassFailure();
     }
+#ifdef __FLAGTREE_HCU_RLC__
+    if (triton::tools::getBoolEnv(
+            "FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE") &&
+        isHcuGfx936Target(m)) {
+      RewritePatternSet pairMaterializationPatterns(context);
+      pairMaterializationPatterns
+          .add<HcuGfx936F16PairMaterializationPattern>(context);
+      if (applyPatternsGreedily(m, std::move(pairMaterializationPatterns))
+              .failed())
+        signalPassFailure();
+    }
+    if (triton::tools::getBoolEnv(
+            "FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE") &&
+        isHcuGfx936Target(m)) {
+      RewritePatternSet boxMullerPairPatterns(context);
+      boxMullerPairPatterns
+          .add<HcuGfx936F32BoxMullerPairMaterializationPattern>(context);
+      if (applyPatternsGreedily(m, std::move(boxMullerPairPatterns)).failed())
+        signalPassFailure();
+    }
+#endif // __FLAGTREE_HCU_RLC__
     LLVM_DEBUG({
       DBGS() << "Module after final cleanups:\n";
       m.dump();

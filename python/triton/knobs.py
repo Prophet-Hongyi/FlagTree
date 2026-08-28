@@ -638,6 +638,43 @@ class hcu_knobs(base_knobs):
 
     use_async_copy: env_bool = env_bool("TRITON_HIP_USE_ASYNC_COPY")
     scalarize_packed_fops: env_bool = env_bool("AMDGCN_SCALARIZE_PACKED_FOPS")
+    # Compile the portable RLC phases into HCU builds, but keep them disabled
+    # until backend-specific IR, correctness, and performance gates pass.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_HCU_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_HCU_RLC_PHASE_MASK", 0xF)
+    # HCU MFMA can distribute atomic elements along a different fastest logical
+    # dimension than the blocked address layout. This opt-in allows Phase 3 to
+    # rematerialize only atomic ptr/mask chains in the MFMA layout; ordinary
+    # stores remain protected by the common writeback-access guard.
+    rlc_allow_atomic_writeback_order_change: env_bool = env_bool(
+        "FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE", False)
+    gfx936_f16_pair_materialize: env_bool = env_bool("FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE", False)
+    gfx936_f32_box_muller_pair_materialize: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE", False)
+    # Bridge LLVM22 pointer-buffer/HCU-MMAC LLIR to the legacy DTK17 gfx936
+    # contract. Keep this fail-closed and opt-in until device correctness passes.
+    gfx936_llvm17_contract_bridge: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_LLVM17_CONTRACT_BRIDGE", False)
+    # DTK17 gfx936 cannot select raw-buffer v2i64 loads. When explicitly
+    # enabled, materialize the same 128 bits through the supported v4i32 form.
+    gfx936_i64_vector_load_materialize: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_I64_VECTOR_LOAD_MATERIALIZE", False)
+    # DTK17 gfx936 cannot select raw-buffer v2i64 stores.  When explicitly
+    # enabled, materialize the same 128 bits through the supported v4i32 form.
+    gfx936_i64_vector_store_materialize: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_I64_VECTOR_STORE_MATERIALIZE", False)
+    # DTK17 gfx936 cannot select scalar i64 raw-buffer loads. Materialize the
+    # same 64 payload bits through the supported v2i32 raw-buffer form.
+    gfx936_i64_scalar_load_materialize: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_I64_SCALAR_LOAD_MATERIALIZE", False)
+    # DTK17 gfx936 cannot select scalar i64 raw-buffer stores. Materialize the
+    # same 64 payload bits through the supported v2i32 raw-buffer form.
+    gfx936_i64_scalar_store_materialize: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_I64_SCALAR_STORE_MATERIALIZE", False)
+    # LLVM22 may merge opaque buffer descriptors through an addrspace(8) phi.
+    # Materialize only phis whose incoming values are proven make-buffer results.
+    gfx936_resource_phi_materialize: env_bool = env_bool(
+        "FLAGTREE_HCU_GFX936_RESOURCE_PHI_MATERIALIZE", False)
 
 
 # flagtree metax
@@ -649,6 +686,10 @@ class metax_knobs(base_knobs):
     mlir_translate_path = os.path.join(mxgpu_llvm_path, "mlir-translate") if mxgpu_llvm_path and use_maca else None
     mxcc_path = os.path.join(mxgpu_llvm_path, "mxcc") if mxgpu_llvm_path and use_maca else None
     mlir_opt_path = os.path.join(maca_path, "mxgpu_llvm", "bin", "mlir-opt") if use_maca else None
+    # Compile the portable RLC phases into MetaX builds, but keep them disabled
+    # until backend-specific IR, correctness, and performance gates pass.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_METAX_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_METAX_RLC_PHASE_MASK", 0xF)
 
 
 # flagtree mthreads

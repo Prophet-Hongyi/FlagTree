@@ -193,6 +193,56 @@ def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
     assert os.environ["FLAGTREE_MUSA_RLC_PHASE_MASK"] == "9"
 
 
+def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
+    assert not fresh_knobs.metax.rlc_enhance
+    assert fresh_knobs.metax.rlc_phase_mask == 0xF
+
+    monkeypatch.setenv("FLAGTREE_METAX_RLC_ENHANCE", "1")
+    monkeypatch.setenv("FLAGTREE_METAX_RLC_PHASE_MASK", "5")
+    assert fresh_knobs.metax.rlc_enhance
+    assert fresh_knobs.metax.rlc_phase_mask == 5
+
+    fresh_knobs.metax.rlc_enhance = False
+    fresh_knobs.metax.rlc_phase_mask = 9
+    assert os.environ["FLAGTREE_METAX_RLC_ENHANCE"] == "0"
+    assert os.environ["FLAGTREE_METAX_RLC_PHASE_MASK"] == "9"
+
+
+def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
+    assert not fresh_knobs.hcu.rlc_enhance
+    assert fresh_knobs.hcu.rlc_phase_mask == 0xF
+    assert not fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
+    assert not fresh_knobs.hcu.gfx936_f16_pair_materialize
+    assert not fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize
+    assert not fresh_knobs.hcu.gfx936_llvm17_contract_bridge
+
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_ENHANCE", "1")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_PHASE_MASK", "5")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE", "true")
+    monkeypatch.setenv("FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE", "true")
+    monkeypatch.setenv("FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE", "true")
+    monkeypatch.setenv("FLAGTREE_HCU_GFX936_LLVM17_CONTRACT_BRIDGE", "true")
+    assert fresh_knobs.hcu.rlc_enhance
+    assert fresh_knobs.hcu.rlc_phase_mask == 5
+    assert fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
+    assert fresh_knobs.hcu.gfx936_f16_pair_materialize
+    assert fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize
+    assert fresh_knobs.hcu.gfx936_llvm17_contract_bridge
+
+    fresh_knobs.hcu.rlc_enhance = False
+    fresh_knobs.hcu.rlc_phase_mask = 9
+    fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change = False
+    fresh_knobs.hcu.gfx936_f16_pair_materialize = False
+    fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize = False
+    fresh_knobs.hcu.gfx936_llvm17_contract_bridge = False
+    assert os.environ["FLAGTREE_HCU_RLC_ENHANCE"] == "0"
+    assert os.environ["FLAGTREE_HCU_RLC_PHASE_MASK"] == "9"
+    assert os.environ["FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE"] == "0"
+    assert os.environ["FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE"] == "0"
+    assert os.environ["FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE"] == "0"
+    assert os.environ["FLAGTREE_HCU_GFX936_LLVM17_CONTRACT_BRIDGE"] == "0"
+
+
 def test_triton_home(fresh_knobs, monkeypatch):
     initial_home = fresh_knobs.cache.home_dir
     assert initial_home == os.path.expanduser("~/")

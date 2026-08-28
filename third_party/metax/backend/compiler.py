@@ -112,6 +112,15 @@ def get_lld_version():
         return 0
 
 
+def _rlc_policy_signature() -> str:
+    """Live RLC identity for disk and in-memory compile keys.
+
+    Must be read on every compile. Do not cache this string across
+    FLAGTREE_METAX_RLC_* environment changes in the same process.
+    """
+    return f"{int(bool(knobs.metax.rlc_enhance))}-{int(knobs.metax.rlc_phase_mask)}"
+
+
 @dataclass(frozen=True)
 class MACAOptions:
     num_warps: int = 4
@@ -142,6 +151,7 @@ class MACAOptions:
     scenario: str = ""
     pipeline_load_num: int = -1
     inner_stages: Tuple[int, int] = field(default_factory=lambda: (0, 0))
+    rlc_policy: str = ""
 
     def __post_init__(self):
         default_libdir = os.getenv("MACA_PATH") + '/lib'
@@ -199,6 +209,7 @@ class MACABackend(BaseBackend):
         args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in MACAOptions.__dataclass_fields__.keys() if k in opts})
         args["max_num_imprecise_acc_default"] = 2**30 if self.capability == 90 else 0
+        args["rlc_policy"] = _rlc_policy_signature()
         return MACAOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -269,7 +280,7 @@ class MACABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance, knobs.metax.rlc_phase_mask)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         if enable_mctle:
             #mctle.passes.add_reject_dot_op(pm)
@@ -282,14 +293,14 @@ class MACABackend(BaseBackend):
             disable_prefetch = True
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_int8_pass(pm, opt.num_stages, opt.pipeline)
         metax.passes.ttgpuir.add_accelerate_matmul(pm, opt.num_stages, disable_prefetch, store_coalesce, capability)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance, knobs.metax.rlc_phase_mask)
         if not os.getenv("TRITON_DISABLE_CONSTANCY_LOAD_LAYOUT_OPT"):
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_constancy_load_layout(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance, knobs.metax.rlc_phase_mask)
         if store_coalesce:
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_from_repn_to_elemn_pass(pm)
             metax.passes.ttgpuir.add_tritonmetaxgpu_optimize_cstore_pass(pm, opt.num_stages)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance, knobs.metax.rlc_phase_mask)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.common.add_cse(pm)
         passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -304,7 +315,7 @@ class MACABackend(BaseBackend):
                 else:
                     mixed = True if 'mixed' in opt.pipeline else False
                     metax.passes.ttgpuir.add_tritonmetaxgpu_addptr_opt_pass(pm, opt.num_stages, fullstage, mixed)
-                    passes.ttgpuir.add_remove_layout_conversions(pm)
+                    passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance, knobs.metax.rlc_phase_mask)
                     metax.passes.ttgpuir.add_pipeline_async_tn(pm, opt.num_stages, inner_stages[0], inner_stages[1])
                     metax.passes.ttgpuir.add_pipeline_async_tt(pm, opt.num_stages)
                     metax.passes.ttgpuir.add_pipeline_async_base(pm, opt.num_stages, fullstage, mixed)
@@ -312,7 +323,7 @@ class MACABackend(BaseBackend):
                 passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance, knobs.metax.rlc_phase_mask)
         metax.passes.ttgpuir.add_tritonmetaxgpu_optimize_smem_usage(pm, reduce_smem_usage)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
@@ -471,10 +482,22 @@ class MACABackend(BaseBackend):
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
         stages["mcfatbin"] = lambda src, metadata: self.make_mcfatbin(src, metadata, options, capability)
 
-    @functools.lru_cache()
-    def hash(self):
+    @staticmethod
+    def _mxcc_version() -> str:
+        """Cache only the immutable toolchain probe, never the live RLC policy."""
         mxcc_arch = knobs.metax.mxcc_path
         if mxcc_arch is None:
             raise RuntimeError('mxcc_arch is None (not specified)')
+        key = str(mxcc_arch)
+        cached = getattr(MACABackend, "_cached_mxcc_version", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         version = subprocess.check_output([mxcc_arch, "--version"]).decode("utf-8").split('\n', 1)[0]
-        return f'{version}-{self.capability}'
+        MACABackend._cached_mxcc_version = (key, version)
+        return version
+
+    def hash(self):
+        # The external version probe is cached, while the policy suffix is
+        # deliberately read on every call so same-process RLC flips stay live.
+        version = self._mxcc_version()
+        return f'{version}-{self.capability}-rlc{_rlc_policy_signature()}'
