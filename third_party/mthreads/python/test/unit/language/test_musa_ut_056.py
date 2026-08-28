@@ -3,12 +3,14 @@ import os
 os.environ.setdefault("TRITON_BACKENDS_IN_TREE", "1")
 
 import pytest
+import torch
 import triton
 import triton.language as tl
 from triton._C import libtriton
 from pathlib import Path
+from triton.compiler.errors import CompilationError
 
-if not hasattr(libtriton, "musa"):
+if not hasattr(libtriton, "mthreads"):
     pytest.skip("musa backend not built in libtriton", allow_module_level=True)
 
 from triton.backends import backends
@@ -18,10 +20,10 @@ from triton._C.libtriton import ir
 
 
 def _get_musa_backend():
-    if "musa" not in backends:
+    if "mthreads" not in backends:
         pytest.skip("musa backend not discovered")
     target = GPUTarget("musa", "ph1", 32)
-    return backends["musa"].compiler(target)
+    return backends["mthreads"].compiler(target)
 
 
 def _compile_to_llir(fn, signature, constexprs=None):
@@ -49,13 +51,13 @@ def _compile_to_llir(fn, signature, constexprs=None):
 
 def test_musa_056_default_libdevice_path(fresh_knobs):
     backend = _get_musa_backend()
-    from triton.backends.musa import compiler as musa_compiler
+    from triton.backends.mthreads import compiler as mthreads_compiler
 
     with fresh_knobs.musa.scope():
         del fresh_knobs.musa.libdevice_path
         options = backend.parse_options({})
 
-    expected = Path(musa_compiler.__file__).resolve().parent / "lib" / "libdevice.31.bc"
+    expected = Path(mthreads_compiler.__file__).resolve().parent / "lib" / "libdevice.31.bc"
     assert Path(dict(options.extern_libs)["libdevice"]).resolve() == expected
 
 
@@ -150,3 +152,41 @@ def test_musa_056_constexpr_annotation_compile_only():
     llir, _ = _compile_to_llir(kernel_constexpr, {"inp": "*fp32", "out": "*fp32", "BLOCK": "constexpr"},
                                constexprs={"BLOCK": 32})
     assert "target datalayout" in llir
+
+
+@triton.jit
+def _musa_int8_dot_kernel(a, b, out):
+    offs_m = tl.arange(0, 32)
+    offs_n = tl.arange(0, 32)
+    offs_k = tl.arange(0, 64)
+    lhs = tl.load(a + offs_m[:, None] * 64 + offs_k[None, :])
+    rhs = tl.load(b + offs_k[:, None] * 32 + offs_n[None, :])
+    acc = tl.dot(lhs, rhs)
+    tl.store(out + offs_m[:, None] * 32 + offs_n[None, :], acc)
+
+
+def test_musa_ph1_signed_int8_dot_lowers_to_sqmma():
+    llir, _ = _compile_to_llir(_musa_int8_dot_kernel, {"a": "*i8", "b": "*i8", "out": "*i32"})
+    assert "llvm.musa.sqmma.smma" in llir
+
+
+def test_musa_ph1_uint8_dot_fails_closed():
+    with pytest.raises(CompilationError, match="only int8 supported"):
+        _compile_to_llir(_musa_int8_dot_kernel, {"a": "*u8", "b": "*u8", "out": "*i32"})
+
+
+def test_musa_ph1_signed_int8_dot_device():
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        pytest.skip("requires a MUSA device")
+
+    torch.manual_seed(17)
+    lhs = torch.randint(-4, 5, (32, 64), dtype=torch.int8, device="musa")
+    rhs = torch.randint(-4, 5, (64, 32), dtype=torch.int8, device="musa")
+    out = torch.empty((32, 32), dtype=torch.int32, device="musa")
+
+    compiled = _musa_int8_dot_kernel[(1, )](lhs, rhs, out, num_warps=4)
+    torch.musa.synchronize()
+
+    expected = lhs.cpu().to(torch.int32) @ rhs.cpu().to(torch.int32)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    assert "llvm.musa.sqmma.smma" in compiled.asm["llir"]
