@@ -57,6 +57,8 @@ _POLICY_ENV = (
     ("FLAGTREE_MUSA_RLC_CACHED_LOAD_COST_PER_BYTE", "ttg.rlc-cached-load-cost-per-byte"),
     ("FLAGTREE_MUSA_RLC_EXPENSIVE_MATH_COST_PER_BYTE", "ttg.rlc-expensive-math-cost-per-byte"),
     ("FLAGTREE_MUSA_RLC_INTER_WARP_REDUCE_COST", "ttg.rlc-inter-warp-reduce-cost"),
+    ("FLAGTREE_MUSA_RLC_ATOMIC_WRITEBACK_MAX_ELEMS_PER_THREAD_RATIO",
+     "ttg.rlc-atomic-writeback-max-elements-per-thread-ratio"),
 )
 
 
