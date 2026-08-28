@@ -556,6 +556,11 @@ please share the reproducer above with Triton project.
             fsrc.name = fsrcformatted
 
             fbin = fsrc.name + ".o"
+            # Keep the reproducer next to the transient formatted input.  The
+            # vendor implementation used this name below without defining it,
+            # which masked every ppu-llc failure with a NameError and also
+            # broke successful compiles when TRITON_DUMP_COMPILE_LOG was set.
+            log_file = fsrc.name + ".log"
 
             ppullc_cmd = [
                 ppullc,
