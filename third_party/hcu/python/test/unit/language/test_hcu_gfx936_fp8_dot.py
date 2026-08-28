@@ -22,6 +22,12 @@ if "hcu" not in backends:
 _GFX936_TARGET = GPUTarget("hip", "gfx936", 64)
 _FP16_MMAC_LLIR = "llvm.hcu.mmac.f32.16x16x16.f16"
 _FP16_MMAC_ASM = "v_mmac_f32_16x16x16_f16"
+_NATIVE_FP8_DOWNCAST_ASM = (
+    "v_cvt_pk_fp8_f32",
+    "v_cvt_pk_bf8_f32",
+    "v_cvt_scalef32_pk_fp8",
+    "v_cvt_scalef32_pk_bf8",
+)
 
 
 @triton.jit
@@ -36,10 +42,14 @@ def _hcu_fp8_dot_kernel(lhs, rhs, out):
     tl.store(out + offs_m[:, None] * 16 + offs_n[None, :], result)
 
 
-def _compile_gfx936(dtype):
+def _compile_gfx936(dtype, out_dtype="fp32"):
     src = ASTSource(
         fn=_hcu_fp8_dot_kernel,
-        signature={"lhs": f"*{dtype}", "rhs": f"*{dtype}", "out": "*fp32"},
+        signature={
+            "lhs": f"*{dtype}",
+            "rhs": f"*{dtype}",
+            "out": f"*{out_dtype}",
+        },
     )
     return triton.compile(
         src,
@@ -100,4 +110,62 @@ def test_gfx936_ocp_fp8_dot_device(triton_dtype, codes):
     assert compiled.asm["amdgcn"].count(_FP16_MMAC_ASM) == 2
     assert "v_mmac_f32_16x16x32_fp8" not in compiled.asm["amdgcn"]
     assert "v_mmac_f32_16x16x32_bf8" not in compiled.asm["amdgcn"]
+    assert compiled.asm["hsaco"]
+
+
+@pytest.mark.parametrize("dtype", ["fp8e4nv", "fp8e5"])
+def test_gfx936_ocp_fp8_dot_output_uses_software_conversion(dtype):
+    compiled = _compile_gfx936(dtype, out_dtype=dtype)
+
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 3
+    assert compiled.asm["llir"].count(_FP16_MMAC_LLIR + "(") == 3
+    assert compiled.asm["amdgcn"].count(_FP16_MMAC_ASM) == 2
+    assert "v_mmac_f32_16x16x32_fp8" not in compiled.asm["amdgcn"]
+    assert "v_mmac_f32_16x16x32_bf8" not in compiled.asm["amdgcn"]
+    assert not any(
+        mnemonic in compiled.asm["amdgcn"] for mnemonic in _NATIVE_FP8_DOWNCAST_ASM
+    )
+    assert compiled.asm["hsaco"]
+
+
+@pytest.mark.parametrize(
+    ("triton_dtype", "codes"),
+    [
+        (tl.float8e4nv, [0xC0, 0xB8, 0x00, 0x38, 0x40]),
+        (tl.float8e5, [0xC0, 0xBC, 0x00, 0x3C, 0x40]),
+    ],
+)
+def test_gfx936_ocp_fp8_dot_output_device(triton_dtype, codes):
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("requires an HCU device")
+
+    target = triton.runtime.driver.active.get_current_target()
+    if target.backend != "hip" or target.arch != "gfx936":
+        pytest.skip("requires a gfx936 HCU device")
+
+    raw_codes = torch.tensor(codes, dtype=torch.uint8)
+    lhs_index = ((torch.arange(16 * 32) * 7 + 3) % len(codes)).reshape(16, 32)
+    lhs_raw = raw_codes[lhs_index].to("cuda")
+    rhs_raw = torch.zeros((32, 16), dtype=torch.uint8)
+    rhs_raw.diagonal().fill_(codes[3])
+    rhs_raw = rhs_raw.to("cuda")
+    out_raw = torch.empty((16, 16), dtype=torch.uint8, device="cuda")
+
+    compiled = _hcu_fp8_dot_kernel[(1, )](
+        triton.reinterpret(lhs_raw, triton_dtype),
+        triton.reinterpret(rhs_raw, triton_dtype),
+        triton.reinterpret(out_raw, triton_dtype),
+        num_warps=4,
+        num_stages=1,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_raw.cpu(), lhs_raw[:, :16].cpu(), rtol=0, atol=0)
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 3
+    assert compiled.asm["amdgcn"].count(_FP16_MMAC_ASM) == 2
+    assert "v_mmac_f32_16x16x32_fp8" not in compiled.asm["amdgcn"]
+    assert "v_mmac_f32_16x16x32_bf8" not in compiled.asm["amdgcn"]
+    assert not any(
+        mnemonic in compiled.asm["amdgcn"] for mnemonic in _NATIVE_FP8_DOWNCAST_ASM
+    )
     assert compiled.asm["hsaco"]
