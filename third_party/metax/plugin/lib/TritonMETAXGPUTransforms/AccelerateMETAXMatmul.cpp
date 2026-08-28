@@ -8,6 +8,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 #define DEBUG_TYPE "TritonMETAXGPUAccelerateMatmulPass"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -121,6 +123,41 @@ SmallVector<unsigned, 2> warpsPerTileMACA(triton::DotOp dotOp,
     }
   } while (true);
   return ret;
+}
+
+static bool isOcpFp8(Type type) {
+  return llvm::isa<Float8E4M3FNType, Float8E5M2Type>(type);
+}
+
+// MetaX MMA versions before 2.6 do not accept FP8 operands.  Keep the FP8
+// storage ABI, but materialize the same software FP8 -> FP16 conversion that a
+// user-written `to(tl.float16)` would express before selecting an FP16 MMA
+// layout.  Doing this before BlockedToMMA is important because the MACA layout
+// parameters depend on the effective MMA operand type.
+static void legalizeSoftwareFp8DotOperands(ModuleOp mod,
+                                           int computeCapability) {
+  if (computeCapability < 80 || computeCapability >= 86)
+    return;
+
+  mod.walk([](triton::DotOp dotOp) {
+    auto aType = cast<RankedTensorType>(dotOp.getA().getType());
+    auto bType = cast<RankedTensorType>(dotOp.getB().getType());
+    if (!isOcpFp8(aType.getElementType()) ||
+        !isOcpFp8(bType.getElementType()))
+      return;
+
+    OpBuilder builder(dotOp);
+    auto promote = [&](Value operand) {
+      auto operandType = cast<RankedTensorType>(operand.getType());
+      auto promotedType = operandType.cloneWith(
+          std::nullopt, builder.getF16Type());
+      return triton::FpToFpOp::create(builder, dotOp.getLoc(), promotedType,
+                                      operand)
+          .getResult();
+    };
+    dotOp.setOperand(0, promote(dotOp.getA()));
+    dotOp.setOperand(1, promote(dotOp.getB()));
+  });
 }
 
 class BlockedToMMA : public mlir::RewritePattern {
@@ -325,6 +362,8 @@ public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+
+    legalizeSoftwareFp8DotOperands(m, computeCapability);
 
     m->setAttr(
         "use.opt.maca.mma",

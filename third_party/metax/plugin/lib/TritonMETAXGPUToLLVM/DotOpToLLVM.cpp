@@ -35,20 +35,27 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
 
     MACAMmaEncodingAttr mmaLayout = dyn_cast<MACAMmaEncodingAttr>(
         cast<RankedTensorType>(D.getType()).getEncoding());
-    if (!isOuter && mmaLayout &&
-        supportMMA(op, mmaLayout.getVersionMajor(),
-                   mmaLayout.getVersionMinor())) {
-      return convertMMAMACA(op, adaptor, getTypeConverter(), rewriter);
-      llvm::report_fatal_error(
-          "Unsupported MMA kind found when converting DotOp to LLVM.");
+    if (mmaLayout) {
+      if (!isOuter && supportMMA(op, mmaLayout.getVersionMajor(),
+                                mmaLayout.getVersionMinor()))
+        return convertMMAMACA(op, adaptor, getTypeConverter(), rewriter);
+      return rewriter.notifyMatchFailure(
+          op, "MMA dot operands were not legalized for the target");
     }
 
     if (isa<BlockedEncodingAttr>(
-            cast<RankedTensorType>(D.getType()).getEncoding()))
+            cast<RankedTensorType>(D.getType()).getEncoding())) {
+      auto aType = cast<RankedTensorType>(op.getA().getType()).getElementType();
+      auto bType = cast<RankedTensorType>(op.getB().getType()).getElementType();
+      auto dType = cast<RankedTensorType>(D.getType()).getElementType();
+      if (aType != dType || bType != dType)
+        return rewriter.notifyMatchFailure(
+            op, "blocked dot operands must match the accumulator type");
       return convertFMADot(op, adaptor, getTypeConverter(), rewriter);
+    }
 
-    llvm::report_fatal_error(
-        "Unsupported DotOp found when converting TritonGPU to LLVM.");
+    return rewriter.notifyMatchFailure(
+        op, "unsupported dot layout when converting TritonGPU to LLVM");
   }
 };
 } // namespace
