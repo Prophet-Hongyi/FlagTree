@@ -14,10 +14,13 @@ import warnings
 import os
 from pathlib import Path
 
-from .llvm17_int8_compat import (
+from .llvm17_mmac_compat import (
+    LEGACY_FP16_MMAC,
     LEGACY_INT8_MMAC,
+    NEW_FP16_MMAC,
     NEW_INT8_MMAC,
-    LLVM17Int8MmacBridgeStats,
+    LLVM17MmacBridgeStats,
+    bridge_gfx936_fp16_mmac_for_llvm17,
     bridge_gfx936_int8_mmac_for_llvm17,
 )
 
@@ -776,12 +779,15 @@ class HIPBackend(BaseBackend):
         #                                False)
         llir_file = None
         asm_file = None
-        bridge_stats = LLVM17Int8MmacBridgeStats()
+        bridge_stats = LLVM17MmacBridgeStats()
+        bridge_asm_instruction = None
         try:
-            use_llvm17_int8_bridge = (
-                options.arch == "gfx936" and HIPBackend._clang_major() == 17 and NEW_INT8_MMAC in llvm_source
+            use_llvm17_mmac_bridge = (
+                options.arch == "gfx936"
+                and HIPBackend._clang_major() == 17
+                and (NEW_INT8_MMAC in llvm_source or NEW_FP16_MMAC in llvm_source)
             )
-            if use_llvm17_int8_bridge:
+            if use_llvm17_mmac_bridge:
                 unsupported_options = []
                 if options.wdra_enabled:
                     unsupported_options.append("wdra_enabled")
@@ -793,10 +799,21 @@ class HIPBackend(BaseBackend):
                     unsupported_options.append("enable_asan")
                 if unsupported_options:
                     raise HSACOError(
-                        "gfx936 DTK17 signed INT8 MMAC bridge does not support: "
+                        "gfx936 DTK17 MMAC bridge does not support: "
                         + ", ".join(unsupported_options)
                     )
-                llvm_source, bridge_stats = bridge_gfx936_int8_mmac_for_llvm17(llvm_source)
+                has_int8_mmac = NEW_INT8_MMAC in llvm_source
+                has_fp16_mmac = NEW_FP16_MMAC in llvm_source
+                if has_int8_mmac and has_fp16_mmac:
+                    raise HSACOError(
+                        "gfx936 DTK17 MMAC bridge does not support mixed INT8/FP16 contracts"
+                    )
+                if has_int8_mmac:
+                    llvm_source, bridge_stats = bridge_gfx936_int8_mmac_for_llvm17(llvm_source)
+                    bridge_asm_instruction = "v_mmac_i32_16x16x32_i8"
+                else:
+                    llvm_source, bridge_stats = bridge_gfx936_fp16_mmac_for_llvm17(llvm_source)
+                    bridge_asm_instruction = "v_mmac_f32_16x16x16_f16"
 
             with tempfile.NamedTemporaryFile(mode='w', suffix=".ll", delete=False) as f:
                 llir_file = f.name
@@ -804,7 +821,7 @@ class HIPBackend(BaseBackend):
 
             asm_file = tempfile.mktemp(suffix=".amdgcn")
 
-            if use_llvm17_int8_bridge:
+            if use_llvm17_mmac_bridge:
                 asm_command = [
                     HIPBackend.path_to_rocm_llc(),
                     f"-mtriple={hcu.TARGET_TRIPLE}",
@@ -831,17 +848,18 @@ class HIPBackend(BaseBackend):
                 amdgcn = fd_out.read()
 
             if bridge_stats.calls:
-                actual_calls = amdgcn.count("v_mmac_i32_16x16x32_i8")
+                actual_calls = amdgcn.count(bridge_asm_instruction)
                 unresolved_contracts = [
                     contract for contract in (
                         LEGACY_INT8_MMAC,
+                        LEGACY_FP16_MMAC,
                         "llvm.amdgcn.make.buffer.rsrc",
                         "llvm.amdgcn.raw.ptr.buffer",
                     ) if contract in amdgcn
                 ]
                 if actual_calls != bridge_stats.calls or unresolved_contracts:
                     raise HSACOError(
-                        "gfx936 DTK17 signed INT8 MMAC lowering mismatch: "
+                        "gfx936 DTK17 MMAC lowering mismatch: "
                         f"llir={bridge_stats.calls} asm={actual_calls} "
                         f"unresolved={unresolved_contracts}"
                     )
@@ -878,11 +896,14 @@ class HIPBackend(BaseBackend):
             hsaco_file = tempfile.mktemp(suffix=".hsaco")
 
             clang_path = HIPBackend.path_to_rocm_clang()
-            use_llvm17_int8_bridge = (
+            use_llvm17_mmac_bridge = (
                 options.arch == "gfx936" and HIPBackend._clang_major() == 17
-                and "v_mmac_i32_16x16x32_i8" in str(src)
+                and (
+                    "v_mmac_i32_16x16x32_i8" in str(src)
+                    or "v_mmac_f32_16x16x16_f16" in str(src)
+                )
             )
-            if use_llvm17_int8_bridge:
+            if use_llvm17_mmac_bridge:
                 hsaco_command = [
                     clang_path,
                     "-target",
@@ -933,7 +954,7 @@ class HIPBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         version = subprocess.check_output([HIPBackend.path_to_rocm_clang(), "--version"], encoding='utf-8')
-        compatibility = "-gfx936-int8-llvm17-v2" if (
+        compatibility = "-gfx936-mmac-llvm17-v3" if (
             self.target.arch == "gfx936" and HIPBackend._clang_major() == 17
         ) else ""
         return f'{version}-{self.target}{compatibility}'

@@ -1,0 +1,68 @@
+import pytest
+
+from triton.backends.hcu.llvm17_mmac_compat import (
+    LEGACY_FP16_MMAC,
+    MAKE_BUFFER_RSRC,
+    NEW_FP16_MMAC,
+    PTR_BUFFER_STORE_F32,
+    RAW_BUFFER_STORE_F32,
+    LLVM17MmacBridgeError,
+    bridge_gfx936_fp16_mmac_for_llvm17,
+)
+
+
+def _fp16_dot_module(lit="false", lts="false", stride=0):
+    return f"""define amdgpu_kernel void @kernel(ptr addrspace(1) %out, <4 x half> %a, <4 x half> %b) {{
+  %acc0 = call <4 x float> @{NEW_FP16_MMAC}(<4 x half> %a, <4 x half> %b, <4 x float> zeroinitializer, i1 {lit}, i1 {lts})
+  %rsrc = call ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1) %out, i16 {stride}, i32 1024, i32 159744)
+  call void @{PTR_BUFFER_STORE_F32}(float 0.0, ptr addrspace(8) %rsrc, i32 0, i32 0, i32 0)
+  ret void
+}}
+declare <4 x float> @{NEW_FP16_MMAC}(<4 x half>, <4 x half>, <4 x float>, i1, i1)
+declare ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1), i16, i32, i32)
+declare void @{PTR_BUFFER_STORE_F32}(float, ptr addrspace(8), i32, i32, i32)
+"""
+
+
+def test_fp16_mmac_and_output_buffer_are_bridged():
+    bridged, stats = bridge_gfx936_fp16_mmac_for_llvm17(_fp16_dot_module())
+
+    assert NEW_FP16_MMAC not in bridged
+    assert LEGACY_FP16_MMAC in bridged
+    assert MAKE_BUFFER_RSRC not in bridged
+    assert PTR_BUFFER_STORE_F32 not in bridged
+    assert RAW_BUFFER_STORE_F32 in bridged
+    assert "ptr addrspace(8)" not in bridged
+    assert stats.calls == 1
+    assert stats.make_buffer_calls == 1
+    assert stats.raw_buffer_store_calls == 1
+
+
+@pytest.mark.parametrize(("lit", "lts"), [("true", "false"), ("false", "true")])
+def test_fp16_mmac_controls_fail_closed(lit, lts):
+    with pytest.raises(LLVM17MmacBridgeError, match="only supports the legacy layout"):
+        bridge_gfx936_fp16_mmac_for_llvm17(_fp16_dot_module(lit, lts))
+
+
+def test_unknown_fp16_buffer_overload_fails_closed():
+    source = _fp16_dot_module().replace(
+        PTR_BUFFER_STORE_F32, "llvm.amdgcn.raw.ptr.buffer.store.f16"
+    )
+    with pytest.raises(LLVM17MmacBridgeError, match="unsupported.*buffer overloads"):
+        bridge_gfx936_fp16_mmac_for_llvm17(source)
+
+
+def test_nonzero_fp16_buffer_stride_fails_closed():
+    with pytest.raises(LLVM17MmacBridgeError, match="nonzero buffer stride"):
+        bridge_gfx936_fp16_mmac_for_llvm17(_fp16_dot_module(stride=4))
+
+
+def test_malformed_fp16_mmac_contract_fails_closed():
+    call_prefix = f"call <4 x float> @{NEW_FP16_MMAC}(<4 x half> %a"
+    source = _fp16_dot_module().replace(
+        call_prefix,
+        f"call <4 x float> @{NEW_FP16_MMAC}(<4 x i16> %a",
+        1,
+    )
+    with pytest.raises(LLVM17MmacBridgeError, match="cannot parse FP16 MMAC contract"):
+        bridge_gfx936_fp16_mmac_for_llvm17(source)

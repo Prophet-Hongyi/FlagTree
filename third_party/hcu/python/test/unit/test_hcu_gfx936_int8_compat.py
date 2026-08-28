@@ -1,6 +1,6 @@
 import pytest
 
-from triton.backends.hcu.llvm17_int8_compat import (
+from triton.backends.hcu.llvm17_mmac_compat import (
     LEGACY_INT8_MMAC,
     MAKE_BUFFER_RSRC,
     NEW_INT8_MMAC,
