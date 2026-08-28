@@ -53,6 +53,15 @@ PPU_UNSUPPORTED_TLE_OPS = {
 }
 
 
+def _rlc_policy_signature() -> str:
+    """Live RLC identity for disk and in-memory compile keys.
+
+    Must be read on every compile. Do not cache this string across
+    FLAGTREE_PPU_RLC_* environment changes in the same process.
+    """
+    return f"{int(bool(knobs.ppu.rlc_enhance))}-{int(knobs.ppu.rlc_phase_mask)}"
+
+
 def reject_unsupported_tle(mod):
     features = set()
 
@@ -172,6 +181,10 @@ class HGGCOptions:
     sanitize_overflow: bool = True
     arch: str = None
     instrumentation_mode: str = ""
+    # Compile-key fragment for FLAGTREE_PPU_RLC_*. Stamped from knobs in
+    # parse_options so JITFunction.device_caches (which keys on str(options))
+    # cannot reuse an incumbent binary after an in-process enhance flip.
+    rlc_policy: str = ""
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -238,6 +251,8 @@ class PPUBackend(BaseBackend):
 
         if "enable_fp_fusion" not in args:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
+
+        args["rlc_policy"] = _rlc_policy_signature()
 
         args["max_num_imprecise_acc_default"] = 2**30 if capability == 90 else 0
 
@@ -541,6 +556,11 @@ please share the reproducer above with Triton project.
             fsrc.name = fsrcformatted
 
             fbin = fsrc.name + ".o"
+            # Keep the reproducer next to the transient formatted input.  The
+            # vendor implementation used this name below without defining it,
+            # which masked every ppu-llc failure with a NameError and also
+            # broke successful compiles when TRITON_DUMP_COMPILE_LOG was set.
+            log_file = fsrc.name + ".log"
 
             ppullc_cmd = [
                 ppullc,
@@ -599,7 +619,9 @@ please share the reproducer above with Triton project.
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, capability)
 
-    @functools.lru_cache()
     def hash(self):
+        # Do not lru_cache: RLC knobs are process environment. A no-arg cache
+        # freezes the first FLAGTREE_PPU_RLC_ENHANCE value for the backend
+        # instance and makes later enhance flips a disk-cache no-op.
         version = get_ppu_llc_version()
-        return f'{version}-{self.target.arch}'
+        return f'{version}-{self.target.arch}-rlc{_rlc_policy_signature()}'
