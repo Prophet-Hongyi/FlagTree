@@ -23,6 +23,7 @@ import triton
 import triton.language as tl
 from triton import knobs
 from triton.backends.compiler import GPUTarget
+from triton.compiler.errors import CompilationError
 
 tle_backend = pytest.importorskip(
     "triton._C.libtriton.tle",
@@ -276,6 +277,8 @@ def _gemm_aiu_kernel(
 
 _GEMM_SIG = {"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32"}
 _GEMM_CONSTEXPRS = {"M": 512, "N": 512, "K": 256, "BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}
+_INT8_GEMM_CONSTEXPRS = {"M": 16, "N": 16, "K": 32, "BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32}
+_INT8_MMA_INSTRUCTION = "ppu.mma.sync.aligned.m16n16k32.row.col.satfinite.s32.s8.s8.s32"
 
 
 @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
@@ -310,6 +313,29 @@ def _int8_gemm_aiu_kernel(
 
 
 @_skip_no_sdk
+def test_int8_gemm_aiu_lowers_to_v1_b8_s8_mma():
+    compiled = _compile_through_llir(
+        _int8_gemm_aiu_kernel,
+        {"a_ptr": "*i8", "b_ptr": "*i8", "c_ptr": "*i32"},
+        _INT8_GEMM_CONSTEXPRS,
+    )
+    _assert_stages_exist(compiled)
+    _assert_no_tle_residue(compiled)
+    _assert_int8_uses_ppu_aiu_v1_b8(compiled)
+    assert _INT8_MMA_INSTRUCTION in compiled.asm["llir"]
+
+
+@_skip_no_sdk
+def test_uint8_gemm_aiu_fails_closed_before_lowering():
+    with pytest.raises(CompilationError, match="only int8 supported"):
+        _compile_through_llir(
+            _int8_gemm_aiu_kernel,
+            {"a_ptr": "*u8", "b_ptr": "*u8", "c_ptr": "*i32"},
+            _INT8_GEMM_CONSTEXPRS,
+        )
+
+
+@_skip_no_sdk
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="PPU device not available")
 @pytest.mark.parametrize(
     "m,n,k,bm,bn,bk,num_warps",
@@ -322,10 +348,14 @@ def test_int8_gemm_aiu_device_correctness(m, n, k, bm, bn, bk, num_warps):
     b = torch.randint(-8, 9, (n, k), device="cuda", dtype=torch.int8)
     actual = torch.empty((m, n), device="cuda", dtype=torch.int32)
     grid = (triton.cdiv(m, bm), triton.cdiv(n, bn))
-    _int8_gemm_aiu_kernel[grid](a, b, actual, m, n, k, bm, bn, bk, num_warps=num_warps, num_stages=1)
+    compiled = _int8_gemm_aiu_kernel[grid](
+        a, b, actual, m, n, k, bm, bn, bk, num_warps=num_warps, num_stages=1)
     torch.cuda.synchronize()
     expected = a.cpu().to(torch.int32) @ b.cpu().to(torch.int32).T
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    _assert_int8_uses_ppu_aiu_v1_b8(compiled)
+    assert _INT8_MMA_INSTRUCTION in compiled.asm["llir"]
+    assert compiled.asm["hgbin"]
 
 
 @_skip_no_sdk
