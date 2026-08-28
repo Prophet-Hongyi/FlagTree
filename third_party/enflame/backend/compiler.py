@@ -26,16 +26,23 @@ from dataclasses import dataclass
 import functools
 from typing import Any, Tuple
 import hashlib
+import triton.knobs as knobs
 from triton.runtime.cache import get_cache_manager
 from triton._C.libtriton import ir, passes, llvm
 from triton.backends.enflame import passes as gcu_passes
+from triton.backends.enflame.passes._rlc import (
+    RLC_OPTION_NAMES,
+    RLC_POLICY_FIELDS,
+    rlc_policy_signature as _make_rlc_policy_signature,
+    validate_rlc_arch,
+    validate_rlc_phase_mask,
+)
 from triton.backends.enflame.gcu_intrinsics import restore_intrinsics_from_placeholders as _restore_gcu_intrinsics
 from typing import Dict
 from types import ModuleType
 from triton.runtime.errors import OutOfResources
 
 if toolkit.get_bool_env("TRITON_GCU_COMPILE_TIME"):
-    import triton.knobs as knobs
     from triton.compiler.compiler import ASTSource
 
     def gcu_listener(*, src, metadata, metadata_group, times, cache_hit):
@@ -69,6 +76,22 @@ if toolkit.get_bool_env("TRITON_GCU_COMPILE_TIME"):
                     print(f"    {pname}: {val!r}")
 
     knobs.compilation.listener = gcu_listener
+
+
+def _rlc_policy_signature():
+    """Return the live Enflame RLC identity used before options are packed."""
+    return _make_rlc_policy_signature(knobs.enflame)
+
+
+def _apply_enflame_rlc_policy(mod, options):
+    """Attach positive Enflame cost overrides to the TTGPU module."""
+    if not options.rlc_enhance:
+        return
+    builder = ir.builder(mod.context)
+    for option_name, attribute_name in RLC_POLICY_FIELDS:
+        value = int(getattr(options, option_name))
+        if value > 0:
+            mod.set_attr(attribute_name, builder.get_int32_attr(value))
 
 
 def _patch_kernel_for_gcuir(kernel):
@@ -157,6 +180,8 @@ def make_ttgir(mod, metadata, options):
 
 
 def make_gcuir(mod, metadata, options):
+    validate_rlc_arch(options.arch, options.rlc_enhance)
+    _apply_enflame_rlc_policy(mod, options)
     patched_mod = _patch_kernel_for_gcuir(str(mod))
     metadata['name'] = re.search('tt.func public @(\\w+)\\(', patched_mod).group(1).strip()
     metadata['tle_raw'] = '"tle.dsl_region"' in patched_mod
@@ -186,12 +211,14 @@ def make_gcuir(mod, metadata, options):
 
         gcu_passes.gcu300.add_gcu_convert_triton_to_tritongpu(pm, options.num_warps, options.warp_size,
                                                               options.num_ctas, f'gcu:{options.arch}')
-        gcu_passes.gcu300.add_tritongpu_remove_layout_conversions(pm)
+        gcu_passes.gcu300.add_tritongpu_remove_layout_conversions(pm, options.rlc_enhance,
+                                                                  options.rlc_phase_mask)
         gcu_passes.gcu300.add_tle_to_triton_gcu(pm, getattr(options, 'cluster_dims', (1, 1, 1)))
         gcu_passes.gcu300.add_triton_gpu_to_triton_gcu(pm)
         gcu_passes.gcu300.add_convert_tensor_pointer(pm)
         gcu_passes.gcu300.add_triton_gcu_dot_layout_optimize(pm)
-        gcu_passes.gcu300.add_tritongpu_remove_layout_conversions(pm)
+        gcu_passes.gcu300.add_tritongpu_remove_layout_conversions(pm, options.rlc_enhance,
+                                                                  options.rlc_phase_mask)
         gcu_passes.gcu300.add_convert_triton_load_store_to_gcu_dma(pm, support_stride0, options.enable_i64)
         gcu_passes.mlir.add_canonicalize(pm)
         gcu_passes.mlir.add_loop_invariant_code_motion(pm)
@@ -215,7 +242,8 @@ def make_gcuir(mod, metadata, options):
                 gcu_passes.gcu400.add_tle_dslregion_inline(pm)
         gcu_passes.gcu400.add_gcu_convert_triton_to_tritongpu(pm, options.num_warps, options.warp_size,
                                                               options.num_ctas, f'gcu:{options.arch}')
-        gcu_passes.gcu400.add_tritongpu_remove_layout_conversions(pm)
+        gcu_passes.gcu400.add_tritongpu_remove_layout_conversions(pm, options.rlc_enhance,
+                                                                  options.rlc_phase_mask)
         # customer Materialize tle_raw_deferred
         gcu_passes.gcu400.add_tle_to_triton_gcu(pm, getattr(options, 'cluster_dims', (1, 1, 1)))
         gcu_passes.gcu400.add_triton_gpu_to_triton_gcu(pm)
@@ -228,7 +256,8 @@ def make_gcuir(mod, metadata, options):
         gcu_passes.gcu400.add_convert_triton_load_store_to_gcu_dma(pm, options.enable_stride0, options.redundant_sip)
         gcu_passes.mlir.add_canonicalize(pm)
         gcu_passes.gcu400.add_triton_wgdot_to_gcu(pm)
-        gcu_passes.gcu400.add_tritongpu_remove_layout_conversions(pm)
+        gcu_passes.gcu400.add_tritongpu_remove_layout_conversions(pm, options.rlc_enhance,
+                                                                  options.rlc_phase_mask)
         gcu_passes.gcu400.add_triton_gcu_data_layout_optimize(pm)
         gcu_passes.mlir.add_loop_invariant_code_motion(pm)
         gcu_passes.gcu400.add_annotate_dot_acc_reuse(pm)
@@ -502,10 +531,25 @@ class GCUOptions:
     max_dsm: int = 0
     instrumentation_mode: str = ""
     launch_pdl: bool = False
+    # These fields are frozen by parse_options and therefore participate in
+    # both str(options) and GCUOptions.hash(). Production remains default-off.
+    rlc_enhance: bool = False
+    rlc_phase_mask: int = 0xF
+    rlc_minimum_writeback_bits: int = 0
+    rlc_convert_minimum_elements: int = 0
+    rlc_convert_minimum_element_bits: int = 0
+    rlc_convert_cost_per_byte: int = 0
+    rlc_cached_load_cost_per_byte: int = 0
+    rlc_expensive_math_cost_per_byte: int = 0
+    rlc_inter_warp_reduce_cost: int = 0
+    rlc_policy: str = ""
 
     def __post_init__(self):
         architecture = GCUBackend().get_architecture_descriptor()
         self.arch = "gcu" + str(architecture['version'])
+        self.rlc_phase_mask = validate_rlc_phase_mask(self.rlc_phase_mask)
+        validate_rlc_arch(self.arch, self.rlc_enhance)
+        self.rlc_policy = _make_rlc_policy_signature(self)
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
                "num_warps must be a power of 2"
         if self.arch == "gcu400" or self.arch == "gcu410":
@@ -602,6 +646,9 @@ class _GCUBackend(BaseBackend):
     def parse_options(self, opts) -> Any:
         args = {k: opts[k] for k in GCUOptions.__dataclass_fields__.keys() if k in opts}
 
+        for name in RLC_OPTION_NAMES:
+            args.setdefault(name, getattr(knobs.enflame, name))
+
         if "enable_fp_fusion" not in opts:
             args["enable_fp_fusion"] = toolkit.get_bool_env("TRITON_DEFAULT_FP_FUSION")
 
@@ -620,9 +667,10 @@ class _GCUBackend(BaseBackend):
     def load_dialects(self, ctx):
         self._backend.load_dialects(ctx)
 
-    @functools.lru_cache()
     def hash(self):
-        return self._backend.hash()
+        # Must remain live: JITFunction consults backend.hash() before packing
+        # GCUOptions, so caching this value would replay an earlier RLC cell.
+        return f"{self._backend.hash()}-rlc{_rlc_policy_signature()}"
 
     def get_architecture_descriptor(self, **kwargs):
         return self._backend.get_architecture_descriptor(**kwargs)

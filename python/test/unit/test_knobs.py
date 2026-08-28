@@ -152,6 +152,65 @@ def test_read_env(truthy, falsey, fresh_knobs, monkeypatch):
     assert fresh_knobs.build.backend_dirs == {"/tmp/cuda/crt", "/tmp/cuda/rt"}
 
 
+def test_nvidia_rlc_phase_mask(fresh_knobs, monkeypatch):
+    assert fresh_knobs.nvidia.rlc_phase_mask == 0xF
+
+    monkeypatch.setenv("FLAGTREE_RLC_PHASE_MASK", "5")
+    assert fresh_knobs.nvidia.rlc_phase_mask == 5
+
+    fresh_knobs.nvidia.rlc_phase_mask = 9
+    assert os.environ["FLAGTREE_RLC_PHASE_MASK"] == "9"
+    assert fresh_knobs.nvidia.rlc_phase_mask == 9
+
+
+def test_ppu_rlc_knobs(fresh_knobs, monkeypatch):
+    assert not fresh_knobs.ppu.rlc_enhance
+    assert fresh_knobs.ppu.rlc_phase_mask == 0xF
+
+    monkeypatch.setenv("FLAGTREE_PPU_RLC_ENHANCE", "1")
+    monkeypatch.setenv("FLAGTREE_PPU_RLC_PHASE_MASK", "5")
+    assert fresh_knobs.ppu.rlc_enhance
+    assert fresh_knobs.ppu.rlc_phase_mask == 5
+
+    fresh_knobs.ppu.rlc_enhance = False
+    fresh_knobs.ppu.rlc_phase_mask = 9
+    assert os.environ["FLAGTREE_PPU_RLC_ENHANCE"] == "0"
+    assert os.environ["FLAGTREE_PPU_RLC_PHASE_MASK"] == "9"
+
+
+def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
+    assert not fresh_knobs.musa.rlc_enhance
+    assert fresh_knobs.musa.rlc_phase_mask == 0xF
+
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_ENHANCE", "1")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_PHASE_MASK", "5")
+    assert fresh_knobs.musa.rlc_enhance
+    assert fresh_knobs.musa.rlc_phase_mask == 5
+
+    fresh_knobs.musa.rlc_enhance = False
+    fresh_knobs.musa.rlc_phase_mask = 9
+    assert os.environ["FLAGTREE_MUSA_RLC_ENHANCE"] == "0"
+    assert os.environ["FLAGTREE_MUSA_RLC_PHASE_MASK"] == "9"
+
+
+def test_enflame_rlc_knobs(fresh_knobs, monkeypatch):
+    assert not fresh_knobs.enflame.rlc_enhance
+    assert fresh_knobs.enflame.rlc_phase_mask == 0xF
+    assert fresh_knobs.enflame.rlc_convert_cost_per_byte == 0
+
+    monkeypatch.setenv("FLAGTREE_ENFLAME_RLC_ENHANCE", "1")
+    monkeypatch.setenv("FLAGTREE_ENFLAME_RLC_PHASE_MASK", "5")
+    monkeypatch.setenv("FLAGTREE_ENFLAME_RLC_CONVERT_COST_PER_BYTE", "37")
+    assert fresh_knobs.enflame.rlc_enhance
+    assert fresh_knobs.enflame.rlc_phase_mask == 5
+    assert fresh_knobs.enflame.rlc_convert_cost_per_byte == 37
+
+    fresh_knobs.enflame.rlc_enhance = False
+    fresh_knobs.enflame.rlc_phase_mask = 9
+    assert os.environ["FLAGTREE_ENFLAME_RLC_ENHANCE"] == "0"
+    assert os.environ["FLAGTREE_ENFLAME_RLC_PHASE_MASK"] == "9"
+
+
 def test_triton_home(fresh_knobs, monkeypatch):
     initial_home = fresh_knobs.cache.home_dir
     assert initial_home == os.path.expanduser("~/")

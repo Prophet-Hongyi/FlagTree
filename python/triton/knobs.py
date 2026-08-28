@@ -573,6 +573,9 @@ class nvidia_knobs(base_knobs):
     mock_ptx_version: env_opt_str = env_opt_str("TRITON_MOCK_PTX_VERSION")
     dump_ptxas_log: env_bool = env_bool("TRITON_DUMP_PTXAS_LOG")
     rlc_enhance: env_bool = env_bool("FLAGTREE_RLC_ENHANCE", True)
+    # Internal attribution mask for RLC phases 1a, 1b, 2, and 3. Production
+    # pipelines keep all four bits enabled; tests can bisect them independently.
+    rlc_phase_mask: env_int = env_int("FLAGTREE_RLC_PHASE_MASK", 0xF)
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
@@ -648,6 +651,22 @@ class metax_knobs(base_knobs):
     mlir_opt_path = os.path.join(maca_path, "mxgpu_llvm", "bin", "mlir-opt") if use_maca else None
 
 
+# flagtree enflame
+class enflame_knobs(base_knobs):
+    # Compile the portable phases into Enflame builds, but keep them disabled
+    # until GCU300/GCU400 IR, correctness, and performance gates pass.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_ENFLAME_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_ENFLAME_RLC_PHASE_MASK", 0xF)
+    # Positive values override common conservative defaults. Zero inherits.
+    rlc_minimum_writeback_bits: env_int = env_int("FLAGTREE_ENFLAME_RLC_MIN_WRITEBACK_BITS", 0)
+    rlc_convert_minimum_elements: env_int = env_int("FLAGTREE_ENFLAME_RLC_CONVERT_MIN_ELEMENTS", 0)
+    rlc_convert_minimum_element_bits: env_int = env_int("FLAGTREE_ENFLAME_RLC_CONVERT_MIN_ELEMENT_BITS", 0)
+    rlc_convert_cost_per_byte: env_int = env_int("FLAGTREE_ENFLAME_RLC_CONVERT_COST_PER_BYTE", 0)
+    rlc_cached_load_cost_per_byte: env_int = env_int("FLAGTREE_ENFLAME_RLC_CACHED_LOAD_COST_PER_BYTE", 0)
+    rlc_expensive_math_cost_per_byte: env_int = env_int("FLAGTREE_ENFLAME_RLC_EXPENSIVE_MATH_COST_PER_BYTE", 0)
+    rlc_inter_warp_reduce_cost: env_int = env_int("FLAGTREE_ENFLAME_RLC_INTER_WARP_REDUCE_COST", 0)
+
+
 # flagtree mthreads
 class musa_knobs(base_knobs):
     llc_path: env_opt_str = env_opt_str("TRITON_MUSA_LLC_PATH")
@@ -666,6 +685,19 @@ class musa_knobs(base_knobs):
     replace_llir: env_opt_str = env_opt_str("TRITON_MUSA_REPLACE_LLIR")
     replace_mubin: env_opt_str = env_opt_str("TRITON_MUSA_REPLACE_MUBIN")
     libdevice_path: env_opt_str = env_opt_str("TRITON_MUSA_LIBDEVICE_PATH")
+    # Compile the portable RLC phases into MThreads builds, but keep them
+    # disabled until MUSA-specific IR, correctness, and performance gates pass.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_MUSA_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_MUSA_RLC_PHASE_MASK", 0xF)
+    # Positive integers override C++ RlcBackendPolicy defaults via module attrs.
+    # Zero leaves the inherited conservative defaults in place.
+    rlc_minimum_writeback_bits: env_int = env_int("FLAGTREE_MUSA_RLC_MIN_WRITEBACK_BITS", 0)
+    rlc_convert_minimum_elements: env_int = env_int("FLAGTREE_MUSA_RLC_CONVERT_MIN_ELEMENTS", 0)
+    rlc_convert_minimum_element_bits: env_int = env_int("FLAGTREE_MUSA_RLC_CONVERT_MIN_ELEMENT_BITS", 0)
+    rlc_convert_cost_per_byte: env_int = env_int("FLAGTREE_MUSA_RLC_CONVERT_COST_PER_BYTE", 0)
+    rlc_cached_load_cost_per_byte: env_int = env_int("FLAGTREE_MUSA_RLC_CACHED_LOAD_COST_PER_BYTE", 0)
+    rlc_expensive_math_cost_per_byte: env_int = env_int("FLAGTREE_MUSA_RLC_EXPENSIVE_MATH_COST_PER_BYTE", 0)
+    rlc_inter_warp_reduce_cost: env_int = env_int("FLAGTREE_MUSA_RLC_INTER_WARP_REDUCE_COST", 0)
 
 
 # flagtree ppu
@@ -674,6 +706,10 @@ class ppu_knobs(base_knobs):
     ppu_llc_options: env_opt_str = env_opt_str("PPU_LLC_OPTIONS")
     dump_compile_log: env_bool = env_bool("TRITON_DUMP_COMPILE_LOG")
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
+    # Compile the portable RLC phases into PPU builds, but keep them disabled
+    # until backend-specific IR, correctness, and performance gates pass.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_PPU_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_PPU_RLC_PHASE_MASK", 0xF)
 
 
 class proton_knobs(base_knobs):
@@ -714,6 +750,7 @@ nvidia = nvidia_knobs()
 amd = amd_knobs()
 hcu = hcu_knobs()  # flagtree hcu
 metax = metax_knobs()  # flagtree metax
+enflame = enflame_knobs()  # flagtree enflame
 musa = musa_knobs()  # flagtree mthreads
 ppu = ppu_knobs()  # flagtree ppu
 iluvatar = iluvatar_knobs()  # flagtree iluvatar

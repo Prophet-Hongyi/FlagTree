@@ -5,6 +5,8 @@ This module provides type-safe wrapper functions for GCU400 passes,
 avoiding string-based pass names and enabling compile-time checks.
 """
 
+from ._rlc import rlc_pass_options
+
 __all__ = [
     'add_gcu64_type_verifier',
     'add_gcu_convert_triton_to_tritongpu',
@@ -135,9 +137,11 @@ def add_triton_wgdot_to_gcu(pipeline):
     pipeline.add_pass('triton-wgdot-to-gcu')
 
 
-def add_tritongpu_remove_layout_conversions(pipeline):
-    """Remove unnecessary layout conversions in TritonGPU."""
-    pipeline.add_pass('tritongpu-remove-layout-conversions')
+def add_tritongpu_remove_layout_conversions(pipeline, enhance: bool = False,
+                                            phase_mask: int = 0xF):
+    """Remove layout conversions with the default-off common RLC phases."""
+    pipeline.add_pass('tritongpu-remove-layout-conversions',
+                      rlc_pass_options(enhance, phase_mask))
 
 
 def add_triton_gcu_data_layout_optimize(pipeline):

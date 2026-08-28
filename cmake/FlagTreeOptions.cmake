@@ -60,6 +60,10 @@ macro(flagtree_configure_options)
     set(ENV{PATH} "$ENV{LLVM_SYSPATH}/bin:$ENV{PATH}")
     set(CMAKE_C_COMPILER clang)
     set(CMAKE_CXX_COMPILER clang++)
+    # Build the portable phased RLC implementation for MThreads. The MUSA
+    # runtime knob remains default-off until IR, device, and performance gates
+    # are qualified on S5000.
+    add_definitions(-D__FLAGTREE_RLC_ENHANCE__)
     set(FLAGTREE_TLE OFF)
     set(FLAGTREE_MTHREADS_TLE ON)
   elseif(FLAGTREE_BACKEND STREQUAL "aipu")
@@ -72,6 +76,10 @@ macro(flagtree_configure_options)
     set(CMAKE_CXX_COMPILER clang++)
   elseif(FLAGTREE_BACKEND STREQUAL "hcu")
     add_definitions(-D__HCU__)
+  elseif(FLAGTREE_BACKEND STREQUAL "enflame")
+    # Compile the shared phased RLC implementation for GCU300/GCU400. The
+    # Enflame runtime knob remains default-off until device qualification.
+    add_definitions(-D__FLAGTREE_RLC_ENHANCE__)
   elseif(FLAGTREE_BACKEND STREQUAL "metax")
     add_definitions(-DUSE_MACA)
     option(BUILD_MCTLE "use maca triton language extensions" ON)
@@ -86,6 +94,9 @@ macro(flagtree_configure_options)
     find_package(Python3 3.10 REQUIRED COMPONENTS Development.Module Interpreter)
   elseif(FLAGTREE_BACKEND STREQUAL "ppu")
     add_definitions(-D__PPU__)
+    # Compile the shared RemoveLayoutConversions phases for PPU, while the
+    # backend-specific runtime knob keeps them disabled by default.
+    add_definitions(-D__FLAGTREE_RLC_ENHANCE__)
   endif()
 
   set(FLAGTREE_PLUGIN "$ENV{FLAGTREE_PLUGIN}")
