@@ -16,6 +16,7 @@ add_triton_library(TritonPPUGPUToLLVM
     DotOpToLLVM/PPUMMAv1.cpp
     DotOpToLLVM/PPUMMAv2.cpp
     DotOpToLLVM.cpp
+    ConvertFpCastOpToLLVM.cpp
     ElementwiseOpToLLVM.cpp
     LoadStoreOpToLLVM.cpp
     TritonGPUToLLVM.cpp

@@ -226,11 +226,16 @@ class PPUBackend(BaseBackend):
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
 
+        supports_fp8e4m3 = capability == 80 or capability >= 89
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(HGGCOptions.supported_fp8_dtypes)
-            if capability >= 89:
+            # ppu0010 uses the software conversion lowering added by this backend;
+            # newer targets keep using their existing native conversion path.
+            if supports_fp8e4m3:
                 supported_fp8_dtypes.add("fp8e4nv")
             args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
+        elif "fp8e4nv" in args["supported_fp8_dtypes"] and not supports_fp8e4m3:
+            raise ValueError("fp8e4nv is only supported on PPU capability 80 or >= 89")
 
         if "deprecated_fp8_dot_operand_dtypes" not in args:
             if capability >= 90:
