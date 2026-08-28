@@ -2492,7 +2492,7 @@ def fp4_to_fp_scaled(src, scale, elem_type, axis, _semantic=None):
 
 @builtin
 def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", cache_modifier="", eviction_policy="",
-         volatile=False, _semantic=None):
+         volatile=False, flagtree_hints=None, _semantic=None):
     """
     Return a tensor of data whose values are loaded from memory at location defined by `pointer`:
 
@@ -2535,6 +2535,8 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
     :type eviction_policy: str, optional
     :param volatile: changes volatile option in NVIDIA PTX
     :type volatile: bool, optional
+    :param flagtree_hints: FlagTree load hints forwarded to the IR builder
+    :type flagtree_hints: str, optional
     """
     # `mask` and `other` can be constexpr
     mask = _unwrap_if_constexpr(mask)
@@ -2547,8 +2549,9 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
     cache_modifier = _unwrap_if_constexpr(cache_modifier)
     eviction_policy = _unwrap_if_constexpr(eviction_policy)
     volatile = _unwrap_if_constexpr(volatile)
+    flagtree_hints = _unwrap_if_constexpr(flagtree_hints)
     return _semantic.load(pointer, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy,
-                          volatile)
+                          volatile, flagtree_hints)
 
 
 @builtin
