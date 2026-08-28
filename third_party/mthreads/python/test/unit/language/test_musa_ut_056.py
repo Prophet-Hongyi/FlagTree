@@ -192,6 +192,66 @@ def test_musa_ph1_signed_int8_dot_device():
     assert "llvm.musa.sqmma.smma" in compiled.asm["llir"]
 
 
+_STANDARD_FP8_DOT_FORMATS = {
+    "fp8e4nv": (tl.float8e4nv, "e4m3", [0xC0, 0xB8, 0x00, 0x38, 0x40]),
+    "fp8e5": (tl.float8e5, "e5m2", [0xC0, 0xBC, 0x00, 0x3C, 0x40]),
+}
+
+
+@triton.jit
+def _musa_standard_fp8_dot_kernel(lhs, rhs, out):
+    offsets_m = tl.arange(0, 32)
+    offsets_n = tl.arange(0, 32)
+    offsets_k = tl.arange(0, 32)
+    a = tl.load(lhs + offsets_m[:, None] * 32 + offsets_k[None, :])
+    b = tl.load(rhs + offsets_k[:, None] * 32 + offsets_n[None, :])
+    acc = tl.zeros((32, 32), dtype=tl.float32)
+    result = tl.dot(a, b, acc, out_dtype=tl.float32)
+    tl.store(out + offsets_m[:, None] * 32 + offsets_n[None, :], result)
+
+
+@pytest.mark.parametrize("format_name", _STANDARD_FP8_DOT_FORMATS)
+def test_musa_ph1_standard_fp8_dot_lowers_to_sqmma(format_name):
+    _, intrinsic_type, _ = _STANDARD_FP8_DOT_FORMATS[format_name]
+    llir, _ = _compile_to_llir(
+        _musa_standard_fp8_dot_kernel,
+        {"lhs": f"*{format_name}", "rhs": f"*{format_name}", "out": "*fp32"},
+    )
+
+    assert f"llvm.musa.sqmma.{intrinsic_type}.m32n32k32.mma" in llir
+    assert "llvm.musa.wmma" not in llir
+
+
+@pytest.mark.parametrize("format_name", _STANDARD_FP8_DOT_FORMATS)
+def test_musa_ph1_standard_fp8_dot_device(format_name):
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        pytest.skip("requires a MUSA device")
+    if tuple(torch.musa.get_device_capability(0)) != (3, 1):
+        pytest.skip("requires a PH1 device")
+
+    dtype, intrinsic_type, raw_codes = _STANDARD_FP8_DOT_FORMATS[format_name]
+    codebook = torch.tensor(raw_codes, dtype=torch.uint8)
+    valuebook = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    lhs_index = ((torch.arange(32 * 32) * 7 + 3) % len(codebook)).reshape(32, 32)
+    rhs_index = ((torch.arange(32 * 32) * 11 + 1) % len(codebook)).reshape(32, 32)
+    lhs_raw = codebook[lhs_index].to("musa")
+    rhs_raw = codebook[rhs_index].to("musa")
+    output = torch.empty((32, 32), dtype=torch.float32, device="musa")
+
+    compiled = _musa_standard_fp8_dot_kernel[(1, )](
+        triton.reinterpret(lhs_raw, dtype),
+        triton.reinterpret(rhs_raw, dtype),
+        output,
+        num_warps=4,
+    )
+    torch.musa.synchronize()
+
+    expected = valuebook[lhs_index] @ valuebook[rhs_index]
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert f"llvm.musa.sqmma.{intrinsic_type}.m32n32k32.mma" in compiled.asm["llir"]
+    assert compiled.asm["mubin"]
+
+
 _CUSTOM_FP8_FORMATS = {
     "fp8e4b15": (tl.float8e4b15, 4, 3, 15, False),
     "fp8e4b8": (tl.float8e4b8, 4, 3, 8, True),
