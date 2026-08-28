@@ -14,6 +14,13 @@ import warnings
 import os
 from pathlib import Path
 
+from .llvm17_int8_compat import (
+    LEGACY_INT8_MMAC,
+    NEW_INT8_MMAC,
+    LLVM17Int8MmacBridgeStats,
+    bridge_gfx936_int8_mmac_for_llvm17,
+)
+
 
 def get_min_dot_size(target: GPUTarget):
     # We fallback to use FMA and cast arguments if certain configurations is
@@ -320,6 +327,31 @@ class HIPBackend(BaseBackend):
                         "Set 'TRITON_HIP_CLANG_PATH' to its path.")
 
     @staticmethod
+    def path_to_rocm_llc():
+        configured = os.getenv("TRITON_HIP_LLC_PATH")
+        if configured:
+            llc = Path(configured)
+            if llc.is_file():
+                return llc
+            raise Exception(f"TRITON_HIP_LLC_PATH is not a file: {llc}")
+
+        llc = HIPBackend.path_to_rocm_clang().parent / "llc"
+        if llc.is_file():
+            return llc
+        raise Exception(
+            "ROCm llc not found next to the configured HCU clang. "
+            "Set TRITON_HIP_LLC_PATH to its path."
+        )
+
+    @staticmethod
+    def _clang_major():
+        output = subprocess.check_output([HIPBackend.path_to_rocm_clang(), "--version"], encoding="utf-8")
+        match = re.search(r"version\s*(?P<major>\d+)\.", output)
+        if match is None:
+            raise RuntimeError(f"cannot determine HCU clang version from: {output!r}")
+        return int(match.group("major"))
+
+    @staticmethod
     def _get_clang_args(metadata, options):
         arch_args = {
             "gfx928": [
@@ -349,10 +381,7 @@ class HIPBackend(BaseBackend):
                 "-mllvm=-hcu-update-wait-by-reverse-search=true",
             ],
         }
-        clang_out = subprocess.check_output([HIPBackend.path_to_rocm_clang(), "--version"])
-        match = re.search(r"version\s*(?P<major>\d+)\.(?P<minor>\d+)([\d.]+)?", clang_out.decode())
-        clang_major = match.group("major")
-        clang_minor = match.group("minor")
+        clang_major = str(HIPBackend._clang_major())
         if clang_major in version_args:
             options_args.extend(version_args[clang_major])
 
@@ -376,10 +405,10 @@ class HIPBackend(BaseBackend):
             "-mllvm=-disable-cluster-lds-memops=true",
             # Note: when register spill after ds_read_matrix, result is wrong for compiler backend. disable current.
             "-mllvm=-hcu-pre-emit-load-store-opt=false",
-            "-mllvm=-vgpr-greedy-alloc-mode=local-wave" if options.wdra_enabled else "",
-            *options_args,
-            "-O3",
         ]
+        if options.wdra_enabled:
+            clang_args.append("-mllvm=-vgpr-greedy-alloc-mode=local-wave")
+        clang_args.extend([*options_args, "-O3"])
 
         return clang_args
 
@@ -730,7 +759,8 @@ class HIPBackend(BaseBackend):
         # Find kernel names (there should only be one)
         # We get the name at the last possible step to accommodate `triton.compile`
         # on user-provided LLVM
-        names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", src)
+        llvm_source = str(src)
+        names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", llvm_source)
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
@@ -744,18 +774,54 @@ class HIPBackend(BaseBackend):
         # features = '-real-true16' if 'gfx11' in options.arch else ''
         # amdgcn = llvm.translate_to_asm(src, hcu.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
         #                                False)
+        llir_file = None
+        asm_file = None
+        bridge_stats = LLVM17Int8MmacBridgeStats()
         try:
+            use_llvm17_int8_bridge = (
+                options.arch == "gfx936" and HIPBackend._clang_major() == 17 and NEW_INT8_MMAC in llvm_source
+            )
+            if use_llvm17_int8_bridge:
+                unsupported_options = []
+                if options.wdra_enabled:
+                    unsupported_options.append("wdra_enabled")
+                if options.schedule_hint != "none":
+                    unsupported_options.append(f"schedule_hint={options.schedule_hint}")
+                if options.sched_latency != "none":
+                    unsupported_options.append(f"sched_latency={options.sched_latency}")
+                if knobs.compilation.enable_asan:
+                    unsupported_options.append("enable_asan")
+                if unsupported_options:
+                    raise HSACOError(
+                        "gfx936 DTK17 signed INT8 MMAC bridge does not support: "
+                        + ", ".join(unsupported_options)
+                    )
+                llvm_source, bridge_stats = bridge_gfx936_int8_mmac_for_llvm17(llvm_source)
+
             with tempfile.NamedTemporaryFile(mode='w', suffix=".ll", delete=False) as f:
                 llir_file = f.name
-                f.write(str(src))
+                f.write(llvm_source)
 
             asm_file = tempfile.mktemp(suffix=".amdgcn")
 
-            clang_path = HIPBackend.path_to_rocm_clang()
-            clang_args = HIPBackend._get_clang_args(metadata, options) + flags
+            if use_llvm17_int8_bridge:
+                asm_command = [
+                    HIPBackend.path_to_rocm_llc(),
+                    f"-mtriple={hcu.TARGET_TRIPLE}",
+                    f"-mcpu={options.arch}",
+                    "-mattr=-xnack",
+                    "-O3",
+                    "-filetype=asm",
+                    llir_file,
+                    "-o",
+                    asm_file,
+                ]
+            else:
+                clang_path = HIPBackend.path_to_rocm_clang()
+                clang_args = HIPBackend._get_clang_args(metadata, options) + flags
+                asm_command = [clang_path] + clang_args + [llir_file, "-S", "-o", asm_file]
 
             # Compile to ASM
-            asm_command = [clang_path] + clang_args + [llir_file, "-S", "-o", asm_file]
             result = subprocess.run(asm_command, check=True, capture_output=True, text=True)
             if options.wdra_enabled:
                 log = result.stdout + result.stderr
@@ -763,6 +829,22 @@ class HIPBackend(BaseBackend):
 
             with open(asm_file, "r") as fd_out:
                 amdgcn = fd_out.read()
+
+            if bridge_stats.calls:
+                actual_calls = amdgcn.count("v_mmac_i32_16x16x32_i8")
+                unresolved_contracts = [
+                    contract for contract in (
+                        LEGACY_INT8_MMAC,
+                        "llvm.amdgcn.make.buffer.rsrc",
+                        "llvm.amdgcn.raw.ptr.buffer",
+                    ) if contract in amdgcn
+                ]
+                if actual_calls != bridge_stats.calls or unresolved_contracts:
+                    raise HSACOError(
+                        "gfx936 DTK17 signed INT8 MMAC lowering mismatch: "
+                        f"llir={bridge_stats.calls} asm={actual_calls} "
+                        f"unresolved={unresolved_contracts}"
+                    )
 
         except subprocess.CalledProcessError as e:
             print(f"Compilation failed: {e.stderr}")
@@ -773,7 +855,7 @@ class HIPBackend(BaseBackend):
         finally:
             # Clean up temporary files
             for file in [llir_file, asm_file]:
-                if os.path.exists(file):
+                if file and os.path.exists(file):
                     os.remove(file)
         if knobs.hcu.dump_amdgcn:
             print("// -----// HCUGCN Dump //----- //")
@@ -786,6 +868,8 @@ class HIPBackend(BaseBackend):
         # if knobs.compilation.enable_asan:
         #     target_features = '+xnack'
         # hsaco = hcu.assemble_amdgcn(src, options.arch, target_features)
+        asm_file = None
+        hsaco_file = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', suffix=".s", delete=False) as f:
                 asm_file = f.name
@@ -794,10 +878,28 @@ class HIPBackend(BaseBackend):
             hsaco_file = tempfile.mktemp(suffix=".hsaco")
 
             clang_path = HIPBackend.path_to_rocm_clang()
-            clang_args = HIPBackend._get_clang_args(metadata, options)
+            use_llvm17_int8_bridge = (
+                options.arch == "gfx936" and HIPBackend._clang_major() == 17
+                and "v_mmac_i32_16x16x32_i8" in str(src)
+            )
+            if use_llvm17_int8_bridge:
+                hsaco_command = [
+                    clang_path,
+                    "-target",
+                    hcu.TARGET_TRIPLE,
+                    f"-mcpu={options.arch}:xnack-",
+                    "-O3",
+                    "-x",
+                    "assembler",
+                    asm_file,
+                    "-o",
+                    hsaco_file,
+                ]
+            else:
+                clang_args = HIPBackend._get_clang_args(metadata, options)
+                hsaco_command = [clang_path] + clang_args + [asm_file, "-x", "assembler", "-o", hsaco_file]
 
             # Compile to HSACO
-            hsaco_command = [clang_path] + clang_args + [asm_file, "-x", "assembler", "-o", hsaco_file]
             subprocess.run(hsaco_command, check=True, capture_output=True, text=True)
 
             with open(hsaco_file, "rb") as fd_out:
@@ -809,6 +911,10 @@ class HIPBackend(BaseBackend):
         except IOError as e:
             print(f"File operation failed: {str(e)}")
             raise HSACOError(f"File operation failed: {str(e)}") from e
+        finally:
+            for file in [asm_file, hsaco_file]:
+                if file and os.path.exists(file):
+                    os.remove(file)
 
         return ret
 
@@ -827,4 +933,7 @@ class HIPBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         version = subprocess.check_output([HIPBackend.path_to_rocm_clang(), "--version"], encoding='utf-8')
-        return f'{version}-{self.target}'
+        compatibility = "-gfx936-int8-llvm17-v2" if (
+            self.target.arch == "gfx936" and HIPBackend._clang_major() == 17
+        ) else ""
+        return f'{version}-{self.target}{compatibility}'
