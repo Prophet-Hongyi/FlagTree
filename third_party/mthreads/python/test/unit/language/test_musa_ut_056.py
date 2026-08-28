@@ -190,3 +190,95 @@ def test_musa_ph1_signed_int8_dot_device():
     expected = lhs.cpu().to(torch.int32) @ rhs.cpu().to(torch.int32)
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
     assert "llvm.musa.sqmma.smma" in compiled.asm["llir"]
+
+
+_CUSTOM_FP8_FORMATS = {
+    "fp8e4b15": (tl.float8e4b15, 4, 3, 15, False),
+    "fp8e4b8": (tl.float8e4b8, 4, 3, 8, True),
+    "fp8e5b16": (tl.float8e5b16, 5, 2, 16, True),
+}
+
+
+@triton.jit
+def _musa_custom_fp8_upcast_kernel(src, out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(src + offsets)
+    tl.store(out + offsets, values.to(tl.float32))
+
+
+@triton.jit
+def _musa_custom_fp8_dot_kernel(lhs, rhs, out):
+    offsets = tl.arange(0, 16)
+    a = tl.load(lhs + offsets[:, None] * 16 + offsets[None, :])
+    b = tl.load(rhs + offsets[:, None] * 16 + offsets[None, :])
+    result = tl.dot(a, b)
+    tl.store(out + offsets[:, None] * 16 + offsets[None, :], result)
+
+
+def _decode_custom_fp8(raw, exponent_bits, mantissa_bits, exponent_bias, nan_on_negzero):
+    if nan_on_negzero and raw == 0x80:
+        return float("nan")
+
+    sign = -1.0 if raw & 0x80 else 1.0
+    exponent = (raw >> mantissa_bits) & ((1 << exponent_bits) - 1)
+    mantissa = raw & ((1 << mantissa_bits) - 1)
+    if exponent == 0:
+        magnitude = mantissa * 2.0**(1 - exponent_bias - mantissa_bits)
+    else:
+        magnitude = (1.0 + mantissa / 2.0**mantissa_bits) * 2.0**(exponent - exponent_bias)
+    return sign * magnitude
+
+
+def test_musa_ph1_fp8_storage_and_dot_capabilities_are_separate():
+    options = _get_musa_backend().parse_options({})
+    compute = set(options.supported_fp8_dtypes)
+    storage = set(options.supported_fp8_storage_dtypes)
+    custom = set(options.custom_fp8_dtypes)
+
+    assert compute == {"fp8e4nv", "fp8e5"}
+    assert custom == set(_CUSTOM_FP8_FORMATS)
+    assert storage == compute | custom
+
+
+@pytest.mark.parametrize("format_name", _CUSTOM_FP8_FORMATS)
+def test_musa_ph1_custom_fp8_storage_upcast_compiles(format_name):
+    llir, _ = _compile_to_llir(
+        _musa_custom_fp8_upcast_kernel,
+        {"src": f"*{format_name}", "out": "*fp32", "BLOCK": "constexpr"},
+        constexprs={"BLOCK": 16},
+    )
+    assert "fmul" in llir
+    assert "llvm.musa.sqmma" not in llir
+
+
+@pytest.mark.parametrize("format_name", _CUSTOM_FP8_FORMATS)
+def test_musa_ph1_custom_fp8_dot_fails_closed(format_name):
+    with pytest.raises(CompilationError, match="not supported in this architecture for dot"):
+        _compile_to_llir(
+            _musa_custom_fp8_dot_kernel,
+            {"lhs": f"*{format_name}", "rhs": f"*{format_name}", "out": "*fp32"},
+        )
+
+
+@pytest.mark.parametrize("format_name", _CUSTOM_FP8_FORMATS)
+def test_musa_ph1_custom_fp8_storage_upcast_device(format_name):
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        pytest.skip("requires a MUSA device")
+
+    dtype, exponent_bits, mantissa_bits, exponent_bias, nan_on_negzero = _CUSTOM_FP8_FORMATS[format_name]
+    raw_values = [0x00, 0x01, 0x08, 0x38, 0x40, 0x7F, 0x80, 0x88, 0xB8, 0xC0, 0xFF]
+    padded_values = raw_values + [0x00] * (16 - len(raw_values))
+    raw = torch.tensor(padded_values, dtype=torch.uint8, device="musa")
+    output = torch.empty(16, dtype=torch.float32, device="musa")
+
+    compiled = _musa_custom_fp8_upcast_kernel[(1, )](
+        triton.reinterpret(raw, dtype), output, BLOCK=16, num_warps=4)
+    torch.musa.synchronize()
+
+    expected = torch.tensor([
+        _decode_custom_fp8(value, exponent_bits, mantissa_bits, exponent_bias, nan_on_negzero)
+        for value in raw_values
+    ])
+    torch.testing.assert_close(output.cpu()[:len(raw_values)], expected, rtol=0, atol=0, equal_nan=True)
+    assert "fmul" in compiled.asm["llir"]
+    assert "llvm.musa.sqmma" not in compiled.asm["llir"]
