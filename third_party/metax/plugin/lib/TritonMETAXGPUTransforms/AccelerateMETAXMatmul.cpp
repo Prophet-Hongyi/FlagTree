@@ -10,6 +10,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -128,6 +129,27 @@ SmallVector<unsigned, 2> warpsPerTileMACA(triton::DotOp dotOp,
 static bool isOcpFp8(Type type) {
   return llvm::isa<Float8E4M3FNType, Float8E5M2Type>(type);
 }
+
+// C550 has no executable E2M1 MMA or conversion instruction.  Reuse Triton's
+// standard scaled-dot decomposition for the one contract we can implement
+// entirely in software: two K-packed E2M1 operands without block scales.  The
+// backend-local Fp4ToFpOp lowering decodes them to BF16 before BlockedToMMA
+// selects the existing BF16 MMA path.  Keep every broader scaled-dot form
+// fail-closed until it has an independently validated lowering.
+class DecomposeC550E2M1DotScaled final
+    : public ttg::DecomposeScaledBlocked {
+public:
+  using DecomposeScaledBlocked::DecomposeScaledBlocked;
+
+  LogicalResult matchAndRewrite(tt::DotScaledOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getAElemType() != tt::ScaleDotElemType::E2M1 ||
+        op.getBElemType() != tt::ScaleDotElemType::E2M1 || op.getAScale() ||
+        op.getBScale() || !op.getLhsKPack() || !op.getRhsKPack())
+      return failure();
+    return DecomposeScaledBlocked::matchAndRewrite(op, rewriter);
+  }
+};
 
 // MetaX MMA versions before 2.6 do not accept FP8 operands.  Keep the FP8
 // storage ABI, but materialize the same software FP8 -> FP16 conversion that a
@@ -370,6 +392,7 @@ public:
         mlir::IntegerAttr::get(mlir::IntegerType::get(m.getContext(), 32), 0));
 
     mlir::RewritePatternSet patterns(context);
+    patterns.add<::DecomposeC550E2M1DotScaled>(context, /*benefit=*/2);
     // TODO: support chain dot & multi dot
     patterns.add<::BlockedToMMA>(context, computeCapability, /*dot_cut=*/1,
                                  numStages, disablePrefetch, storeCoalesce);
