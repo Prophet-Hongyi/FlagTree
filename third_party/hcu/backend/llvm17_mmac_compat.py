@@ -38,6 +38,8 @@ PTR_BUFFER_LOAD_I8 = "llvm.amdgcn.raw.ptr.buffer.load.i8"
 RAW_BUFFER_LOAD_I8 = "llvm.amdgcn.raw.buffer.load.i8"
 PTR_BUFFER_LOAD_F32 = "llvm.amdgcn.raw.ptr.buffer.load.f32"
 RAW_BUFFER_LOAD_F32 = "llvm.amdgcn.raw.buffer.load.f32"
+PTR_BUFFER_LOAD_V2F32 = "llvm.amdgcn.raw.ptr.buffer.load.v2f32"
+RAW_BUFFER_LOAD_V2F32 = "llvm.amdgcn.raw.buffer.load.v2f32"
 PTR_BUFFER_LOAD_V4F32 = "llvm.amdgcn.raw.ptr.buffer.load.v4f32"
 RAW_BUFFER_LOAD_V4F32 = "llvm.amdgcn.raw.buffer.load.v4f32"
 PTR_BUFFER_LOAD_V4I32 = "llvm.amdgcn.raw.ptr.buffer.load.v4i32"
@@ -256,6 +258,7 @@ def bridge_gfx936_buffer_contracts_for_llvm17(
             PTR_BUFFER_LOAD_I16: RAW_BUFFER_LOAD_I16,
             PTR_BUFFER_LOAD_I32: RAW_BUFFER_LOAD_I32,
             PTR_BUFFER_LOAD_F32: RAW_BUFFER_LOAD_F32,
+            PTR_BUFFER_LOAD_V2F32: RAW_BUFFER_LOAD_V2F32,
             PTR_BUFFER_LOAD_V4F32: RAW_BUFFER_LOAD_V4F32,
             PTR_BUFFER_LOAD_V4I32: RAW_BUFFER_LOAD_V4I32,
         },
