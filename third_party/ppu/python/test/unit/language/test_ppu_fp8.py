@@ -15,6 +15,8 @@ _CONSTANTS = {"BLOCK": 64}
 _PPU0010_FP16_MMA = "ppu.mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32"
 _PPU_NATIVE_E4M3_MMA = ".e4m3.e4m3."
 _PPU_NATIVE_E4M3_CVT = "ppu.cvt.rn.satfinite.e4m3x2.f32"
+_PPU_NATIVE_E5M2_MMA = ".e5m2.e5m2."
+_PPU_NATIVE_E5M2_CVT = "ppu.cvt.rn.satfinite.e5m2x2.f16x2"
 
 
 @triton.jit
@@ -39,6 +41,14 @@ def _fp16_to_fp8e5(src, dst, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _fp16_to_fp8e5_grid(src, dst, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    values = tl.load(src + offsets, mask=mask)
+    tl.store(dst + offsets, values.to(tl.float8e5), mask=mask)
+
+
+@triton.jit
 def _fp8e4m3_to_fp32(src, dst, BLOCK: tl.constexpr):
     offsets = tl.arange(0, BLOCK)
     values = tl.load(src + offsets)
@@ -56,6 +66,20 @@ def _fp8e4m3_dot(lhs, rhs, out, OUTPUT_FP8: tl.constexpr):
     result = tl.dot(a, b, acc, out_dtype=tl.float32)
     if OUTPUT_FP8:
         result = result.to(tl.float8e4nv)
+    tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
+
+
+@triton.jit
+def _fp8e5m2_dot(lhs, rhs, out, OUTPUT_FP8: tl.constexpr):
+    offsets_m = tl.arange(0, 16)
+    offsets_n = tl.arange(0, 16)
+    offsets_k = tl.arange(0, 32)
+    a = tl.load(lhs + offsets_m[:, None] * 32 + offsets_k[None, :])
+    b = tl.load(rhs + offsets_k[:, None] * 16 + offsets_n[None, :])
+    acc = tl.zeros((16, 16), dtype=tl.float32)
+    result = tl.dot(a, b, acc, out_dtype=tl.float32)
+    if OUTPUT_FP8:
+        result = result.to(tl.float8e5)
     tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
 
 
@@ -207,6 +231,92 @@ def test_ppu0010_fp8e4m3_dot_device(device, output_fp8):
     assert compiled.asm["llir"].count(_PPU0010_FP16_MMA) == 2
     assert _PPU_NATIVE_E4M3_MMA not in compiled.asm["llir"]
     assert _PPU_NATIVE_E4M3_CVT not in compiled.asm["llir"]
+    assert compiled.asm["hgbin"]
+
+
+@pytest.mark.parametrize("output_fp8", [False, True])
+def test_ppu0010_fp8e5m2_dot_lowers_through_fp16_mma(output_fp8):
+    output_type = "fp8e5" if output_fp8 else "fp32"
+    compiled = _compile_through_llir(
+        _fp8e5m2_dot,
+        {
+            "lhs": "*fp8e5",
+            "rhs": "*fp8e5",
+            "out": f"*{output_type}",
+            "OUTPUT_FP8": "constexpr",
+        },
+        constexprs={"OUTPUT_FP8": output_fp8},
+    )
+
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 2 + int(output_fp8)
+    assert compiled.asm["llir"].count(_PPU0010_FP16_MMA) == 2
+    assert _PPU_NATIVE_E5M2_MMA not in compiled.asm["llir"]
+    assert _PPU_NATIVE_E5M2_CVT not in compiled.asm["llir"]
+
+
+@pytest.mark.parametrize("output_fp8", [False, True])
+def test_ppu0010_fp8e5m2_dot_device(device, output_fp8):
+    if not is_ppu():
+        pytest.skip("requires the PPU backend")
+
+    codes = torch.tensor([0xC0, 0xBC, 0x00, 0x3C, 0x40], dtype=torch.uint8)
+    values = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    lhs_index = ((torch.arange(16 * 32) * 7 + 3) % len(codes)).reshape(16, 32)
+    rhs_index = ((torch.arange(32 * 16) * 11 + 1) % len(codes)).reshape(32, 16)
+    lhs_raw = codes[lhs_index].to(device)
+    rhs_raw = codes[rhs_index].to(device)
+    expected = values[lhs_index] @ values[rhs_index]
+    output = torch.empty(
+        (16, 16),
+        dtype=torch.uint8 if output_fp8 else torch.float32,
+        device=device,
+    )
+
+    output_arg = triton.reinterpret(output, tl.float8e5) if output_fp8 else output
+    compiled = _fp8e5m2_dot[(1, )](
+        triton.reinterpret(lhs_raw, tl.float8e5),
+        triton.reinterpret(rhs_raw, tl.float8e5),
+        output_arg,
+        OUTPUT_FP8=output_fp8,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    if output_fp8:
+        expected = expected.to(torch.float8_e5m2).view(torch.uint8)
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert compiled.asm["llir"].count(_PPU0010_FP16_MMA) == 2
+    assert _PPU_NATIVE_E5M2_MMA not in compiled.asm["llir"]
+    assert _PPU_NATIVE_E5M2_CVT not in compiled.asm["llir"]
+    assert compiled.asm["hgbin"]
+
+
+def test_ppu0010_fp16_to_fp8e5m2_rtne_exhaustive(device):
+    if not is_ppu():
+        pytest.skip("requires the PPU backend")
+
+    raw = torch.arange(65536, dtype=torch.int32).to(torch.uint16)
+    values = raw.view(torch.float16)
+    expected = values.to(torch.float8_e5m2).view(torch.uint8)
+    expected = torch.where(
+        (expected & 0x7f) == 0x7c,
+        (expected & 0x80) | 0x7b,
+        expected,
+    )
+    output = torch.empty(values.shape, dtype=torch.uint8, device=device)
+
+    block = 256
+    compiled = _fp16_to_fp8e5_grid[(triton.cdiv(values.numel(), block), )](
+        values.to(device),
+        triton.reinterpret(output, tl.float8e5),
+        N=values.numel(),
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert _PPU_NATIVE_E5M2_CVT not in compiled.asm["llir"]
     assert compiled.asm["hgbin"]
 
 

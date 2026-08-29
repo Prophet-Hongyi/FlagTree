@@ -436,6 +436,49 @@ downcastToFp8E4M3FNRTNESoftware(Location loc,
   return results;
 }
 
+static SmallVector<Value>
+downcastFp16ToFp8E5M2RTNESoftware(Location loc,
+                                  ConversionPatternRewriter &rewriter,
+                                  const SmallVector<Value> &values) {
+  assert(values.size() == 4);
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  SmallVector<Value> results;
+  results.reserve(values.size());
+
+  for (Value value : values) {
+    Value bits = b.bitcast(value, i16_ty);
+    Value sign = b.and_(bits, b.i16_val(0x8000));
+    Value exponent =
+        b.and_(b.lshr(bits, b.i16_val(10)), b.i16_val(0x1f));
+    Value mantissa = b.and_(bits, b.i16_val(0x03ff));
+    Value magnitude = b.and_(bits, b.i16_val(0x7fff));
+
+    // E5M2 and FP16 have the same exponent width. Reduce the ten FP16
+    // mantissa bits to two with the standard RTNE bias: 0x7f plus the least
+    // significant retained bit. This is the scalar form used by AMD's
+    // software FP8 conversion and avoids the old packed half-up tie behavior.
+    Value retainedLsb = b.lshr(b.and_(magnitude, b.i16_val(0x0100)),
+                               b.i16_val(8));
+    Value roundingBias = b.add(retainedLsb, b.i16_val(0x007f));
+    Value rounded = b.add(magnitude, roundingBias);
+
+    // Match the native satfinite conversion contract. Values at or above the
+    // FP16 halfway point between max-finite E5M2 and infinity, including
+    // infinity itself, become max-finite. Preserve NaNs as canonical NaNs.
+    rounded = b.select(b.icmp_uge(magnitude, b.i16_val(0x7b80)),
+                       b.i16_val(0x7b00), rounded);
+    Value isNaN = b.and_(b.icmp_eq(exponent, b.i16_val(0x1f)),
+                         b.icmp_ne(mantissa, b.i16_val(0)));
+    rounded = b.select(isNaN, b.i16_val(0x7f00), rounded);
+
+    rounded = b.or_(sign, rounded);
+    results.push_back(
+        b.trunc(i8_ty, b.lshr(rounded, b.i16_val(8))));
+  }
+
+  return results;
+}
+
 static Value upcastFp8E4M3FNToFp16OneValue(Location loc,
                                            ConversionPatternRewriter &rewriter,
                                            Value value) {
@@ -645,6 +688,9 @@ struct FpToFpOpConversion
     bool involvesFp8E4M3 = llvm::isa<Float8E4M3FNType>(srcTy) ||
                            llvm::isa<Float8E4M3FNType>(dstTy);
     if (computeCapability == 80) {
+      if (srcTy.isF16() && llvm::isa<Float8E5M2Type>(dstTy) &&
+          roundingMode == RoundingMode::RTNE)
+        return {downcastFp16ToFp8E5M2RTNESoftware, 4};
       if (llvm::isa<Float8E4M3FNType>(dstTy) &&
           roundingMode == RoundingMode::RTNE) {
         if (srcTy.isF32())
