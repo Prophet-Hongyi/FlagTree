@@ -146,6 +146,23 @@ def _compile_single_scale(side):
     )
 
 
+def _compile_both_scales():
+    return triton.compile(
+        ASTSource(
+            fn=_hcu_scaled_e2m1_dot_kernel,
+            signature={
+                "lhs": "*u8",
+                "lhs_scale": "*u8",
+                "rhs": "*u8",
+                "rhs_scale": "*u8",
+                "out": "*fp32",
+            },
+        ),
+        target=_GFX936_TARGET,
+        options={"num_warps": 4, "num_stages": 1},
+    )
+
+
 def _pack_along_k(raw_codes, dim):
     if dim == 1:
         low = raw_codes[:, 0::2]
@@ -176,24 +193,10 @@ def test_gfx936_single_scaled_e2m1_dot_lowers_through_software_decode_and_fp16_m
     assert compiled.asm["hsaco"]
 
 
-def test_gfx936_both_scaled_e2m1_dot_remains_fail_closed(capfd):
-    source = ASTSource(
-        fn=_hcu_scaled_e2m1_dot_kernel,
-        signature={
-            "lhs": "*u8",
-            "lhs_scale": "*u8",
-            "rhs": "*u8",
-            "rhs_scale": "*u8",
-            "out": "*fp32",
-        },
-    )
-    with pytest.raises(RuntimeError, match="PassManager::run failed"):
-        triton.compile(
-            source,
-            target=_GFX936_TARGET,
-            options={"num_warps": 4, "num_stages": 1},
-        )
-    assert "Unsupported DotScaleOp found" in capfd.readouterr().err
+def test_gfx936_both_scaled_e2m1_dot_lowers_through_software_decode_and_fp16_mmac():
+    compiled = _compile_both_scales()
+    _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["hsaco"]
 
 
 def _e2m1_test_operands():
@@ -294,6 +297,42 @@ def test_gfx936_single_scaled_e2m1_dot_device(side):
         expected = lhs_values @ (rhs_values * rhs_scales)
     torch.cuda.synchronize()
 
+    actual = out.cpu()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, lhs_values @ rhs_values)
+    _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["hsaco"]
+
+
+def test_gfx936_both_scaled_e2m1_dot_device():
+    _require_gfx936_device()
+    lhs, rhs, lhs_values, rhs_values = _e2m1_test_operands()
+    lhs_scale_codes = torch.tensor(
+        [[0x7E + ((row + 2 * block) % 4) for block in range(2)] for row in range(16)],
+        dtype=torch.uint8,
+    )
+    rhs_scale_codes = torch.tensor(
+        [[0x7E + ((3 * col + block + 1) % 4) for block in range(2)] for col in range(16)],
+        dtype=torch.uint8,
+    )
+    lhs_scale_values = torch.pow(2.0, lhs_scale_codes.to(torch.int32) - 127).to(torch.float32)
+    rhs_scale_values = torch.pow(2.0, rhs_scale_codes.to(torch.int32) - 127).to(torch.float32)
+    out = torch.empty((16, 16), dtype=torch.float32, device="cuda")
+
+    compiled = _hcu_scaled_e2m1_dot_kernel[(1,)](
+        lhs,
+        lhs_scale_codes.cuda(),
+        rhs,
+        rhs_scale_codes.cuda(),
+        out,
+        num_warps=4,
+        num_stages=1,
+    )
+    torch.cuda.synchronize()
+
+    scaled_lhs = lhs_values * lhs_scale_values.repeat_interleave(32, dim=1)
+    scaled_rhs = rhs_values * rhs_scale_values.repeat_interleave(32, dim=1).transpose(0, 1)
+    expected = scaled_lhs @ scaled_rhs
     actual = out.cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, lhs_values @ rhs_values)
