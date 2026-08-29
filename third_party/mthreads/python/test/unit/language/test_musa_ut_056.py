@@ -210,6 +210,46 @@ def _musa_standard_fp8_dot_kernel(lhs, rhs, out):
     tl.store(out + offsets_m[:, None] * 32 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _musa_shaped_fp8_dot_kernel(
+    lhs,
+    rhs,
+    out,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+):
+    offsets_m = tl.arange(0, M)
+    offsets_n = tl.arange(0, N)
+    offsets_k = tl.arange(0, K)
+    a = tl.load(lhs + offsets_m[:, None] * K + offsets_k[None, :])
+    b = tl.load(rhs + offsets_k[:, None] * N + offsets_n[None, :])
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    result = tl.dot(a, b, acc, out_dtype=tl.float32)
+    tl.store(out + offsets_m[:, None] * N + offsets_n[None, :], result)
+
+
+@triton.jit
+def _musa_fp8_dot_fp16_accumulator_kernel(lhs, rhs, out):
+    offsets = tl.arange(0, 32)
+    a = tl.load(lhs + offsets[:, None] * 32 + offsets[None, :])
+    b = tl.load(rhs + offsets[:, None] * 32 + offsets[None, :])
+    acc = tl.zeros((32, 32), dtype=tl.float16)
+    result = tl.dot(a, b, acc, out_dtype=tl.float16)
+    tl.store(out + offsets[:, None] * 32 + offsets[None, :], result)
+
+
+def _assert_mixed_fp8_software_dot(llir):
+    assert "llvm.musa.e4m32f16.rn" in llir
+    assert "llvm.musa.e5m22f16.rn" in llir
+    assert "llvm.fmuladd.f32" in llir
+    assert "llvm.musa.sqmma." not in llir
+    assert not any(
+        "llvm.musa." in line and ".mma" in line
+        for line in llir.splitlines()
+    )
+
+
 @pytest.mark.parametrize("format_name", _STANDARD_FP8_DOT_FORMATS)
 def test_musa_ph1_standard_fp8_dot_lowers_to_sqmma(format_name):
     _, intrinsic_type, _ = _STANDARD_FP8_DOT_FORMATS[format_name]
@@ -296,6 +336,124 @@ def test_musa_ph1_standard_fp8_dot_output_device(format_name):
     assert f"llvm.musa.sqmma.{intrinsic_type}.m32n32k32.mma" in compiled.asm["llir"]
     assert f"llvm.musa.f2{intrinsic_type}.rn" in compiled.asm["llir"]
     assert compiled.asm["mubin"]
+
+
+def test_musa_ph1_mixed_standard_fp8_dot_uses_software_fma():
+    llir, metadata = _compile_to_llir(
+        _musa_standard_fp8_dot_kernel,
+        {"lhs": "*fp8e4nv", "rhs": "*fp8e5", "out": "*fp32"},
+    )
+
+    _assert_mixed_fp8_software_dot(llir)
+    assert not metadata.get("uses_sqmma", False)
+
+
+def test_musa_ph1_mixed_standard_fp8_dot_device():
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        pytest.skip("requires a MUSA device")
+    if tuple(torch.musa.get_device_capability(0)) != (3, 1):
+        pytest.skip("requires a PH1 device")
+
+    _, _, lhs_codes = _STANDARD_FP8_DOT_FORMATS["fp8e4nv"]
+    _, _, rhs_codes = _STANDARD_FP8_DOT_FORMATS["fp8e5"]
+    valuebook = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    lhs_index = ((torch.arange(32 * 32) * 7 + 3) % len(lhs_codes)).reshape(32, 32)
+    rhs_index = ((torch.arange(32 * 32) * 11 + 1) % len(rhs_codes)).reshape(32, 32)
+    lhs_raw = torch.tensor(lhs_codes, dtype=torch.uint8)[lhs_index].to("musa")
+    rhs_raw = torch.tensor(rhs_codes, dtype=torch.uint8)[rhs_index].to("musa")
+    output = torch.empty((32, 32), dtype=torch.float32, device="musa")
+
+    compiled = _musa_standard_fp8_dot_kernel[(1, )](
+        triton.reinterpret(lhs_raw, tl.float8e4nv),
+        triton.reinterpret(rhs_raw, tl.float8e5),
+        output,
+        num_warps=4,
+    )
+    torch.musa.synchronize()
+
+    expected = valuebook[lhs_index] @ valuebook[rhs_index]
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    _assert_mixed_fp8_software_dot(compiled.asm["llir"])
+    assert compiled.asm["mubin"]
+
+
+@pytest.mark.parametrize(
+    "m,n,k,intrinsic",
+    [
+        (32, 32, 16, "llvm.musa.e4m3.m16n16k16.mma"),
+        (16, 16, 32, "llvm.musa.e4m3.m16n16k32.mma"),
+    ],
+)
+def test_musa_ph1_standard_fp8_alternate_shapes_use_wmma(m, n, k, intrinsic):
+    llir, metadata = _compile_to_llir(
+        _musa_shaped_fp8_dot_kernel,
+        {
+            "lhs": "*fp8e4nv",
+            "rhs": "*fp8e4nv",
+            "out": "*fp32",
+            "M": "constexpr",
+            "N": "constexpr",
+            "K": "constexpr",
+        },
+        constexprs={"M": m, "N": n, "K": k},
+    )
+
+    assert intrinsic in llir
+    assert "llvm.musa.sqmma." not in llir
+    assert not metadata.get("uses_sqmma", False)
+
+
+@pytest.mark.parametrize(
+    "m,n,k,intrinsic",
+    [
+        (32, 32, 16, "llvm.musa.e4m3.m16n16k16.mma"),
+        (16, 16, 32, "llvm.musa.e4m3.m16n16k32.mma"),
+    ],
+)
+def test_musa_ph1_standard_fp8_alternate_shapes_device(m, n, k, intrinsic):
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        pytest.skip("requires a MUSA device")
+    if tuple(torch.musa.get_device_capability(0)) != (3, 1):
+        pytest.skip("requires a PH1 device")
+
+    dtype, _, raw_codes = _STANDARD_FP8_DOT_FORMATS["fp8e4nv"]
+    valuebook = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    lhs_index = ((torch.arange(m * k) * 7 + 3) % len(raw_codes)).reshape(m, k)
+    rhs_index = ((torch.arange(k * n) * 11 + 1) % len(raw_codes)).reshape(k, n)
+    lhs_raw = torch.tensor(raw_codes, dtype=torch.uint8)[lhs_index].to("musa")
+    rhs_raw = torch.tensor(raw_codes, dtype=torch.uint8)[rhs_index].to("musa")
+    output = torch.empty((m, n), dtype=torch.float32, device="musa")
+
+    compiled = _musa_shaped_fp8_dot_kernel[(1, )](
+        triton.reinterpret(lhs_raw, dtype),
+        triton.reinterpret(rhs_raw, dtype),
+        output,
+        M=m,
+        N=n,
+        K=k,
+        num_warps=4,
+    )
+    torch.musa.synchronize()
+
+    expected = valuebook[lhs_index] @ valuebook[rhs_index]
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert intrinsic in compiled.asm["llir"]
+    assert "llvm.musa.sqmma." not in compiled.asm["llir"]
+    assert compiled.asm["mubin"]
+
+
+def test_musa_ph1_fp8_fp16_accumulator_fails_closed(capfd):
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        _compile_to_llir(
+            _musa_fp8_dot_fp16_accumulator_kernel,
+            {"lhs": "*fp8e4nv", "rhs": "*fp8e4nv", "out": "*fp16"},
+        )
+
+    captured = capfd.readouterr()
+    assert (
+        "WMMA fp16 accumulators/results are not currently supported; "
+        "use an fp32 carrier and truncate after layout conversion instead"
+    ) in captured.err
 
 
 _CUSTOM_FP8_FORMATS = {
