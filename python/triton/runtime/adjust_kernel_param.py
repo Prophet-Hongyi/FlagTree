@@ -1346,6 +1346,15 @@ def auto_adjust_block_sizes(nargs, fn, configs, current, config):
                 print("[AABS] 4. adjust bs in tl.dot with general tl.load")
             adjust_block_size_general_dot_mn_dim(nargs, current, config, ge_m_map, 16)
             adjust_block_size_general_dot_mn_dim(nargs, current, config, ge_n_map, 16)
+        if FLAGTREE_BACKEND == "ppu":
+            # PPU MMA consumes a 16x16 output instruction tile. Although the
+            # frontend admits smaller logical M/N shapes, shrinking a block
+            # below the physical tile here produces an invalid launch config.
+            if knobs.autotuning.print:
+                print("[AABS] 4. adjust bs in tl.dot with general tl.load")
+            adjust_block_size_general_dot_mn_dim(nargs, current, config, ge_k_map, 16)
+            adjust_block_size_general_dot_mn_dim(nargs, current, config, ge_m_map, 16)
+            adjust_block_size_general_dot_mn_dim(nargs, current, config, ge_n_map, 16)
         if FLAGTREE_BACKEND == "sunrise":
             # sunrise min_dot_size = (M=8, N=8, K=16/4) (see sunrise compiler.py
             # min_dot_size). The tl.load shrink path above can lower a BLOCK that
