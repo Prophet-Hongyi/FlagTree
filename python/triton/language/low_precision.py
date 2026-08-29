@@ -162,14 +162,14 @@ def encode_fp8(
     dequantization without claiming native FP8 arithmetic.
 
     Supported formats are OCP E4M3FN and E5M2. Both use
-    round-to-nearest-even, saturating finite overflow, and FP16 or BF16 input.
-    Unsupported combinations fail at compile time instead of silently changing
-    numeric semantics.
+    round-to-nearest-even, saturating finite overflow, and FP16, BF16, or FP32
+    input. Unsupported combinations fail at compile time instead of silently
+    changing numeric semantics.
     """
 
     core.static_assert(
-        input.dtype.is_fp16() or input.dtype.is_bf16(),
-        "encode_fp8 input must be tl.float16 or tl.bfloat16",
+        input.dtype.is_fp16() or input.dtype.is_bf16() or input.dtype.is_fp32(),
+        "encode_fp8 input must be tl.float16, tl.bfloat16, or tl.float32",
     )
     core.static_assert(
         format == "e4m3fn" or format == "e5m2",
@@ -178,58 +178,133 @@ def encode_fp8(
     core.static_assert(rounding == "rtne", "encode_fp8 rounding must be 'rtne'")
     core.static_assert(overflow == "satfinite", "encode_fp8 overflow must be 'satfinite'")
 
-    # Preserve NaN and sign information from the original source. BF16 values
-    # at or above the smallest FP8 rounding midpoint are exactly representable
-    # in FP16; smaller values encode as signed zero. Larger values may safely
-    # overflow to FP16 infinity because this contract saturates FP8 overflow.
-    source_bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
-    source_absolute = source_bits & 0x7FFF
-    sign = ((source_bits & 0x8000) >> 8).to(core.uint8)
-    if input.dtype.is_bf16():
-        is_nan = ((source_absolute & 0x7F80) == 0x7F80) & ((source_absolute & 0x007F) != 0)
-        input = input.to(core.float16)
+    if input.dtype.is_fp32():
+        bits = input.to(core.int32, bitcast=True)
+        absolute = bits & 0x7FFFFFFF
+        sign = ((((bits >> 31) & 1) << 7).to(core.uint8))
+        exponent = (absolute >> 23) & 0xFF
+        mantissa = absolute & 0x007FFFFF
+        is_nan = (exponent == 0xFF) & (mantissa != 0)
+
+        if format == "e4m3fn":
+            # AMD's generic software conversion reduces the FP32 mantissa from
+            # 23 bits to three with RTNE, rebases the exponent from 127 to 7,
+            # and handles the eight E4M3FN subnormal bins explicitly.
+            rounding_absolute = core.where(is_nan, 0x7F800000, absolute)
+            rounding_bias = ((rounding_absolute & 0x00100000) >> 20) + 0x0007FFFF
+            rounded = (rounding_absolute + rounding_bias) & 0x7FF00000
+            rounded = core.maximum(rounded, 0x3C800000)
+            encoded = (rounded - 0x3C000000) >> 20
+            encoded = core.where(absolute > 0x43E7FFFF, 0x7E, encoded)
+
+            halfway_points: core.constexpr = (
+                0x3A800000,
+                0x3B400000,
+                0x3BA00000,
+                0x3BE00000,
+                0x3C100000,
+                0x3C300000,
+                0x3C500000,
+                0x3C700000,
+            )
+            for i in core.static_range(7, -1, -1):
+                if i % 2 == 0:
+                    below_halfway = absolute <= halfway_points[i]
+                else:
+                    below_halfway = absolute < halfway_points[i]
+                encoded = core.where(below_halfway, i, encoded)
+        else:
+            # Port AMD's direct FP32 -> OCP E5M2 software path. Mapping the
+            # exponent and subnormal bins before reducing the 23-bit mantissa
+            # avoids the double rounding of an FP16 intermediate.
+            exponent5 = core.where(exponent < 0x71, 0, exponent - 0x70)
+            adjusted_mantissa = core.where(exponent < 0x6E, 0, mantissa)
+            adjusted_mantissa = core.where(
+                exponent == 0x6E,
+                core.where(mantissa != 0, 0x00200000, 0),
+                adjusted_mantissa,
+            )
+            adjusted_mantissa = core.where(
+                exponent == 0x6F,
+                core.where(mantissa >= 0x00400000, 0x00400000, 0x00200000),
+                adjusted_mantissa,
+            )
+            adjusted_mantissa = core.where(
+                exponent == 0x70,
+                core.where(
+                    mantissa > 0x00200000,
+                    core.where(mantissa >= 0x00600000, 0x00800000, 0x00600000),
+                    0x00400000,
+                ),
+                adjusted_mantissa,
+            )
+            significand = (exponent5 << 23) | adjusted_mantissa
+            rounding_bias = ((significand & 0x00200000) >> 21) + 0x000FFFFF
+            rounded = significand + rounding_bias
+            rounded = core.where(
+                (exponent > 0x8E) | (significand >= 0x0F700000),
+                0x0F7FFFFF,
+                rounded,
+            )
+            encoded = rounded >> 21
+
+        encoded = core.where(is_nan, 0x7F, encoded).to(core.uint8)
+        return (encoded | sign).to(core.uint8)
+
     else:
-        is_nan = ((source_absolute & 0x7C00) == 0x7C00) & ((source_absolute & 0x03FF) != 0)
+        # Preserve NaN and sign information from the original source. BF16
+        # values at or above the smallest FP8 rounding midpoint are exactly
+        # representable in FP16; smaller values encode as signed zero. Larger
+        # values may safely overflow to FP16 infinity because this contract
+        # saturates FP8 overflow.
+        source_bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
+        source_absolute = source_bits & 0x7FFF
+        sign = ((source_bits & 0x8000) >> 8).to(core.uint8)
+        if input.dtype.is_bf16():
+            is_nan = ((source_absolute & 0x7F80) == 0x7F80) & ((source_absolute & 0x007F) != 0)
+            input = input.to(core.float16)
+        else:
+            is_nan = ((source_absolute & 0x7C00) == 0x7C00) & ((source_absolute & 0x03FF) != 0)
 
-    # Use a non-negative int32 carrier. Some backends cannot lower unsigned
-    # 32-bit arithmetic without promoting it to an unsupported uint64 cast.
-    bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
-    absolute = bits & 0x7FFF
+        # Use a non-negative int32 carrier. Some backends cannot lower unsigned
+        # 32-bit arithmetic without promoting it to an unsupported uint64 cast.
+        bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
+        absolute = bits & 0x7FFF
 
-    if format == "e4m3fn":
-        rounding_bias = ((absolute & 0x0080) >> 7) + 0x003F
-        encoded = (absolute + rounding_bias) & 0xFF80
-        encoded = core.maximum(encoded, 0x2400)
-        encoded = ((encoded - 0x2000) >> 7).to(core.uint8)
-        encoded = core.where(absolute > 0x5F40, 0x7E, encoded)
+        if format == "e4m3fn":
+            rounding_bias = ((absolute & 0x0080) >> 7) + 0x003F
+            encoded = (absolute + rounding_bias) & 0xFF80
+            encoded = core.maximum(encoded, 0x2400)
+            encoded = ((encoded - 0x2000) >> 7).to(core.uint8)
+            encoded = core.where(absolute > 0x5F40, 0x7E, encoded)
 
-        halfway_points: core.constexpr = (
-            0x1400,
-            0x1A00,
-            0x1D00,
-            0x1F00,
-            0x2080,
-            0x2180,
-            0x2280,
-            0x2380,
-        )
-        for i in core.static_range(7, -1, -1):
-            if i % 2 == 0:
-                below_halfway = absolute <= halfway_points[i]
-            else:
-                below_halfway = absolute < halfway_points[i]
-            encoded = core.where(below_halfway, i, encoded)
-    else:
-        # E5M2 and FP16 share the same five-bit exponent. Round the FP16
-        # mantissa from ten bits to two, clamp overflow and infinities to the
-        # largest finite E5M2 value, then retain the high byte.
-        rounding_bias = ((absolute & 0x0100) >> 8) + 0x007F
-        encoded = absolute + rounding_bias
-        encoded = core.where(absolute >= 0x7B80, 0x7B00, encoded)
-        encoded = (encoded >> 8).to(core.uint8)
+            halfway_points: core.constexpr = (
+                0x1400,
+                0x1A00,
+                0x1D00,
+                0x1F00,
+                0x2080,
+                0x2180,
+                0x2280,
+                0x2380,
+            )
+            for i in core.static_range(7, -1, -1):
+                if i % 2 == 0:
+                    below_halfway = absolute <= halfway_points[i]
+                else:
+                    below_halfway = absolute < halfway_points[i]
+                encoded = core.where(below_halfway, i, encoded)
+        else:
+            # E5M2 and FP16 share the same five-bit exponent. Round the FP16
+            # mantissa from ten bits to two, clamp overflow and infinities to
+            # the largest finite E5M2 value, then retain the high byte.
+            rounding_bias = ((absolute & 0x0100) >> 8) + 0x007F
+            encoded = absolute + rounding_bias
+            encoded = core.where(absolute >= 0x7B80, 0x7B00, encoded)
+            encoded = (encoded >> 8).to(core.uint8)
 
-    encoded = core.where(is_nan, 0x7F, encoded)
-    return (encoded | sign).to(core.uint8)
+        encoded = core.where(is_nan, 0x7F, encoded)
+        return (encoded | sign).to(core.uint8)
 
 
 @jit
