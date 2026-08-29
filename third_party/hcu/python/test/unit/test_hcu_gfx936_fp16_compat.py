@@ -9,6 +9,8 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     PTR_BUFFER_LOAD_V2I32,
     PTR_BUFFER_STORE_F32,
     PTR_BUFFER_STORE_I8,
+    PTR_BUFFER_STORE_I32,
+    PTR_BUFFER_STORE_V2I32,
     PTR_BUFFER_STORE_V2F32,
     PTR_BUFFER_STORE_V4F32,
     RAW_BUFFER_LOAD_I16,
@@ -16,6 +18,8 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     RAW_BUFFER_LOAD_V2I32,
     RAW_BUFFER_STORE_F32,
     RAW_BUFFER_STORE_I8,
+    RAW_BUFFER_STORE_I32,
+    RAW_BUFFER_STORE_V2I32,
     RAW_BUFFER_STORE_V2F32,
     RAW_BUFFER_STORE_V4F32,
     LLVM17MmacBridgeError,
@@ -35,18 +39,24 @@ def _fp16_dot_module(
     store_pointer = {
         "f32": PTR_BUFFER_STORE_F32,
         "i8": PTR_BUFFER_STORE_I8,
+        "i32": PTR_BUFFER_STORE_I32,
+        "v2i32": PTR_BUFFER_STORE_V2I32,
         "v2f32": PTR_BUFFER_STORE_V2F32,
         "v4f32": PTR_BUFFER_STORE_V4F32,
     }[store_type]
     store_raw_type = {
         "f32": "float",
         "i8": "i8",
+        "i32": "i32",
+        "v2i32": "<2 x i32>",
         "v2f32": "<2 x float>",
         "v4f32": "<4 x float>",
     }[store_type]
     store_value = {
         "f32": "0.0",
         "i8": "0",
+        "i32": "0",
+        "v2i32": "zeroinitializer",
         "v2f32": "zeroinitializer",
         "v4f32": "zeroinitializer",
     }[store_type]
@@ -70,6 +80,8 @@ declare void @{store_pointer}({store_raw_type}, ptr addrspace(8), i32, i32, i32)
     [
         ("f32", PTR_BUFFER_STORE_F32, RAW_BUFFER_STORE_F32),
         ("i8", PTR_BUFFER_STORE_I8, RAW_BUFFER_STORE_I8),
+        ("i32", PTR_BUFFER_STORE_I32, RAW_BUFFER_STORE_I32),
+        ("v2i32", PTR_BUFFER_STORE_V2I32, RAW_BUFFER_STORE_V2I32),
         ("v2f32", PTR_BUFFER_STORE_V2F32, RAW_BUFFER_STORE_V2F32),
         ("v4f32", PTR_BUFFER_STORE_V4F32, RAW_BUFFER_STORE_V4F32),
     ],
