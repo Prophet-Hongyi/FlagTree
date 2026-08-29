@@ -52,24 +52,28 @@ def _quantize_pack_int4_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PACKED_K: tl.constexpr,
+    LOGICAL_K: tl.constexpr,
     SCALE: tl.constexpr,
     SIGNED: tl.constexpr,
     PACK_LHS: tl.constexpr,
 ):
     reduction = tl.arange(0, PACKED_K)
+    high_valid = 2 * reduction + 1 < LOGICAL_K
     if PACK_LHS:
         rows = tl.arange(0, BLOCK_M)
-        low_offsets = rows[:, None] * (2 * PACKED_K) + 2 * reduction[None, :]
+        low_offsets = rows[:, None] * LOGICAL_K + 2 * reduction[None, :]
         high_offsets = low_offsets + 1
         packed_offsets = rows[:, None] * PACKED_K + reduction[None, :]
+        high_mask = high_valid[None, :]
     else:
         columns = tl.arange(0, BLOCK_N)
         low_offsets = (2 * reduction[:, None]) * BLOCK_N + columns[None, :]
         high_offsets = low_offsets + BLOCK_N
         packed_offsets = reduction[:, None] * BLOCK_N + columns[None, :]
+        high_mask = high_valid[:, None]
 
     low = tl.load(input_ptr + low_offsets)
-    high = tl.load(input_ptr + high_offsets)
+    high = tl.load(input_ptr + high_offsets, mask=high_mask, other=0.0)
     if SIGNED:
         low = tl.quantize(low, SCALE, dtype=tl.int8, qmin=-8, qmax=7)
         high = tl.quantize(high, SCALE, dtype=tl.int8, qmin=-8, qmax=7)
@@ -99,13 +103,13 @@ def _make_inputs(signed):
     return lhs, rhs
 
 
-def _make_quantized_inputs(signed):
+def _make_quantized_inputs(signed, logical_k):
     lhs_steps = (
-        (torch.arange(BLOCK_M * LOGICAL_K, dtype=torch.int64) * 7 + 3) % 41 - 20
-    ).reshape(BLOCK_M, LOGICAL_K)
+        (torch.arange(BLOCK_M * logical_k, dtype=torch.int64) * 7 + 3) % 41 - 20
+    ).reshape(BLOCK_M, logical_k)
     rhs_steps = (
-        (torch.arange(LOGICAL_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % 51 - 15
-    ).reshape(LOGICAL_K, BLOCK_N)
+        (torch.arange(logical_k * BLOCK_N, dtype=torch.int64) * 11 + 5) % 51 - 15
+    ).reshape(logical_k, BLOCK_N)
     lhs = lhs_steps.to(torch.float32) * (INT4_SCALE / 2)
     rhs = rhs_steps.to(torch.float32) * (INT4_SCALE / 2)
     qmin, qmax = (-8, 7) if signed else (0, 15)
@@ -113,6 +117,15 @@ def _make_quantized_inputs(signed):
     lhs_quantized = torch.round(lhs / INT4_SCALE).clamp(qmin, qmax).to(dtype)
     rhs_quantized = torch.round(rhs / INT4_SCALE).clamp(qmin, qmax).to(dtype)
     return lhs, rhs, lhs_quantized, rhs_quantized
+
+
+def _pad_high_k_nibble(values, axis):
+    if values.shape[axis] % 2 == 0:
+        return values
+    padding_shape = list(values.shape)
+    padding_shape[axis] = 1
+    padding = torch.zeros(padding_shape, dtype=values.dtype)
+    return torch.cat((values, padding), dim=axis)
 
 
 @pytest.mark.parametrize("signed", [True, False], ids=["int4", "uint4"])
@@ -143,8 +156,9 @@ def test_packed_int4_storage_uses_explicit_int8_dot(device, signed):
 
 
 @pytest.mark.parametrize("signed", [True, False], ids=["int4", "uint4"])
-def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed):
-    lhs, rhs, lhs_quantized, rhs_quantized = _make_quantized_inputs(signed)
+@pytest.mark.parametrize("logical_k", [2 * PACKED_K, 2 * PACKED_K - 1], ids=["even-k", "odd-k"])
+def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed, logical_k):
+    lhs, rhs, lhs_quantized, rhs_quantized = _make_quantized_inputs(signed, logical_k)
     lhs_packed = torch.empty((BLOCK_M, PACKED_K), dtype=torch.uint8, device=device)
     rhs_packed = torch.empty((PACKED_K, BLOCK_N), dtype=torch.uint8, device=device)
 
@@ -154,6 +168,7 @@ def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         PACKED_K=PACKED_K,
+        LOGICAL_K=logical_k,
         SCALE=INT4_SCALE,
         SIGNED=signed,
         PACK_LHS=True,
@@ -164,16 +179,19 @@ def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         PACKED_K=PACKED_K,
+        LOGICAL_K=logical_k,
         SCALE=INT4_SCALE,
         SIGNED=signed,
         PACK_LHS=False,
     )
 
+    lhs_quantized_padded = _pad_high_k_nibble(lhs_quantized, axis=1)
+    rhs_quantized_padded = _pad_high_k_nibble(rhs_quantized, axis=0)
     expected_lhs_packed = _pack_adjacent_k_values(
-        lhs_quantized[:, 0::2], lhs_quantized[:, 1::2]
+        lhs_quantized_padded[:, 0::2], lhs_quantized_padded[:, 1::2]
     )
     expected_rhs_packed = _pack_adjacent_k_values(
-        rhs_quantized[0::2, :], rhs_quantized[1::2, :]
+        rhs_quantized_padded[0::2, :], rhs_quantized_padded[1::2, :]
     )
     torch.testing.assert_close(lhs_packed.cpu(), expected_lhs_packed, rtol=0, atol=0)
     torch.testing.assert_close(rhs_packed.cpu(), expected_rhs_packed, rtol=0, atol=0)
