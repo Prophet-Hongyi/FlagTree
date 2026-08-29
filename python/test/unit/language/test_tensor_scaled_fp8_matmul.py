@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from low_precision_reference import E4M3FN, decode_fp8, encode_fp8_rtne
+from low_precision_reference import E4M3FN, E5M2, decode_fp8, encode_fp8_rtne
 
 
 BLOCK_M = 32
@@ -23,6 +23,7 @@ def _quantize_fp8_per_group_kernel(
     GROUPS: tl.constexpr,
     GROUP_K: tl.constexpr,
     QUANTIZE_LHS: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
 ):
     group = tl.program_id(0)
     reduction = tl.arange(0, GROUP_K)
@@ -36,7 +37,7 @@ def _quantize_fp8_per_group_kernel(
         scale = tl.load(scale_ptr + axis * GROUPS + group)[None, :]
 
     values = tl.load(input_ptr + offsets)
-    quantized = tl.quantize(values, scale, dtype=tl.float8e4nv, rounding="rtne")
+    quantized = tl.quantize(values, scale, dtype=FP8_DTYPE, rounding="rtne")
     tl.store(quantized_ptr + offsets, quantized)
 
 
@@ -71,17 +72,25 @@ def _tensor_scaled_fp8_matmul_kernel(
     tl.store(output_ptr + rows[:, None] * BLOCK_N + columns[None, :], output)
 
 
-def _encode_e4m3fn(values):
-    flat = [encode_fp8_rtne(value, E4M3FN) for value in values.reshape(-1).tolist()]
+def _encode_fp8(values, fp8_format):
+    flat = [encode_fp8_rtne(value, fp8_format) for value in values.reshape(-1).tolist()]
     return torch.tensor(flat, dtype=torch.uint8).reshape(values.shape)
 
 
-def _decode_e4m3fn(values):
-    flat = [decode_fp8(value, E4M3FN) for value in values.reshape(-1).tolist()]
+def _decode_fp8(values, fp8_format):
+    flat = [decode_fp8(value, fp8_format) for value in values.reshape(-1).tolist()]
     return torch.tensor(flat, dtype=torch.float32).reshape(values.shape)
 
 
-def _make_inputs(groups):
+def _format_config(format_name):
+    if format_name == "e4m3fn":
+        return E4M3FN, tl.float8e4nv, "f8E4M3FN", 25, 12, 0.5
+    if format_name == "e5m2":
+        return E5M2, tl.float8e5, "f8E5M2", 13, 6, 1.0
+    raise AssertionError(f"unhandled FP8 format: {format_name}")
+
+
+def _make_inputs(groups, value_modulus, value_offset, value_step):
     group_k = LOGICAL_K // groups
     lhs_scale = torch.tensor(
         [[0.125, 0.5], [0.25, 1.0], [0.5, 0.125], [1.0, 0.25]], dtype=torch.float32
@@ -91,27 +100,35 @@ def _make_inputs(groups):
     ).repeat(BLOCK_N // 4, 1)[:, :groups].contiguous()
 
     lhs_unscaled = (
-        (torch.arange(BLOCK_M * LOGICAL_K, dtype=torch.int64) * 7 + 3) % 25 - 12
-    ).reshape(BLOCK_M, groups, group_k).to(torch.float32) * 0.5
+        (torch.arange(BLOCK_M * LOGICAL_K, dtype=torch.int64) * 7 + 3) % value_modulus
+        - value_offset
+    ).reshape(BLOCK_M, groups, group_k).to(torch.float32) * value_step
     rhs_unscaled = (
-        (torch.arange(LOGICAL_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % 25 - 12
-    ).reshape(groups, group_k, BLOCK_N).to(torch.float32) * 0.5
+        (torch.arange(LOGICAL_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % value_modulus
+        - value_offset
+    ).reshape(groups, group_k, BLOCK_N).to(torch.float32) * value_step
     lhs = lhs_unscaled * lhs_scale[:, :, None]
     rhs = rhs_unscaled * rhs_scale.T[:, None, :]
-    lhs_encoded = _encode_e4m3fn(lhs_unscaled)
-    rhs_encoded = _encode_e4m3fn(rhs_unscaled)
-    return lhs, rhs, lhs_scale, rhs_scale, lhs_encoded, rhs_encoded
+    return lhs, rhs, lhs_scale, rhs_scale, lhs_unscaled, rhs_unscaled
 
 
+@pytest.mark.parametrize("format_name", ["e4m3fn", "e5m2"])
 @pytest.mark.parametrize("groups", [1, 2], ids=["per-axis", "per-group-k32"])
-def test_tensor_scaled_fp8_matmul(device, groups):
+def test_tensor_scaled_fp8_matmul(device, groups, format_name):
     group_k = LOGICAL_K // groups
-    lhs, rhs, lhs_scale, rhs_scale, lhs_encoded, rhs_encoded = _make_inputs(groups)
+    fp8_format, fp8_dtype, ir_type, value_modulus, value_offset, value_step = (
+        _format_config(format_name)
+    )
+    lhs, rhs, lhs_scale, rhs_scale, lhs_unscaled, rhs_unscaled = _make_inputs(
+        groups, value_modulus, value_offset, value_step
+    )
+    lhs_encoded = _encode_fp8(lhs_unscaled, fp8_format)
+    rhs_encoded = _encode_fp8(rhs_unscaled, fp8_format)
 
     lhs_storage = torch.empty(lhs_encoded.shape, dtype=torch.uint8, device=device)
     rhs_storage = torch.empty(rhs_encoded.shape, dtype=torch.uint8, device=device)
-    lhs_fp8 = triton.reinterpret(lhs_storage, tl.float8e4nv)
-    rhs_fp8 = triton.reinterpret(rhs_storage, tl.float8e4nv)
+    lhs_fp8 = triton.reinterpret(lhs_storage, fp8_dtype)
+    rhs_fp8 = triton.reinterpret(rhs_storage, fp8_dtype)
     lhs_quantize_program = _quantize_fp8_per_group_kernel[(groups, )](
         lhs.to(device),
         lhs_scale.to(device),
@@ -121,6 +138,7 @@ def test_tensor_scaled_fp8_matmul(device, groups):
         GROUPS=groups,
         GROUP_K=group_k,
         QUANTIZE_LHS=True,
+        FP8_DTYPE=fp8_dtype,
     )
     rhs_quantize_program = _quantize_fp8_per_group_kernel[(groups, )](
         rhs.to(device),
@@ -131,6 +149,7 @@ def test_tensor_scaled_fp8_matmul(device, groups):
         GROUPS=groups,
         GROUP_K=group_k,
         QUANTIZE_LHS=False,
+        FP8_DTYPE=fp8_dtype,
     )
     torch.testing.assert_close(lhs_storage.cpu(), lhs_encoded, rtol=0, atol=0)
     torch.testing.assert_close(rhs_storage.cpu(), rhs_encoded, rtol=0, atol=0)
@@ -148,8 +167,8 @@ def test_tensor_scaled_fp8_matmul(device, groups):
         GROUP_K=group_k,
     )
 
-    lhs_decoded = _decode_e4m3fn(lhs_encoded)
-    rhs_decoded = _decode_e4m3fn(rhs_encoded)
+    lhs_decoded = _decode_fp8(lhs_encoded, fp8_format)
+    rhs_decoded = _decode_fp8(rhs_encoded, fp8_format)
     expected = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float32)
     for group in range(groups):
         group_accumulator = torch.from_numpy(
@@ -160,7 +179,7 @@ def test_tensor_scaled_fp8_matmul(device, groups):
 
     for program in (lhs_quantize_program, rhs_quantize_program):
         assert "tt.fp_to_fp" in program.asm["ttir"]
-        assert "f8E4M3FN" in program.asm["ttir"]
+        assert ir_type in program.asm["ttir"]
     assert dot_program.asm["ttir"].count("tt.dot") == groups
-    assert "f8E4M3FN" in dot_program.asm["ttir"]
+    assert ir_type in dot_program.asm["ttir"]
     assert "f32" in dot_program.asm["ttir"]
