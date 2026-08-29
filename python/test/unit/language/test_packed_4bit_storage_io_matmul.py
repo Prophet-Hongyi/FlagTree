@@ -5,10 +5,8 @@ import triton
 import triton.language as tl
 
 
-BLOCK_M = 32
-BLOCK_N = 32
-PACKED_N = BLOCK_N // 2
 PACKED_K = 32
+MATMUL_SHAPES = ((16, 32), (32, 32), (32, 64))
 
 
 @triton.jit
@@ -114,28 +112,28 @@ def _pack_adjacent(values, axis):
     return low_bits | (high_bits << 4)
 
 
-def _make_inputs(signed):
+def _make_inputs(signed, block_m, block_n):
     lhs_centered = (
-        (torch.arange(BLOCK_M * 2 * PACKED_K, dtype=torch.int64) * 7 + 3) % 5
+        (torch.arange(block_m * 2 * PACKED_K, dtype=torch.int64) * 7 + 3) % 5
         - 2
-    ).reshape(BLOCK_M, 2 * PACKED_K)
+    ).reshape(block_m, 2 * PACKED_K)
     rhs_centered = (
-        (torch.arange(2 * PACKED_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % 5
+        (torch.arange(2 * PACKED_K * block_n, dtype=torch.int64) * 11 + 5) % 5
         - 2
-    ).reshape(2 * PACKED_K, BLOCK_N)
+    ).reshape(2 * PACKED_K, block_n)
     input_zero_point = 0 if signed else 7
     output_zero_point = 0 if signed else 7
     dtype = torch.int8 if signed else torch.uint8
     lhs = (lhs_centered + input_zero_point).to(dtype)
     rhs = (rhs_centered + input_zero_point).to(dtype)
     lhs_scale = torch.tensor([0.125, 0.25, 0.5, 1.0], dtype=torch.float32).repeat(
-        BLOCK_M // 4
+        block_m // 4
     )
     rhs_scale = torch.tensor([0.25, 0.5, 1.0, 0.125], dtype=torch.float32).repeat(
-        BLOCK_N // 4
+        block_n // 4
     )
     output_scale = torch.tensor([3.0, 5.0, 7.0, 9.0], dtype=torch.float32).repeat(
-        BLOCK_M // 4
+        block_m // 4
     )
     return (
         lhs,
@@ -151,7 +149,10 @@ def _make_inputs(signed):
 
 
 @pytest.mark.parametrize("signed", [True, False], ids=["int4", "uint4"])
-def test_packed_4bit_storage_input_output_matmul(device, signed):
+@pytest.mark.parametrize(
+    "block_m,block_n", MATMUL_SHAPES, ids=["m16n32", "m32n32", "m32n64"]
+)
+def test_packed_4bit_storage_input_output_matmul(device, signed, block_m, block_n):
     (
         lhs,
         rhs,
@@ -162,10 +163,11 @@ def test_packed_4bit_storage_input_output_matmul(device, signed):
         output_scale,
         input_zero_point,
         output_zero_point,
-    ) = _make_inputs(signed)
+    ) = _make_inputs(signed, block_m, block_n)
     lhs_packed = _pack_adjacent(lhs, axis=1)
     rhs_packed = _pack_adjacent(rhs, axis=0)
-    output_packed = torch.empty((BLOCK_M, PACKED_N), dtype=torch.uint8, device=device)
+    packed_n = block_n // 2
+    output_packed = torch.empty((block_m, packed_n), dtype=torch.uint8, device=device)
 
     program = _packed_4bit_storage_io_matmul_kernel[(1, )](
         lhs_packed.to(device),
@@ -174,9 +176,9 @@ def test_packed_4bit_storage_input_output_matmul(device, signed):
         rhs_scale.to(device),
         output_scale.to(device),
         output_packed,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        PACKED_N=PACKED_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        PACKED_N=packed_n,
         PACKED_K=PACKED_K,
         SIGNED=signed,
         INPUT_ZERO_POINT=input_zero_point,
