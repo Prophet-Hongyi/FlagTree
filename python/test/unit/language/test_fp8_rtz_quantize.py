@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 import triton
@@ -59,6 +61,35 @@ def _input_values():
     return values.repeat(2)
 
 
+def _special_input_values():
+    values = torch.tensor(
+        [
+            float("-nan"),
+            -math.inf,
+            -65504.0,
+            -60000.0,
+            -57344.0,
+            -0.0,
+            0.0,
+            57344.0,
+            60000.0,
+            65504.0,
+            math.inf,
+            math.nan,
+            -1.20,
+            1.20,
+            -2**-17,
+            2**-17,
+        ],
+        dtype=torch.float32,
+    )
+    return values.repeat(2)
+
+
+def _is_e5m2_nan(byte):
+    return byte & 0x7C == 0x7C and byte & 0x03 != 0
+
+
 @pytest.mark.parametrize("carrier", ["fp16", "bf16", "fp32"])
 def test_fp8_e5m2_rtz_quantize_carrier_dtypes(device, carrier):
     input = _input_values().to(dtype=_carrier_dtype(carrier), device=device)
@@ -75,4 +106,26 @@ def test_fp8_e5m2_rtz_quantize_carrier_dtypes(device, carrier):
         dtype=torch.uint8,
     )
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert "rounding = rtz" in program.asm["ttir"]
+
+
+@pytest.mark.parametrize("carrier", ["fp16", "bf16", "fp32"])
+def test_fp8_e5m2_rtz_preserves_special_value_categories(device, carrier):
+    input = _special_input_values().to(dtype=_carrier_dtype(carrier), device=device)
+    output = torch.empty(BLOCK_SIZE, dtype=torch.uint8, device=device)
+
+    program = _quantize_e5m2_rtz_kernel[(1, )](
+        input,
+        triton.reinterpret(output, tl.float8e5),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    actual = output.cpu().tolist()
+    for value, byte in zip(input.cpu().float().tolist(), actual):
+        if math.isnan(value):
+            # NaN payload and sign may be canonicalized by the carrier or
+            # target, but the result must remain an E5M2 NaN.
+            assert _is_e5m2_nan(byte), (carrier, value, byte)
+        else:
+            assert byte == encode_fp8_rtz(value, E5M2), (carrier, value, byte)
     assert "rounding = rtz" in program.asm["ttir"]
