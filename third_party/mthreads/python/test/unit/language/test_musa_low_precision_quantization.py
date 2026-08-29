@@ -13,6 +13,42 @@ if not hasattr(libtriton, "mthreads"):
 
 _PH1_INT8_MMA = "llvm.musa.sqmma.smma"
 _PH1_BF16_MMA = "llvm.musa.sqmma.bfmma.m32n32k64.mma"
+_E4M3FN_RTZ_INPUT = [
+    -500.0,
+    -1.4375,
+    -1.20,
+    -1.0,
+    -3 * 2**-10,
+    -2**-10,
+    -0.0,
+    0.0,
+    2**-10,
+    3 * 2**-10,
+    1.0,
+    1.20,
+    1.4375,
+    448.0,
+    500.0,
+    0.30,
+]
+_E4M3FN_RTZ_BYTES = [
+    0xFE,
+    0xBB,
+    0xB9,
+    0xB8,
+    0x81,
+    0x80,
+    0x80,
+    0x00,
+    0x00,
+    0x01,
+    0x38,
+    0x39,
+    0x3B,
+    0x7E,
+    0x7E,
+    0x29,
+]
 
 
 @triton.jit
@@ -79,6 +115,20 @@ def _uint8_storage_bf16_dot_quantize_kernel(
     tl.store(out + offsets_m[:, None] * 32 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _e4m3fn_rtz_quantize_kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(input_ptr + offsets)
+    result = tl.quantize(
+        values,
+        1.0,
+        dtype=tl.float8e4nv,
+        zero_point=0,
+        rounding="rtz",
+    )
+    tl.store(output_ptr + offsets, result)
+
+
 def _int8_inputs():
     lhs = (((torch.arange(32 * 64) * 7 + 3) % 17) - 8).reshape(32, 64).to(torch.int8)
     rhs = (((torch.arange(64 * 32) * 11 + 5) % 17) - 8).reshape(64, 32).to(torch.int8)
@@ -98,6 +148,16 @@ def _quantize_reference(values, scale):
 def _quantize_uint8_reference(values, scale, zero_point):
     rounded = torch.round(values.to(torch.float32) / scale) + zero_point
     return torch.clamp(rounded, 0, 255).to(torch.uint8)
+
+
+def _carrier_dtype(carrier):
+    if carrier == "fp16":
+        return torch.float16
+    if carrier == "bf16":
+        return torch.bfloat16
+    if carrier == "fp32":
+        return torch.float32
+    raise AssertionError(f"unhandled carrier dtype: {carrier}")
 
 
 def _require_ph1():
@@ -181,4 +241,27 @@ def test_ph1_uint8_storage_bf16_compute_uint8_output():
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
     assert _PH1_BF16_MMA in compiled.asm["llir"]
     assert _PH1_INT8_MMA not in compiled.asm["llir"]
+    assert compiled.asm["mubin"]
+
+
+@pytest.mark.parametrize("carrier", ["fp16", "bf16", "fp32"])
+def test_ph1_e4m3fn_rtz_quantize_uses_software_correction(carrier):
+    _require_ph1()
+
+    values = torch.tensor(_E4M3FN_RTZ_INPUT * 2, dtype=_carrier_dtype(carrier), device="musa")
+    output = torch.empty(32, dtype=torch.uint8, device="musa")
+    compiled = _e4m3fn_rtz_quantize_kernel[(1, )](
+        values,
+        triton.reinterpret(output, tl.float8e4nv),
+        BLOCK_SIZE=32,
+        num_warps=4,
+    )
+    torch.musa.synchronize()
+
+    expected = torch.tensor(_E4M3FN_RTZ_BYTES * 2, dtype=torch.uint8)
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert "rounding = rtz" in compiled.asm["ttir"]
+    assert "llvm.musa.f2e4m3.rn" in compiled.asm["llir"]
+    assert "llvm.musa.e4m32f16.rn" in compiled.asm["llir"]
+    assert "fcmp ogt" in compiled.asm["llir"]
     assert compiled.asm["mubin"]
