@@ -50,6 +50,7 @@ def _tensor_scaled_fp8_matmul_kernel(
     BLOCK_N: tl.constexpr,
     GROUPS: tl.constexpr,
     GROUP_K: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
 ):
     rows = tl.arange(0, BLOCK_M)
     columns = tl.arange(0, BLOCK_N)
@@ -67,7 +68,10 @@ def _tensor_scaled_fp8_matmul_kernel(
         rhs_scale = tl.load(rhs_scale_ptr + columns * GROUPS + group)[None, :]
         output += accumulator * lhs_scale * rhs_scale
 
-    tl.store(output_ptr + rows[:, None] * BLOCK_N + columns[None, :], output)
+    tl.store(
+        output_ptr + rows[:, None] * BLOCK_N + columns[None, :],
+        output.to(OUTPUT_DTYPE),
+    )
 
 
 def _encode_fp8(values, fp8_format):
@@ -86,6 +90,16 @@ def _format_config(format_name):
     if format_name == "e5m2":
         return E5M2, tl.float8e5, "f8E5M2", 13, 6, 1.0
     raise AssertionError(f"unhandled FP8 format: {format_name}")
+
+
+def _output_config(output_name):
+    if output_name == "fp32":
+        return torch.float32, tl.float32, "f32"
+    if output_name == "fp16":
+        return torch.float16, tl.float16, "f16"
+    if output_name == "bf16":
+        return torch.bfloat16, tl.bfloat16, "bf16"
+    raise AssertionError(f"unhandled output dtype: {output_name}")
 
 
 def _make_inputs(block_m, block_n, groups, value_modulus, value_offset, value_step):
@@ -112,13 +126,19 @@ def _make_inputs(block_m, block_n, groups, value_modulus, value_offset, value_st
 
 @pytest.mark.parametrize("format_name", ["e4m3fn", "e5m2"])
 @pytest.mark.parametrize("groups", [1, 2], ids=["per-axis", "per-group-k32"])
+@pytest.mark.parametrize("output_name", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize(
     "block_m,block_n",
     [(16, 32), (32, 16), (32, 32)],
     ids=["m16n32", "m32n16", "m32n32"],
 )
-def test_tensor_scaled_fp8_matmul(device, block_m, block_n, groups, format_name):
+def test_tensor_scaled_fp8_matmul(
+    device, block_m, block_n, output_name, groups, format_name
+):
     group_k = LOGICAL_K // groups
+    output_torch_dtype, output_triton_dtype, output_ir_type = _output_config(
+        output_name
+    )
     fp8_format, fp8_dtype, ir_type, value_modulus, value_offset, value_step = (
         _format_config(format_name)
     )
@@ -157,7 +177,9 @@ def test_tensor_scaled_fp8_matmul(device, block_m, block_n, groups, format_name)
     torch.testing.assert_close(lhs_storage.cpu(), lhs_encoded, rtol=0, atol=0)
     torch.testing.assert_close(rhs_storage.cpu(), rhs_encoded, rtol=0, atol=0)
 
-    output = torch.empty((block_m, block_n), dtype=torch.float32, device=device)
+    output = torch.empty(
+        (block_m, block_n), dtype=output_torch_dtype, device=device
+    )
     dot_program = _tensor_scaled_fp8_matmul_kernel[(1, )](
         lhs_fp8,
         rhs_fp8,
@@ -168,6 +190,7 @@ def test_tensor_scaled_fp8_matmul(device, block_m, block_n, groups, format_name)
         BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
+        OUTPUT_DTYPE=output_triton_dtype,
     )
 
     lhs_decoded = _decode_fp8(lhs_encoded, fp8_format)
@@ -178,7 +201,16 @@ def test_tensor_scaled_fp8_matmul(device, block_m, block_n, groups, format_name)
             np.matmul(lhs_decoded[:, group].numpy(), rhs_decoded[group].numpy())
         )
         expected += group_accumulator * lhs_scale[:, group, None] * rhs_scale[:, group][None, :]
-    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=FP8_MATMUL_ATOL)
+    expected = expected.to(output_torch_dtype)
+    if output_torch_dtype == torch.float32:
+        output_rtol = 0
+        output_atol = FP8_MATMUL_ATOL
+    else:
+        output_rtol = torch.finfo(output_torch_dtype).eps
+        output_atol = 0
+    torch.testing.assert_close(
+        output.cpu(), expected, rtol=output_rtol, atol=output_atol
+    )
 
     for program in (lhs_quantize_program, rhs_quantize_program):
         assert "tt.fp_to_fp" in program.asm["ttir"]
@@ -186,3 +218,4 @@ def test_tensor_scaled_fp8_matmul(device, block_m, block_n, groups, format_name)
     assert dot_program.asm["ttir"].count("tt.dot") == groups
     assert ir_type in dot_program.asm["ttir"]
     assert "f32" in dot_program.asm["ttir"]
+    assert f"!tt.ptr<{output_ir_type}>" in dot_program.asm["ttir"]
