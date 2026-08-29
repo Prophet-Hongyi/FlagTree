@@ -5,8 +5,6 @@ import triton
 import triton.language as tl
 
 
-BLOCK_M = 32
-BLOCK_N = 32
 LOGICAL_K = 64
 
 
@@ -69,21 +67,21 @@ def _tensor_scaled_int8_matmul_kernel(
     tl.store(output_ptr + rows[:, None] * BLOCK_N + columns[None, :], output)
 
 
-def _make_inputs(groups):
+def _make_inputs(block_m, block_n, groups):
     group_k = LOGICAL_K // groups
     lhs_scale = torch.tensor(
         [[0.125, 0.5], [0.25, 1.0], [0.5, 0.125], [1.0, 0.25]], dtype=torch.float32
-    ).repeat(BLOCK_M // 4, 1)[:, :groups].contiguous()
+    ).repeat(block_m // 4, 1)[:, :groups].contiguous()
     rhs_scale = torch.tensor(
         [[0.25, 1.0], [0.5, 2.0], [1.0, 0.25], [2.0, 0.5]], dtype=torch.float32
-    ).repeat(BLOCK_N // 4, 1)[:, :groups].contiguous()
+    ).repeat(block_n // 4, 1)[:, :groups].contiguous()
 
     lhs_steps = (
-        (torch.arange(BLOCK_M * LOGICAL_K, dtype=torch.int64) * 7 + 3) % 41 - 20
-    ).reshape(BLOCK_M, groups, group_k)
+        (torch.arange(block_m * LOGICAL_K, dtype=torch.int64) * 7 + 3) % 41 - 20
+    ).reshape(block_m, groups, group_k)
     rhs_steps = (
-        (torch.arange(LOGICAL_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % 43 - 21
-    ).reshape(groups, group_k, BLOCK_N)
+        (torch.arange(LOGICAL_K * block_n, dtype=torch.int64) * 11 + 5) % 43 - 21
+    ).reshape(groups, group_k, block_n)
     lhs = lhs_steps.to(torch.float32) * 0.5 * lhs_scale[:, :, None]
     rhs = rhs_steps.to(torch.float32) * 0.5 * rhs_scale.T[:, None, :]
     lhs_quantized = torch.round(lhs / lhs_scale[:, :, None]).clamp(-128, 127).to(torch.int8)
@@ -92,9 +90,16 @@ def _make_inputs(groups):
 
 
 @pytest.mark.parametrize("groups", [1, 2], ids=["per-axis", "per-group-k32"])
-def test_tensor_scaled_int8_matmul(device, groups):
+@pytest.mark.parametrize(
+    "block_m,block_n",
+    [(16, 32), (32, 16), (32, 32)],
+    ids=["m16n32", "m32n16", "m32n32"],
+)
+def test_tensor_scaled_int8_matmul(device, block_m, block_n, groups):
     group_k = LOGICAL_K // groups
-    lhs, rhs, lhs_scale, rhs_scale, lhs_quantized, rhs_quantized = _make_inputs(groups)
+    lhs, rhs, lhs_scale, rhs_scale, lhs_quantized, rhs_quantized = _make_inputs(
+        block_m, block_n, groups
+    )
 
     lhs_storage = torch.empty_like(lhs_quantized, device=device)
     rhs_storage = torch.empty_like(rhs_quantized, device=device)
@@ -102,8 +107,8 @@ def test_tensor_scaled_int8_matmul(device, groups):
         lhs.to(device),
         lhs_scale.to(device),
         lhs_storage,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
         QUANTIZE_LHS=True,
@@ -112,8 +117,8 @@ def test_tensor_scaled_int8_matmul(device, groups):
         rhs.to(device),
         rhs_scale.to(device),
         rhs_storage,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
         QUANTIZE_LHS=False,
@@ -121,20 +126,20 @@ def test_tensor_scaled_int8_matmul(device, groups):
     torch.testing.assert_close(lhs_storage.cpu(), lhs_quantized, rtol=0, atol=0)
     torch.testing.assert_close(rhs_storage.cpu(), rhs_quantized, rtol=0, atol=0)
 
-    output = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.float32, device=device)
+    output = torch.empty((block_m, block_n), dtype=torch.float32, device=device)
     dot_program = _tensor_scaled_int8_matmul_kernel[(1, )](
         lhs_storage,
         rhs_storage,
         lhs_scale.to(device),
         rhs_scale.to(device),
         output,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
     )
 
-    expected = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float32)
+    expected = torch.zeros((block_m, block_n), dtype=torch.float32)
     for group in range(groups):
         group_accumulator = torch.from_numpy(
             np.matmul(lhs_quantized[:, group].to(torch.int32).numpy(),
