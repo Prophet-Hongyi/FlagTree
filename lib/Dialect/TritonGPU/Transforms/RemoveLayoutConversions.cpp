@@ -412,6 +412,7 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-cached-load-cost-per-byte
 //   ttg.rlc-expensive-math-cost-per-byte
 //   ttg.rlc-inter-warp-reduce-cost
+//   ttg.rlc-atomic-writeback-max-elements-per-thread-ratio
 //   ttg.rlc-allow-atomic-writeback-order-change
 //
 // Values must be positive integers; absent or invalid values keep the
@@ -424,6 +425,10 @@ struct RlcBackendPolicy {
   int64_t cachedLoadCostPerByte = 8;
   int64_t expensiveMathCostPerByte = 8;
   int64_t interWarpReduceCost = 8;
+  // Zero leaves atomic writeback retagging unrestricted. Backends whose
+  // atomic lowering serializes every per-thread element can set a positive
+  // ratio to preserve the incumbent lane parallelism.
+  int64_t atomicWritebackMaxElementsPerThreadRatio = 0;
   bool allowAtomicWritebackOrderChange = false;
 
   static RlcBackendPolicy fromOperation(Operation *op) {
@@ -451,6 +456,8 @@ struct RlcBackendPolicy {
                      policy.expensiveMathCostPerByte);
     overridePositive("ttg.rlc-inter-warp-reduce-cost",
                      policy.interWarpReduceCost);
+    overridePositive("ttg.rlc-atomic-writeback-max-elements-per-thread-ratio",
+                     policy.atomicWritebackMaxElementsPerThreadRatio);
     if (auto attr = module->getAttrOfType<IntegerAttr>(
             "ttg.rlc-allow-atomic-writeback-order-change"))
       policy.allowAtomicWritebackOrderChange = attr.getInt() > 0;
@@ -2651,10 +2658,22 @@ bool LayoutPropagation::solveSmallComponents() {
     auto valType = dyn_cast<RankedTensorType>(atomicOp.getVal().getType());
     if (!ptrType || !valType)
       return false;
+    RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(atomicOp);
+    if (policy.atomicWritebackMaxElementsPerThreadRatio > 0) {
+      int64_t currentElements = getTotalElemsPerThread(valType);
+      int64_t candidateElements = getTotalElemsPerThread(
+          valType.cloneWithEncoding(encoding));
+      if (candidateElements >
+          currentElements * policy.atomicWritebackMaxElementsPerThreadRatio) {
+        traceRlcDecision("2", "reject",
+                         "atomic-elements-per-thread-expansion", atomicOp);
+        return false;
+      }
+    }
     if (!preservesWritebackMemoryAccess(
             ptrType, valType, encoding,
             /*allowNarrowerContiguity=*/false,
-            RlcBackendPolicy::fromOperation(atomicOp)))
+            policy))
       return false;
     if (!collectOperand(atomicOp.getVal()) ||
         !collectOperand(atomicOp.getPtr()))
