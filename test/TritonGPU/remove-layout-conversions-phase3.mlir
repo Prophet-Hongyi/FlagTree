@@ -1,5 +1,9 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=0" | FileCheck %s --check-prefix=MASK0
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=8" | FileCheck %s --check-prefix=PHASE3
+// RUN: env FLAGTREE_RLC_TRACE_REJECTS=1 triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=8" 2>&1 | FileCheck %s --check-prefix=TRACE
+
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=accept reason=writeback-rematerialized op=tt.atomic_rmw
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=reject reason=memory-access-change op=tt.store
 
 #blocked_atomic = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked_store = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -73,6 +77,77 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc
     %mask = arith.constant dense<true> : tensor<16x64xi1, #blocked>
     %value = ttg.convert_layout %acc : tensor<16x64xf32, #mma> -> tensor<16x64xf32, #blocked>
     %unused = tt.atomic_rmw fadd, acq_rel, gpu, %ptrs, %value, %mask : (tensor<16x64x!tt.ptr<f32>, #blocked>, tensor<16x64xf32, #blocked>, tensor<16x64xi1, #blocked>) -> tensor<16x64xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked_order_change = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+#mma_order_change = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 4], instrShape = [16, 8]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // PHASE3-LABEL: tt.func @atomic_order_change_default_off
+  // PHASE3: ttg.convert_layout
+  // PHASE3: tt.atomic_rmw
+  tt.func @atomic_order_change_default_off(%acc: tensor<16x64xf32, #mma_order_change>, %base: !tt.ptr<f32>) {
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_order_change}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_order_change}>> -> tensor<16x1xi32, #blocked_order_change>
+    %rows_full = tt.broadcast %rows_2d : tensor<16x1xi32, #blocked_order_change> -> tensor<16x64xi32, #blocked_order_change>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_order_change}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_order_change}>> -> tensor<1x64xi32, #blocked_order_change>
+    %cols_full = tt.broadcast %cols_2d : tensor<1x64xi32, #blocked_order_change> -> tensor<16x64xi32, #blocked_order_change>
+    %offsets = arith.addi %rows_full, %cols_full : tensor<16x64xi32, #blocked_order_change>
+    %base_splat = tt.splat %base : !tt.ptr<f32> -> tensor<16x64x!tt.ptr<f32>, #blocked_order_change>
+    %ptrs = tt.addptr %base_splat, %offsets : tensor<16x64x!tt.ptr<f32>, #blocked_order_change>, tensor<16x64xi32, #blocked_order_change>
+    %mask = arith.constant dense<true> : tensor<16x64xi1, #blocked_order_change>
+    %value = ttg.convert_layout %acc : tensor<16x64xf32, #mma_order_change> -> tensor<16x64xf32, #blocked_order_change>
+    %unused = tt.atomic_rmw fadd, acq_rel, gpu, %ptrs, %value, %mask : (tensor<16x64x!tt.ptr<f32>, #blocked_order_change>, tensor<16x64xf32, #blocked_order_change>, tensor<16x64xi1, #blocked_order_change>) -> tensor<16x64xf32, #blocked_order_change>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked_order_change = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+#mma_order_change = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 4], instrShape = [16, 8]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-allow-atomic-writeback-order-change" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // PHASE3-LABEL: tt.func @atomic_order_change_opt_in
+  // PHASE3-NOT: ttg.convert_layout
+  // PHASE3: tt.atomic_rmw
+  tt.func @atomic_order_change_opt_in(%acc: tensor<16x64xf32, #mma_order_change>, %base: !tt.ptr<f32>) {
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_order_change}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_order_change}>> -> tensor<16x1xi32, #blocked_order_change>
+    %rows_full = tt.broadcast %rows_2d : tensor<16x1xi32, #blocked_order_change> -> tensor<16x64xi32, #blocked_order_change>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_order_change}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_order_change}>> -> tensor<1x64xi32, #blocked_order_change>
+    %cols_full = tt.broadcast %cols_2d : tensor<1x64xi32, #blocked_order_change> -> tensor<16x64xi32, #blocked_order_change>
+    %offsets = arith.addi %rows_full, %cols_full : tensor<16x64xi32, #blocked_order_change>
+    %base_splat = tt.splat %base : !tt.ptr<f32> -> tensor<16x64x!tt.ptr<f32>, #blocked_order_change>
+    %ptrs = tt.addptr %base_splat, %offsets : tensor<16x64x!tt.ptr<f32>, #blocked_order_change>, tensor<16x64xi32, #blocked_order_change>
+    %mask = arith.constant dense<true> : tensor<16x64xi1, #blocked_order_change>
+    %value = ttg.convert_layout %acc : tensor<16x64xf32, #mma_order_change> -> tensor<16x64xf32, #blocked_order_change>
+    %unused = tt.atomic_rmw fadd, acq_rel, gpu, %ptrs, %value, %mask : (tensor<16x64x!tt.ptr<f32>, #blocked_order_change>, tensor<16x64xf32, #blocked_order_change>, tensor<16x64xi1, #blocked_order_change>) -> tensor<16x64xf32, #blocked_order_change>
+    tt.return
+  }
+
+  // PHASE3-LABEL: tt.func @store_order_change_still_protected
+  // PHASE3: ttg.convert_layout
+  // PHASE3: tt.store
+  tt.func @store_order_change_still_protected(%acc: tensor<16x64xf32, #mma_order_change>, %base: !tt.ptr<f32>) {
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_order_change}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_order_change}>> -> tensor<16x1xi32, #blocked_order_change>
+    %rows_full = tt.broadcast %rows_2d : tensor<16x1xi32, #blocked_order_change> -> tensor<16x64xi32, #blocked_order_change>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_order_change}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_order_change}>> -> tensor<1x64xi32, #blocked_order_change>
+    %cols_full = tt.broadcast %cols_2d : tensor<1x64xi32, #blocked_order_change> -> tensor<16x64xi32, #blocked_order_change>
+    %offsets = arith.addi %rows_full, %cols_full : tensor<16x64xi32, #blocked_order_change>
+    %base_splat = tt.splat %base : !tt.ptr<f32> -> tensor<16x64x!tt.ptr<f32>, #blocked_order_change>
+    %ptrs = tt.addptr %base_splat, %offsets : tensor<16x64x!tt.ptr<f32>, #blocked_order_change>, tensor<16x64xi32, #blocked_order_change>
+    %mask = arith.constant dense<true> : tensor<16x64xi1, #blocked_order_change>
+    %value = ttg.convert_layout %acc : tensor<16x64xf32, #mma_order_change> -> tensor<16x64xf32, #blocked_order_change>
+    tt.store %ptrs, %value, %mask : tensor<16x64x!tt.ptr<f32>, #blocked_order_change>
     tt.return
   }
 }
