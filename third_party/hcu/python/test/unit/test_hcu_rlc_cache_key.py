@@ -119,6 +119,24 @@ def test_codegen_signature_tracks_in_process_bridge_flip():
                 os.environ[key] = value
 
 
+def test_codegen_signature_tracks_i64_vector_load_flip():
+    previous = {k: os.environ.get(k) for k in _RLC_ENV_KEYS}
+    try:
+        _set_rlc(False, llvm17_contract_bridge=True)
+        bridge_only = _gfx936_codegen_signature()
+        os.environ["FLAGTREE_HCU_GFX936_I64_VECTOR_LOAD_MATERIALIZE"] = "1"
+        vector_load_on = _gfx936_codegen_signature()
+        assert bridge_only == "1-0-0-0-0-0"
+        assert vector_load_on == "1-1-0-0-0-0"
+        assert bridge_only != vector_load_on
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_backend_hash_tracks_in_process_rlc_flip():
     previous = {k: os.environ.get(k) for k in _RLC_ENV_KEYS}
     backend = _backend()
