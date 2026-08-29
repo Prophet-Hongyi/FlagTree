@@ -131,21 +131,27 @@ static bool isOcpFp8(Type type) {
 }
 
 // C550 has no executable E2M1 MMA or conversion instruction.  Reuse Triton's
-// standard scaled-dot decomposition for the one contract we can implement
-// entirely in software: two K-packed E2M1 operands without block scales.  The
+// standard scaled-dot decomposition for the contract we can implement entirely
+// in software: two K-packed E2M1 operands with optional E8M0 block scales.  The
 // backend-local Fp4ToFpOp lowering decodes them to BF16 before BlockedToMMA
-// selects the existing BF16 MMA path.  Keep every broader scaled-dot form
-// fail-closed until it has an independently validated lowering.
+// selects the existing BF16 MMA path.  Keep this fallback scoped to C550 so it
+// cannot shadow a native path on a future MetaX target.
 class DecomposeC550E2M1DotScaled final
     : public ttg::DecomposeScaledBlocked {
+  int computeCapability;
+
 public:
-  using DecomposeScaledBlocked::DecomposeScaledBlocked;
+  DecomposeC550E2M1DotScaled(MLIRContext *context, int computeCapability,
+                             PatternBenefit benefit = 1)
+      : DecomposeScaledBlocked(context, benefit),
+        computeCapability(computeCapability) {}
 
   LogicalResult matchAndRewrite(tt::DotScaledOp op,
                                 PatternRewriter &rewriter) const override {
-    if (op.getAElemType() != tt::ScaleDotElemType::E2M1 ||
-        op.getBElemType() != tt::ScaleDotElemType::E2M1 || op.getAScale() ||
-        op.getBScale() || !op.getLhsKPack() || !op.getRhsKPack())
+    if (computeCapability != 80 ||
+        op.getAElemType() != tt::ScaleDotElemType::E2M1 ||
+        op.getBElemType() != tt::ScaleDotElemType::E2M1 ||
+        !op.getLhsKPack() || !op.getRhsKPack())
       return failure();
     return DecomposeScaledBlocked::matchAndRewrite(op, rewriter);
   }
@@ -392,7 +398,8 @@ public:
         mlir::IntegerAttr::get(mlir::IntegerType::get(m.getContext(), 32), 0));
 
     mlir::RewritePatternSet patterns(context);
-    patterns.add<::DecomposeC550E2M1DotScaled>(context, /*benefit=*/2);
+    patterns.add<::DecomposeC550E2M1DotScaled>(
+        context, computeCapability, /*benefit=*/2);
     // TODO: support chain dot & multi dot
     patterns.add<::BlockedToMMA>(context, computeCapability, /*dot_cut=*/1,
                                  numStages, disablePrefetch, storeCoalesce);
