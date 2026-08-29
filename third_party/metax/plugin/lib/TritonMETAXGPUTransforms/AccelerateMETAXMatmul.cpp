@@ -130,6 +130,19 @@ static bool isOcpFp8(Type type) {
   return llvm::isa<Float8E4M3FNType, Float8E5M2Type>(type);
 }
 
+static bool isLegalMACAMmaShape(int m, int n, int k, Type elementTy,
+                                bool enableTf32, int computeCapability) {
+  auto threadShape = ttg::getMmaThreadShape();
+  auto elemsPerThread =
+      getDefaultElemsPerThread(elementTy, enableTf32, computeCapability);
+  int instructionM = threadShape[0] * elemsPerThread[0];
+  int instructionN = threadShape[1] * elemsPerThread[1];
+  int instructionK = threadShape[2] * elemsPerThread[2];
+  return m >= instructionM && n >= instructionN && k >= instructionK &&
+         m % instructionM == 0 && n % instructionN == 0 &&
+         k % instructionK == 0;
+}
+
 // C550 has no executable E2M1 MMA or conversion instruction.  Reuse Triton's
 // standard scaled-dot decomposition for the contract we can implement entirely
 // in software: two K-packed E2M1 operands with optional E8M0 block scales.  The
@@ -241,6 +254,10 @@ public:
     int n = bTensorTy.getShape()[1];
     auto elementTy = aTensorTy.getElementType();
     bool enableTf32 = dotOp.getInputPrecision() == tt::InputPrecision::TF32;
+    if (!isLegalMACAMmaShape(m, n, k, elementTy, enableTf32,
+                             computeCapability))
+      return rewriter.notifyMatchFailure(
+          dotOp, "shape is not aligned to a native MACA MMA tile");
 
     auto parentOp = dotOp->getParentOp();
     // enable MACA's optimized MMA layout, currently must satisfy:

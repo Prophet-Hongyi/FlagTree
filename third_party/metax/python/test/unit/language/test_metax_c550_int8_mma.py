@@ -34,6 +34,17 @@ def _metax_int8_dot_kernel(lhs, rhs, out):
     tl.store(out + offs_m[:, None] * 16 + offs_n[None, :], acc)
 
 
+@triton.jit
+def _metax_int8_narrow_dot_kernel(lhs, rhs, out):
+    offs_m = tl.arange(0, 32)
+    offs_n = tl.arange(0, 8)
+    offs_k = tl.arange(0, 32)
+    a = tl.load(lhs + offs_m[:, None] * 32 + offs_k[None, :])
+    b = tl.load(rhs + offs_k[:, None] * 8 + offs_n[None, :])
+    acc = tl.dot(a, b)
+    tl.store(out + offs_m[:, None] * 8 + offs_n[None, :], acc)
+
+
 def _compile_c550(signature):
     src = ASTSource(fn=_metax_int8_dot_kernel, signature=signature)
     return triton.compile(src, target=_C550_TARGET, options={"num_warps": 4})
@@ -48,6 +59,17 @@ def test_c550_signed_int8_dot_lowers_to_native_mma():
 def test_c550_uint8_dot_fails_closed():
     with pytest.raises(CompilationError, match="only int8 supported"):
         _compile_c550({"lhs": "*u8", "rhs": "*u8", "out": "*i32"})
+
+
+def test_c550_signed_int8_dot_below_native_tile_fails_closed():
+    src = ASTSource(
+        fn=_metax_int8_narrow_dot_kernel,
+        signature={"lhs": "*i8", "rhs": "*i8", "out": "*i32"},
+    )
+    # The blocked i8 dot cannot use the generic FMA fallback because its
+    # accumulator is i32, so rejecting the native tile must fail the MLIR pass.
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        triton.compile(src, target=_C550_TARGET, options={"num_warps": 4})
 
 
 def test_c550_signed_int8_dot_device():
