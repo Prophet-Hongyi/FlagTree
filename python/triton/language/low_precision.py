@@ -162,12 +162,15 @@ def encode_fp8(
     dequantization without claiming native FP8 arithmetic.
 
     Supported formats are OCP E4M3FN and E5M2. Both use
-    round-to-nearest-even, saturating finite overflow, and FP16 input.
+    round-to-nearest-even, saturating finite overflow, and FP16 or BF16 input.
     Unsupported combinations fail at compile time instead of silently changing
     numeric semantics.
     """
 
-    core.static_assert(input.dtype.is_fp16(), "encode_fp8 input must be tl.float16")
+    core.static_assert(
+        input.dtype.is_fp16() or input.dtype.is_bf16(),
+        "encode_fp8 input must be tl.float16 or tl.bfloat16",
+    )
     core.static_assert(
         format == "e4m3fn" or format == "e5m2",
         "encode_fp8 format must be 'e4m3fn' or 'e5m2'",
@@ -175,12 +178,23 @@ def encode_fp8(
     core.static_assert(rounding == "rtne", "encode_fp8 rounding must be 'rtne'")
     core.static_assert(overflow == "satfinite", "encode_fp8 overflow must be 'satfinite'")
 
+    # Preserve NaN and sign information from the original source. BF16 values
+    # at or above the smallest FP8 rounding midpoint are exactly representable
+    # in FP16; smaller values encode as signed zero. Larger values may safely
+    # overflow to FP16 infinity because this contract saturates FP8 overflow.
+    source_bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
+    source_absolute = source_bits & 0x7FFF
+    sign = ((source_bits & 0x8000) >> 8).to(core.uint8)
+    if input.dtype.is_bf16():
+        is_nan = ((source_absolute & 0x7F80) == 0x7F80) & ((source_absolute & 0x007F) != 0)
+        input = input.to(core.float16)
+    else:
+        is_nan = ((source_absolute & 0x7C00) == 0x7C00) & ((source_absolute & 0x03FF) != 0)
+
     # Use a non-negative int32 carrier. Some backends cannot lower unsigned
     # 32-bit arithmetic without promoting it to an unsupported uint64 cast.
     bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
     absolute = bits & 0x7FFF
-    sign = ((bits & 0x8000) >> 8).to(core.uint8)
-    is_nan = ((absolute & 0x7C00) == 0x7C00) & ((absolute & 0x03FF) != 0)
 
     if format == "e4m3fn":
         rounding_bias = ((absolute & 0x0080) >> 7) + 0x003F
