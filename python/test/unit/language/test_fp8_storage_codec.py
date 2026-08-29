@@ -205,6 +205,41 @@ def test_fp8_storage_encode_all_fp16_bit_patterns(device, format, torch_fp8_dtyp
 
 
 @pytest.mark.parametrize(
+    "format,torch_fp8_dtype,max_finite",
+    [
+        ("e4m3fn", torch.float8_e4m3fn, 448.0),
+        ("e5m2", torch.float8_e5m2, 57344.0),
+    ],
+)
+def test_fp8_storage_encode_all_bf16_bit_patterns(
+    device,
+    format,
+    torch_fp8_dtype,
+    max_finite,
+):
+    input_cpu = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    input = input_cpu.to(device)
+    storage = torch.empty(input_cpu.shape, dtype=torch.uint8, device=device)
+    output = torch.empty(input_cpu.shape, dtype=torch.float16, device=device)
+
+    block_size = 256
+    program = _fp8_storage_roundtrip_kernel[(triton.cdiv(input_cpu.numel(), block_size), )](
+        input,
+        storage,
+        output,
+        n_elements=input_cpu.numel(),
+        BLOCK_SIZE=block_size,
+        OUTPUT_DTYPE=tl.float16,
+        FORMAT=format,
+    )
+
+    expected_fp8 = input_cpu.float().clamp(-max_finite, max_finite).to(torch_fp8_dtype)
+    torch.testing.assert_close(storage.cpu(), expected_fp8.view(torch.uint8), rtol=0, atol=0)
+    torch.testing.assert_close(output.cpu(), expected_fp8.to(torch.float16), rtol=0, atol=0, equal_nan=True)
+    _assert_software_storage_program(program)
+
+
+@pytest.mark.parametrize(
     "format,torch_fp8_dtype",
     [
         ("e4m3fn", torch.float8_e4m3fn),
@@ -232,7 +267,7 @@ def test_fp8_storage_decode_all_byte_patterns(device, format, torch_fp8_dtype):
 @pytest.mark.parametrize(
     "case,error",
     [
-        ("encode_input", "encode_fp8 input must be tl.float16"),
+        ("encode_input", "encode_fp8 input must be tl.float16 or tl.bfloat16"),
         ("encode_format", "encode_fp8 format must be 'e4m3fn' or 'e5m2'"),
         ("encode_rounding", "encode_fp8 rounding must be 'rtne'"),
         ("encode_overflow", "encode_fp8 overflow must be 'satfinite'"),
