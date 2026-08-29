@@ -148,3 +148,66 @@ def dequantize(input, scale, dtype: core.constexpr = core.float32, zero_point=0)
     else:
         input_fp32 = input.to(core.float32)
         return ((input_fp32 - zero_point) * scale).to(dtype)
+
+
+@jit
+def pack_int4(low, high, signed: core.constexpr = True):
+    """Pack two logical INT4 or UINT4 values into each UINT8 element.
+
+    ``low`` and ``high`` must have the same shape. The low value occupies bits
+    0-3 and the high value occupies bits 4-7. Signed inputs use two's-complement
+    nibbles and must be INT8 values in ``[-8, 7]``; unsigned inputs must be
+    UINT8 values in ``[0, 15]``.
+
+    This pair-wise primitive deliberately does not reshape tensors or infer an
+    odd-tail policy. Callers packing an odd logical extent must provide an
+    explicit padding value for ``high`` and retain the logical element count.
+    """
+
+    core.static_assert(signed == True or signed == False, "signed must be a compile-time bool")
+    core.static_assert(low.shape == high.shape, "low and high must have the same shape")
+    if signed:
+        core.static_assert(
+            low.dtype.is_int8() and high.dtype.is_int8(),
+            "signed INT4 packing requires tl.int8 inputs",
+        )
+        core.device_assert(
+            (low >= -8) & (low <= 7) & (high >= -8) & (high <= 7),
+            "signed INT4 values must be within [-8, 7]",
+        )
+    else:
+        core.static_assert(
+            low.dtype.is_uint8() and high.dtype.is_uint8(),
+            "UINT4 packing requires tl.uint8 inputs",
+        )
+        core.device_assert(
+            (low <= 15) & (high <= 15),
+            "UINT4 values must be within [0, 15]",
+        )
+
+    low_nibble = low.to(core.uint8) & 0xF
+    high_nibble = high.to(core.uint8) & 0xF
+    return (low_nibble | (high_nibble << 4)).to(core.uint8)
+
+
+@jit
+def unpack_int4(packed, signed: core.constexpr = True):
+    """Unpack low-first UINT8 storage into two logical INT4 or UINT4 values.
+
+    The returned tensors have the same shape as ``packed``. Signed results are
+    sign-extended to INT8; unsigned results remain UINT8. Interleaving or
+    reshaping the pair into a logical element axis is intentionally left to the
+    caller so backend-independent storage semantics stay explicit.
+    """
+
+    core.static_assert(signed == True or signed == False, "signed must be a compile-time bool")
+    core.static_assert(packed.dtype.is_uint8(), "INT4 unpacking requires a tl.uint8 packed input")
+
+    low = packed & 0xF
+    high = (packed >> 4) & 0xF
+    if signed:
+        low_i16 = low.to(core.int16)
+        high_i16 = high.to(core.int16)
+        low = core.where((low & 0x8) != 0, low_i16 - 16, low_i16).to(core.int8)
+        high = core.where((high & 0x8) != 0, high_i16 - 16, high_i16).to(core.int8)
+    return low, high

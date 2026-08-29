@@ -54,7 +54,7 @@ from .standard import (
     zeros,
     zeros_like,
 )
-from .low_precision import dequantize, quantize
+from .low_precision import dequantize, pack_int4, quantize, unpack_int4
 from .core import (
     PropagateNan,
     TRITON_MAX_TENSOR_NUMEL,
@@ -259,6 +259,7 @@ __all__ = [
     "mul",
     "multiple_of",
     "num_programs",
+    "pack_int4",
     "pair_uniform_to_normal",
     "permute",
     "philox",
@@ -305,6 +306,7 @@ __all__ = [
     "uint8",
     "uint_to_uniform_float",
     "umulhi",
+    "unpack_int4",
     "view",
     "void",
     "where",
