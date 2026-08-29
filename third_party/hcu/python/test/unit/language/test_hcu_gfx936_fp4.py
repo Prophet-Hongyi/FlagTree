@@ -11,13 +11,11 @@ from triton.backends import backends
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-
 if not hasattr(libtriton, "hcu"):
     pytest.skip("HCU backend not built in libtriton", allow_module_level=True)
 
 if "hcu" not in backends:
     pytest.skip("HCU backend not discovered", allow_module_level=True)
-
 
 _GFX936_TARGET = GPUTarget("hip", "gfx936", 64)
 _FP16_MMAC_LLIR = "llvm.hcu.mmac.f32.16x16x16.f16"
@@ -119,6 +117,32 @@ def _hcu_scaled_e2m1_dot_kernel(lhs, lhs_scale, rhs, rhs_scale, out):
     tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _hcu_scaled_e2m1_fast_math_kernel(lhs, lhs_scale, rhs, rhs_scale, out, FAST_MATH: tl.constexpr):
+    offsets_m = tl.arange(0, 16)
+    offsets_n = tl.arange(0, 16)
+    offsets_k_packed = tl.arange(0, 32)
+    offsets_scale = tl.arange(0, 2)
+    a = tl.load(lhs + offsets_m[:, None] * 32 + offsets_k_packed[None, :])
+    b = tl.load(rhs + offsets_k_packed[:, None] * 16 + offsets_n[None, :])
+    a_scale = tl.load(lhs_scale + offsets_m[:, None] * 2 + offsets_scale[None, :])
+    b_scale = tl.load(rhs_scale + offsets_n[:, None] * 2 + offsets_scale[None, :])
+    acc = tl.zeros((16, 16), dtype=tl.float32)
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e2m1",
+        b,
+        b_scale,
+        "e2m1",
+        acc,
+        fast_math=FAST_MATH,
+        lhs_k_pack=True,
+        rhs_k_pack=True,
+    )
+    tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
+
+
 def _compile_no_scale():
     source = ASTSource(
         fn=_hcu_e2m1_dot_scaled_kernel,
@@ -163,6 +187,25 @@ def _compile_both_scales():
     )
 
 
+def _compile_fast_math(fast_math):
+    return triton.compile(
+        ASTSource(
+            fn=_hcu_scaled_e2m1_fast_math_kernel,
+            signature={
+                "lhs": "*u8",
+                "lhs_scale": "*u8",
+                "rhs": "*u8",
+                "rhs_scale": "*u8",
+                "out": "*fp32",
+                "FAST_MATH": "constexpr",
+            },
+            constexprs={"FAST_MATH": fast_math},
+        ),
+        target=_GFX936_TARGET,
+        options={"num_warps": 4, "num_stages": 1},
+    )
+
+
 def _pack_along_k(raw_codes, dim):
     if dim == 1:
         low = raw_codes[:, 0::2]
@@ -178,6 +221,12 @@ def _assert_software_e2m1_dot(compiled):
     assert compiled.asm["llir"].count(_FP16_MMAC_LLIR + "(") == 5
     assert compiled.asm["amdgcn"].count(_FP16_MMAC_ASM) == 4
     assert "f8f6f4" not in compiled.asm["amdgcn"]
+
+
+def _assert_e8m0_nan_guard(compiled, fast_math):
+    expected = 0 if fast_math else 2
+    assert compiled.asm["ttgir"].count("arith.cmpi") == expected
+    assert compiled.asm["ttgir"].count("arith.select") == expected
 
 
 def test_gfx936_e2m1_dot_scaled_lowers_through_software_decode_and_fp16_mmac():
@@ -196,6 +245,14 @@ def test_gfx936_single_scaled_e2m1_dot_lowers_through_software_decode_and_fp16_m
 def test_gfx936_both_scaled_e2m1_dot_lowers_through_software_decode_and_fp16_mmac():
     compiled = _compile_both_scales()
     _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["hsaco"]
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_gfx936_e2m1_fast_math_lowers_through_software_decode_and_fp16_mmac(fast_math):
+    compiled = _compile_fast_math(fast_math)
+    _assert_software_e2m1_dot(compiled)
+    _assert_e8m0_nan_guard(compiled, fast_math)
     assert compiled.asm["hsaco"]
 
 
@@ -247,7 +304,7 @@ def test_gfx936_e2m1_dot_scaled_device():
     lhs, rhs, lhs_values, rhs_values = _e2m1_test_operands()
     out = torch.empty((16, 16), dtype=torch.float32, device="cuda")
 
-    compiled = _hcu_e2m1_dot_scaled_kernel[(1,)](
+    compiled = _hcu_e2m1_dot_scaled_kernel[(1, )](
         lhs,
         rhs,
         out,
@@ -275,7 +332,7 @@ def test_gfx936_single_scaled_e2m1_dot_device(side):
     out = torch.empty((16, 16), dtype=torch.float32, device="cuda")
 
     if side == "lhs":
-        compiled = _hcu_lhs_scaled_e2m1_dot_kernel[(1,)](
+        compiled = _hcu_lhs_scaled_e2m1_dot_kernel[(1, )](
             lhs,
             scale_codes.cuda(),
             rhs,
@@ -285,7 +342,7 @@ def test_gfx936_single_scaled_e2m1_dot_device(side):
         )
         expected = (lhs_values * scale_values.repeat_interleave(32, dim=1)) @ rhs_values
     else:
-        compiled = _hcu_rhs_scaled_e2m1_dot_kernel[(1,)](
+        compiled = _hcu_rhs_scaled_e2m1_dot_kernel[(1, )](
             lhs,
             rhs,
             scale_codes.cuda(),
@@ -319,7 +376,7 @@ def test_gfx936_both_scaled_e2m1_dot_device():
     rhs_scale_values = torch.pow(2.0, rhs_scale_codes.to(torch.int32) - 127).to(torch.float32)
     out = torch.empty((16, 16), dtype=torch.float32, device="cuda")
 
-    compiled = _hcu_scaled_e2m1_dot_kernel[(1,)](
+    compiled = _hcu_scaled_e2m1_dot_kernel[(1, )](
         lhs,
         lhs_scale_codes.cuda(),
         rhs,
@@ -337,4 +394,36 @@ def test_gfx936_both_scaled_e2m1_dot_device():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, lhs_values @ rhs_values)
     _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["hsaco"]
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_gfx936_e2m1_scale_special_value_device(fast_math):
+    _require_gfx936_device()
+    lhs_packed = torch.full((16, 32), 0x22, dtype=torch.uint8, device="cuda")
+    rhs_packed = torch.full((32, 16), 0x22, dtype=torch.uint8, device="cuda")
+    scale_code = 0x7F if fast_math else 0xFF
+    lhs_scale = torch.full((16, 2), scale_code, dtype=torch.uint8, device="cuda")
+    rhs_scale = torch.full((16, 2), scale_code, dtype=torch.uint8, device="cuda")
+    output = torch.empty((16, 16), dtype=torch.float32, device="cuda")
+
+    compiled = _hcu_scaled_e2m1_fast_math_kernel[(1, )](
+        lhs_packed,
+        lhs_scale,
+        rhs_packed,
+        rhs_scale,
+        output,
+        FAST_MATH=fast_math,
+        num_warps=4,
+        num_stages=1,
+    )
+    torch.cuda.synchronize()
+
+    actual = output.cpu()
+    if fast_math:
+        torch.testing.assert_close(actual, torch.full_like(actual, 64.0), rtol=0, atol=0)
+    else:
+        assert torch.isnan(actual).all()
+    _assert_software_e2m1_dot(compiled)
+    _assert_e8m0_nan_guard(compiled, fast_math)
     assert compiled.asm["hsaco"]
