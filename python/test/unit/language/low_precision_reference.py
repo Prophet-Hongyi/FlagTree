@@ -149,6 +149,41 @@ def encode_fp8_rtne(value: float, fmt: Float8Format) -> int:
     return sign | code
 
 
+def encode_fp8_rtz(value: float, fmt: Float8Format) -> int:
+    """Encode with round-toward-zero.
+
+    Finite values choose the largest representable magnitude no greater than
+    the input magnitude.  Finite overflow therefore clamps to the largest
+    finite value.  IEEE formats preserve infinity, finite-only formats clamp
+    it, NaNs are canonicalized, and signed zero is preserved.
+
+    For OCP E5M2 this is equivalent to AMD's software lowering: first convert
+    FP32 to FP16 with RTZ, then retain the sign/exponent/top-two-mantissa byte.
+    """
+
+    value = float(value)
+    sign = 0x80 if math.copysign(1.0, value) < 0 else 0
+    if math.isnan(value):
+        return sign | fmt.canonical_nan_code
+
+    magnitude = abs(value)
+    if magnitude == 0.0:
+        return sign
+    if math.isinf(magnitude):
+        if fmt.finite_only:
+            return sign | fmt.max_finite_code
+        infinity_code = ((1 << fmt.exponent_bits) - 1) << fmt.mantissa_bits
+        return sign | infinity_code
+
+    candidates = _positive_finite_values(fmt)
+    if magnitude >= candidates[-1]:
+        return sign | fmt.max_finite_code
+
+    upper = bisect_left(candidates, magnitude)
+    code = upper if candidates[upper] == magnitude else max(0, upper - 1)
+    return sign | code
+
+
 def _encode_nibble(value: int, signed: bool) -> int:
     value = int(value)
     lower, upper = (-8, 7) if signed else (0, 15)

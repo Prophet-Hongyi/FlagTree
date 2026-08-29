@@ -30,6 +30,7 @@ from low_precision_reference import (
     decode_fp8,
     dequantize_affine,
     encode_fp8_rtne,
+    encode_fp8_rtz,
     pack_nibbles,
     quantize_affine,
     unpack_nibbles,
@@ -73,6 +74,7 @@ def test_all_finite_encodings_roundtrip(fmt):
         for sign in (0x00, 0x80):
             code = sign | magnitude
             assert encode_fp8_rtne(decode_fp8(code, fmt), fmt) == code
+            assert encode_fp8_rtz(decode_fp8(code, fmt), fmt) == code
 
 
 @pytest.mark.parametrize(
@@ -113,6 +115,35 @@ def test_encode_fp8_rtne_ties(fmt, value, expected):
 )
 def test_encode_fp8_saturation_and_nan(fmt, value, expected):
     assert encode_fp8_rtne(value, fmt) == expected
+
+
+@pytest.mark.parametrize(
+    "fmt, value, expected",
+    [
+        (E4M3FN, 2**-10, 0x00),
+        (E4M3FN, 3 * 2**-10, 0x01),
+        (E4M3FN, 1.20, 0x39),
+        (E4M3FN, 500.0, 0x7E),
+        (E4M3FN, math.inf, 0x7E),
+        (E5M2, 2**-17, 0x00),
+        (E5M2, 3 * 2**-17, 0x01),
+        (E5M2, 1.20, 0x3C),
+        (E5M2, 1.375, 0x3D),
+        (E5M2, 60000.0, 0x7B),
+        (E5M2, math.inf, 0x7C),
+    ],
+)
+def test_encode_fp8_rtz_boundaries(fmt, value, expected):
+    assert encode_fp8_rtz(value, fmt) == expected
+    assert encode_fp8_rtz(-value, fmt) == (expected | 0x80)
+
+
+@pytest.mark.parametrize("fmt", [E4M3FN, E5M2])
+def test_encode_fp8_rtz_nan_and_signed_zero(fmt):
+    assert encode_fp8_rtz(0.0, fmt) == 0x00
+    assert encode_fp8_rtz(-0.0, fmt) == 0x80
+    assert encode_fp8_rtz(math.nan, fmt) == fmt.canonical_nan_code
+    assert encode_fp8_rtz(math.copysign(math.nan, -1.0), fmt) == (0x80 | fmt.canonical_nan_code)
 
 
 @pytest.mark.parametrize(
