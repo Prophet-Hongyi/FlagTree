@@ -72,6 +72,20 @@ def _uint8_storage_bf16_dot_quantize_kernel(
     tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _e4m3fn_rtz_quantize_kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(input_ptr + offsets)
+    result = tl.quantize(
+        values,
+        1.0,
+        dtype=tl.float8e4nv,
+        zero_point=0,
+        rounding="rtz",
+    )
+    tl.store(output_ptr + offsets, result)
+
+
 def _int8_inputs(device):
     lhs = (((torch.arange(16 * 32) * 7 + 3) % 17) - 8).reshape(16, 32).to(torch.int8)
     rhs = (((torch.arange(32 * 16) * 11 + 5) % 17) - 8).reshape(32, 16).to(torch.int8)
@@ -171,3 +185,23 @@ def test_ppu0010_uint8_storage_bf16_compute_uint8_output(device):
     assert compiled.asm["llir"].count(_PPU0010_BF16_MMA) == 2
     assert _PPU0010_INT8_MMA not in compiled.asm["llir"]
     assert compiled.asm["hgbin"]
+
+
+def test_ppu0010_e4m3fn_rtz_quantize_fails_closed(device, capfd):
+    if not is_ppu():
+        pytest.skip("requires the PPU backend")
+
+    values = torch.arange(32, dtype=torch.float32, device=device) / 10
+    output = torch.empty(32, dtype=torch.uint8, device=device)
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        _e4m3fn_rtz_quantize_kernel[(1, )](
+            values,
+            triton.reinterpret(output, tl.float8e4nv),
+            BLOCK_SIZE=32,
+            num_warps=1,
+            num_stages=1,
+        )
+
+    stderr = capfd.readouterr().err
+    assert "Unsupported f8e4m3nv conversion on PPU capability 80" in stderr
+    assert "only FP32/FP16/BF16 RTNE encode" in stderr
