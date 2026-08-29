@@ -54,6 +54,7 @@ from .standard import (
     zeros,
     zeros_like,
 )
+from .low_precision import dequantize, quantize
 from .core import (
     PropagateNan,
     TRITON_MAX_TENSOR_NUMEL,
@@ -206,6 +207,7 @@ __all__ = [
     "cos",
     "cumprod",
     "cumsum",
+    "dequantize",
     "debug_barrier",
     "device_assert",
     "device_print",
@@ -264,6 +266,7 @@ __all__ = [
     "pi32_t",
     "pointer_type",
     "program_id",
+    "quantize",
     "rand",
     "rand4x",
     "randint",
