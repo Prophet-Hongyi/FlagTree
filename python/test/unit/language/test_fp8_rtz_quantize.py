@@ -86,6 +86,12 @@ def _special_input_values():
     return values.repeat(2)
 
 
+def _input_values_for_size(size):
+    values = _input_values()
+    repeats = (size + values.numel() - 1) // values.numel()
+    return values.repeat(repeats)[:size]
+
+
 def _is_e5m2_nan(byte):
     return byte & 0x7C == 0x7C and byte & 0x03 != 0
 
@@ -128,4 +134,24 @@ def test_fp8_e5m2_rtz_preserves_special_value_categories(device, carrier):
             assert _is_e5m2_nan(byte), (carrier, value, byte)
         else:
             assert byte == encode_fp8_rtz(value, E5M2), (carrier, value, byte)
+    assert "rounding = rtz" in program.asm["ttir"]
+
+
+@pytest.mark.parametrize("block_size", [256, 512, 1024])
+def test_fp8_e5m2_rtz_quantize_vector_widths(device, block_size):
+    input = _input_values_for_size(block_size).to(dtype=torch.float32, device=device)
+    output = torch.empty(block_size, dtype=torch.uint8, device=device)
+
+    program = _quantize_e5m2_rtz_kernel[(1, )](
+        input,
+        triton.reinterpret(output, tl.float8e5),
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+    expected = torch.tensor(
+        [encode_fp8_rtz(value, E5M2) for value in input.cpu().tolist()],
+        dtype=torch.uint8,
+    )
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
     assert "rounding = rtz" in program.asm["ttir"]
