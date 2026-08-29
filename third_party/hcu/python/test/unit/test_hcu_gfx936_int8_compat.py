@@ -5,8 +5,10 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     MAKE_BUFFER_RSRC,
     NEW_INT8_MMAC,
     PTR_BUFFER_LOAD_I16,
+    PTR_BUFFER_STORE_I8,
     PTR_BUFFER_STORE_I32,
     RAW_BUFFER_LOAD_I16,
+    RAW_BUFFER_STORE_I8,
     RAW_BUFFER_STORE_I32,
     LLVM17Int8MmacBridgeError,
     bridge_gfx936_int8_mmac_for_llvm17,
@@ -67,8 +69,15 @@ def test_gfx936_llvm17_int8_mmac_bridge_preserves_legacy_contract():
     assert "%flagtree.mmac.result.rhs_i64 = bitcast <2 x i32> %rhs to i64" in bridged
 
 
-def test_gfx936_llvm17_int8_dot_bridge_rewrites_observed_buffer_contracts():
-    bridged, stats = bridge_gfx936_int8_mmac_for_llvm17(_int8_dot_module())
+@pytest.mark.parametrize(
+    ("store_type", "pointer_store", "raw_store"),
+    [
+        ("i32", PTR_BUFFER_STORE_I32, RAW_BUFFER_STORE_I32),
+        ("i8", PTR_BUFFER_STORE_I8, RAW_BUFFER_STORE_I8),
+    ],
+)
+def test_gfx936_llvm17_int8_dot_bridge_rewrites_observed_buffer_contracts(store_type, pointer_store, raw_store):
+    bridged, stats = bridge_gfx936_int8_mmac_for_llvm17(_int8_dot_module(store_type=store_type))
 
     assert stats.calls == 1
     assert stats.make_buffer_calls == 2
@@ -76,9 +85,9 @@ def test_gfx936_llvm17_int8_dot_bridge_rewrites_observed_buffer_contracts():
     assert stats.raw_buffer_store_calls == 1
     assert MAKE_BUFFER_RSRC not in bridged
     assert PTR_BUFFER_LOAD_I16 not in bridged
-    assert PTR_BUFFER_STORE_I32 not in bridged
+    assert pointer_store not in bridged
     assert bridged.count(RAW_BUFFER_LOAD_I16) == 2
-    assert bridged.count(RAW_BUFFER_STORE_I32) == 2
+    assert bridged.count(raw_store) == 2
     assert "ptr addrspace(8)" not in bridged
     assert "%input.rsrc = bitcast i128 %flagtree.rsrc.input.rsrc.packed to <4 x i32>" in bridged
 

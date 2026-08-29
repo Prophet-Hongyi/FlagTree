@@ -6,39 +6,51 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     NEW_FP16_MMAC,
     PTR_BUFFER_LOAD_I16,
     PTR_BUFFER_STORE_F32,
+    PTR_BUFFER_STORE_I8,
     RAW_BUFFER_LOAD_I16,
     RAW_BUFFER_STORE_F32,
+    RAW_BUFFER_STORE_I8,
     LLVM17MmacBridgeError,
     bridge_gfx936_fp16_mmac_for_llvm17,
 )
 
 
-def _fp16_dot_module(lit="false", lts="false", stride=0):
+def _fp16_dot_module(lit="false", lts="false", stride=0, store_type="f32"):
+    store_pointer = {"f32": PTR_BUFFER_STORE_F32, "i8": PTR_BUFFER_STORE_I8}[store_type]
+    store_raw_type = "float" if store_type == "f32" else "i8"
+    store_value = "0.0" if store_type == "f32" else "0"
     return f"""define amdgpu_kernel void @kernel(ptr addrspace(1) %input, ptr addrspace(1) %out, <4 x half> %a, <4 x half> %b) {{
   %input.rsrc = call ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1) %input, i16 0, i32 1024, i32 159744)
   %packed = call i16 @{PTR_BUFFER_LOAD_I16}(ptr addrspace(8) %input.rsrc, i32 0, i32 0, i32 0)
   %acc0 = call <4 x float> @{NEW_FP16_MMAC}(<4 x half> %a, <4 x half> %b, <4 x float> zeroinitializer, i1 {lit}, i1 {lts})
   %rsrc = call ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1) %out, i16 {stride}, i32 1024, i32 159744)
-  call void @{PTR_BUFFER_STORE_F32}(float 0.0, ptr addrspace(8) %rsrc, i32 0, i32 0, i32 0)
+  call void @{store_pointer}({store_raw_type} {store_value}, ptr addrspace(8) %rsrc, i32 0, i32 0, i32 0)
   ret void
 }}
 declare <4 x float> @{NEW_FP16_MMAC}(<4 x half>, <4 x half>, <4 x float>, i1, i1)
 declare ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1), i16, i32, i32)
 declare i16 @{PTR_BUFFER_LOAD_I16}(ptr addrspace(8), i32, i32, i32)
-declare void @{PTR_BUFFER_STORE_F32}(float, ptr addrspace(8), i32, i32, i32)
+declare void @{store_pointer}({store_raw_type}, ptr addrspace(8), i32, i32, i32)
 """
 
 
-def test_fp16_mmac_and_output_buffer_are_bridged():
-    bridged, stats = bridge_gfx936_fp16_mmac_for_llvm17(_fp16_dot_module())
+@pytest.mark.parametrize(
+    ("store_type", "pointer_store", "raw_store"),
+    [
+        ("f32", PTR_BUFFER_STORE_F32, RAW_BUFFER_STORE_F32),
+        ("i8", PTR_BUFFER_STORE_I8, RAW_BUFFER_STORE_I8),
+    ],
+)
+def test_fp16_mmac_and_output_buffer_are_bridged(store_type, pointer_store, raw_store):
+    bridged, stats = bridge_gfx936_fp16_mmac_for_llvm17(_fp16_dot_module(store_type=store_type))
 
     assert NEW_FP16_MMAC not in bridged
     assert LEGACY_FP16_MMAC in bridged
     assert MAKE_BUFFER_RSRC not in bridged
     assert PTR_BUFFER_LOAD_I16 not in bridged
-    assert PTR_BUFFER_STORE_F32 not in bridged
+    assert pointer_store not in bridged
     assert RAW_BUFFER_LOAD_I16 in bridged
-    assert RAW_BUFFER_STORE_F32 in bridged
+    assert raw_store in bridged
     assert "ptr addrspace(8)" not in bridged
     assert stats.calls == 1
     assert stats.make_buffer_calls == 2
