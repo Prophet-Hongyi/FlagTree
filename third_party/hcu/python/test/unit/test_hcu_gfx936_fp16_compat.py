@@ -9,12 +9,14 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     PTR_BUFFER_LOAD_V2I32,
     PTR_BUFFER_STORE_F32,
     PTR_BUFFER_STORE_I8,
+    PTR_BUFFER_STORE_V2F32,
     PTR_BUFFER_STORE_V4F32,
     RAW_BUFFER_LOAD_I16,
     RAW_BUFFER_LOAD_I32,
     RAW_BUFFER_LOAD_V2I32,
     RAW_BUFFER_STORE_F32,
     RAW_BUFFER_STORE_I8,
+    RAW_BUFFER_STORE_V2F32,
     RAW_BUFFER_STORE_V4F32,
     LLVM17MmacBridgeError,
     bridge_gfx936_fp16_mmac_for_llvm17,
@@ -33,14 +35,21 @@ def _fp16_dot_module(
     store_pointer = {
         "f32": PTR_BUFFER_STORE_F32,
         "i8": PTR_BUFFER_STORE_I8,
+        "v2f32": PTR_BUFFER_STORE_V2F32,
         "v4f32": PTR_BUFFER_STORE_V4F32,
     }[store_type]
-    store_raw_type = {"f32": "float", "i8": "i8", "v4f32": "<4 x float>"}[
-        store_type
-    ]
-    store_value = {"f32": "0.0", "i8": "0", "v4f32": "zeroinitializer"}[
-        store_type
-    ]
+    store_raw_type = {
+        "f32": "float",
+        "i8": "i8",
+        "v2f32": "<2 x float>",
+        "v4f32": "<4 x float>",
+    }[store_type]
+    store_value = {
+        "f32": "0.0",
+        "i8": "0",
+        "v2f32": "zeroinitializer",
+        "v4f32": "zeroinitializer",
+    }[store_type]
     return f"""define amdgpu_kernel void @kernel(ptr addrspace(1) %input, ptr addrspace(1) %out, <4 x half> %a, <4 x half> %b) {{
   %input.rsrc = call ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1) %input, i16 0, i32 1024, i32 159744)
   %packed = call {load_ir_type} @{load_pointer}(ptr addrspace(8) %input.rsrc, i32 0, i32 0, i32 0)
@@ -61,6 +70,7 @@ declare void @{store_pointer}({store_raw_type}, ptr addrspace(8), i32, i32, i32)
     [
         ("f32", PTR_BUFFER_STORE_F32, RAW_BUFFER_STORE_F32),
         ("i8", PTR_BUFFER_STORE_I8, RAW_BUFFER_STORE_I8),
+        ("v2f32", PTR_BUFFER_STORE_V2F32, RAW_BUFFER_STORE_V2F32),
         ("v4f32", PTR_BUFFER_STORE_V4F32, RAW_BUFFER_STORE_V4F32),
     ],
 )

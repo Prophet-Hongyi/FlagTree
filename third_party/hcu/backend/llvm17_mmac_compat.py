@@ -56,6 +56,8 @@ PTR_BUFFER_STORE_I8 = "llvm.amdgcn.raw.ptr.buffer.store.i8"
 RAW_BUFFER_STORE_I8 = "llvm.amdgcn.raw.buffer.store.i8"
 PTR_BUFFER_STORE_F32 = "llvm.amdgcn.raw.ptr.buffer.store.f32"
 RAW_BUFFER_STORE_F32 = "llvm.amdgcn.raw.buffer.store.f32"
+PTR_BUFFER_STORE_V2F32 = "llvm.amdgcn.raw.ptr.buffer.store.v2f32"
+RAW_BUFFER_STORE_V2F32 = "llvm.amdgcn.raw.buffer.store.v2f32"
 PTR_BUFFER_STORE_V4F32 = "llvm.amdgcn.raw.ptr.buffer.store.v4f32"
 RAW_BUFFER_STORE_V4F32 = "llvm.amdgcn.raw.buffer.store.v4f32"
 
@@ -414,6 +416,7 @@ def bridge_gfx936_fp16_mmac_for_llvm17(
         store_contracts={
             PTR_BUFFER_STORE_F32: RAW_BUFFER_STORE_F32,
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
+            PTR_BUFFER_STORE_V2F32: RAW_BUFFER_STORE_V2F32,
             PTR_BUFFER_STORE_V4F32: RAW_BUFFER_STORE_V4F32,
         },
         label="FP16 MMAC",
