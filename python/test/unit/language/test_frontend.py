@@ -26,6 +26,18 @@ def anchor(v):
     pass
 
 
+@triton.jit
+def nested_default_string(mode: tl.constexpr = "rtne"):
+    tl.static_assert(mode == "rtne")
+
+
+@filecheck_test
+@triton.jit
+def test_nested_jit_default_string_is_constexpr():
+    # CHECK-LABEL: test_nested_jit_default_string_is_constexpr
+    nested_default_string()
+
+
 @tl.core._aggregate
 class Pair:
     first: tl.tensor
