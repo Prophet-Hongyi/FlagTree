@@ -1268,12 +1268,13 @@ public:
 };
 
 // gfx936 has no native E2M1 MMAC.  The existing scaled-MFMA rewrite upcasts an
-// E2M1 operand only when a block scale is present, so an unscaled E2M1 pair
-// otherwise reaches DotOp as packed i8 and fails layout verification.  Reuse
-// Triton's software decomposition for this one explicit contract and force the
-// decoded operands to FP16, which is exact for every E2M1 value and uses the
-// already-qualified gfx936 FP16 MMAC/toolchain bridge.  Broader scaled and
-// mixed-format forms remain on their existing paths or fail closed.
+// E2M1 operand only when its block scale is present, so a no-scale pair or the
+// unscaled side of a one-scale pair otherwise reaches DotOp as packed i8 and
+// fails layout verification.  Reuse Triton's software decomposition for these
+// explicit contracts and force the decoded operands to FP16, which is exact
+// for every E2M1 value and uses the already-qualified gfx936 FP16
+// MMAC/toolchain bridge.  Both-scaled and mixed-format forms remain on their
+// existing paths or fail closed.
 class DecomposeGfx936E2M1DotScaled final
     : public ttg::DecomposeScaledBlocked {
 public:
@@ -1282,8 +1283,9 @@ public:
   LogicalResult matchAndRewrite(tt::DotScaledOp op,
                                 PatternRewriter &rewriter) const override {
     if (op.getAElemType() != tt::ScaleDotElemType::E2M1 ||
-        op.getBElemType() != tt::ScaleDotElemType::E2M1 || op.getAScale() ||
-        op.getBScale() || !op.getLhsKPack() || !op.getRhsKPack())
+        op.getBElemType() != tt::ScaleDotElemType::E2M1 ||
+        (op.getAScale() && op.getBScale()) || !op.getLhsKPack() ||
+        !op.getRhsKPack())
       return failure();
     return DecomposeScaledBlocked::matchAndRewrite(op, rewriter);
   }
