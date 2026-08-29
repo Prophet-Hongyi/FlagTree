@@ -7,8 +7,6 @@ import triton.language as tl
 from low_precision_reference import E4M3FN, E5M2, decode_fp8, encode_fp8_rtne
 
 
-BLOCK_M = 32
-BLOCK_N = 32
 LOGICAL_K = 64
 FP8_MATMUL_ATOL = 2**-14
 
@@ -90,23 +88,23 @@ def _format_config(format_name):
     raise AssertionError(f"unhandled FP8 format: {format_name}")
 
 
-def _make_inputs(groups, value_modulus, value_offset, value_step):
+def _make_inputs(block_m, block_n, groups, value_modulus, value_offset, value_step):
     group_k = LOGICAL_K // groups
     lhs_scale = torch.tensor(
         [[0.125, 0.5], [0.25, 1.0], [0.5, 0.125], [1.0, 0.25]], dtype=torch.float32
-    ).repeat(BLOCK_M // 4, 1)[:, :groups].contiguous()
+    ).repeat(block_m // 4, 1)[:, :groups].contiguous()
     rhs_scale = torch.tensor(
         [[0.25, 1.0], [0.5, 2.0], [1.0, 0.25], [2.0, 0.5]], dtype=torch.float32
-    ).repeat(BLOCK_N // 4, 1)[:, :groups].contiguous()
+    ).repeat(block_n // 4, 1)[:, :groups].contiguous()
 
     lhs_unscaled = (
-        (torch.arange(BLOCK_M * LOGICAL_K, dtype=torch.int64) * 7 + 3) % value_modulus
+        (torch.arange(block_m * LOGICAL_K, dtype=torch.int64) * 7 + 3) % value_modulus
         - value_offset
-    ).reshape(BLOCK_M, groups, group_k).to(torch.float32) * value_step
+    ).reshape(block_m, groups, group_k).to(torch.float32) * value_step
     rhs_unscaled = (
-        (torch.arange(LOGICAL_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % value_modulus
+        (torch.arange(LOGICAL_K * block_n, dtype=torch.int64) * 11 + 5) % value_modulus
         - value_offset
-    ).reshape(groups, group_k, BLOCK_N).to(torch.float32) * value_step
+    ).reshape(groups, group_k, block_n).to(torch.float32) * value_step
     lhs = lhs_unscaled * lhs_scale[:, :, None]
     rhs = rhs_unscaled * rhs_scale.T[:, None, :]
     return lhs, rhs, lhs_scale, rhs_scale, lhs_unscaled, rhs_unscaled
@@ -114,13 +112,18 @@ def _make_inputs(groups, value_modulus, value_offset, value_step):
 
 @pytest.mark.parametrize("format_name", ["e4m3fn", "e5m2"])
 @pytest.mark.parametrize("groups", [1, 2], ids=["per-axis", "per-group-k32"])
-def test_tensor_scaled_fp8_matmul(device, groups, format_name):
+@pytest.mark.parametrize(
+    "block_m,block_n",
+    [(16, 32), (32, 16), (32, 32)],
+    ids=["m16n32", "m32n16", "m32n32"],
+)
+def test_tensor_scaled_fp8_matmul(device, block_m, block_n, groups, format_name):
     group_k = LOGICAL_K // groups
     fp8_format, fp8_dtype, ir_type, value_modulus, value_offset, value_step = (
         _format_config(format_name)
     )
     lhs, rhs, lhs_scale, rhs_scale, lhs_unscaled, rhs_unscaled = _make_inputs(
-        groups, value_modulus, value_offset, value_step
+        block_m, block_n, groups, value_modulus, value_offset, value_step
     )
     lhs_encoded = _encode_fp8(lhs_unscaled, fp8_format)
     rhs_encoded = _encode_fp8(rhs_unscaled, fp8_format)
@@ -133,8 +136,8 @@ def test_tensor_scaled_fp8_matmul(device, groups, format_name):
         lhs.to(device),
         lhs_scale.to(device),
         lhs_fp8,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
         QUANTIZE_LHS=True,
@@ -144,8 +147,8 @@ def test_tensor_scaled_fp8_matmul(device, groups, format_name):
         rhs.to(device),
         rhs_scale.to(device),
         rhs_fp8,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
         QUANTIZE_LHS=False,
@@ -154,22 +157,22 @@ def test_tensor_scaled_fp8_matmul(device, groups, format_name):
     torch.testing.assert_close(lhs_storage.cpu(), lhs_encoded, rtol=0, atol=0)
     torch.testing.assert_close(rhs_storage.cpu(), rhs_encoded, rtol=0, atol=0)
 
-    output = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.float32, device=device)
+    output = torch.empty((block_m, block_n), dtype=torch.float32, device=device)
     dot_program = _tensor_scaled_fp8_matmul_kernel[(1, )](
         lhs_fp8,
         rhs_fp8,
         lhs_scale.to(device),
         rhs_scale.to(device),
         output,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=groups,
         GROUP_K=group_k,
     )
 
     lhs_decoded = _decode_fp8(lhs_encoded, fp8_format)
     rhs_decoded = _decode_fp8(rhs_encoded, fp8_format)
-    expected = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float32)
+    expected = torch.zeros((block_m, block_n), dtype=torch.float32)
     for group in range(groups):
         group_accumulator = torch.from_numpy(
             np.matmul(lhs_decoded[:, group].numpy(), rhs_decoded[group].numpy())
