@@ -40,6 +40,24 @@ _FP8_DOWNCAST_CASES = (
     ("fp8e4nv", "llvm.mxc.cvt.pk4.f32tof8.cfg"),
     ("fp8e5", "llvm.mxc.cvt.pk4.f32tobf8.cfg"),
 )
+_MIXED_OCP_FP8_CASES = (
+    (
+        "fp8e4nv",
+        "fp8e5",
+        tl.float8e4nv,
+        tl.float8e5,
+        torch.tensor([0xC0, 0xB8, 0x00, 0x38, 0x40], dtype=torch.uint8),
+        torch.tensor([0xC0, 0xBC, 0x00, 0x3C, 0x40], dtype=torch.uint8),
+    ),
+    (
+        "fp8e5",
+        "fp8e4nv",
+        tl.float8e5,
+        tl.float8e4nv,
+        torch.tensor([0xC0, 0xBC, 0x00, 0x3C, 0x40], dtype=torch.uint8),
+        torch.tensor([0xC0, 0xB8, 0x00, 0x38, 0x40], dtype=torch.uint8),
+    ),
+)
 
 
 @triton.jit
@@ -83,10 +101,11 @@ def _metax_downcast_e5(src, dst):
     tl.store(dst + offsets, result)
 
 
-def _compile_c550(dtype_name):
+def _compile_c550(dtype_name, rhs_dtype_name=None):
+    rhs_dtype_name = dtype_name if rhs_dtype_name is None else rhs_dtype_name
     src = ASTSource(
         fn=_metax_fp8_dot_kernel,
-        signature={"lhs": f"*{dtype_name}", "rhs": f"*{dtype_name}", "out": "*fp32"},
+        signature={"lhs": f"*{dtype_name}", "rhs": f"*{rhs_dtype_name}", "out": "*fp32"},
     )
     return triton.compile(
         src,
@@ -149,6 +168,73 @@ def test_c550_fp8_dot_device(dtype_name, triton_dtype, codes):
     compiled = _metax_fp8_dot_kernel[(1, )](
         triton.reinterpret(lhs_raw, triton_dtype),
         triton.reinterpret(rhs_raw, triton_dtype),
+        output,
+        num_warps=4,
+        num_stages=1,
+    )
+    torch.cuda.synchronize()
+
+    expected = values[lhs_index] @ values[rhs_index]
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=1.0e-5)
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 2
+    assert "llvm.mxc.mma.f32.16x16x16f16" in compiled.asm["llir"]
+    assert "llvm.mxc.mma.f32.16x16x32f8" not in compiled.asm["llir"]
+    assert "llvm.mxc.mma.f32.16x16x32bf8" not in compiled.asm["llir"]
+
+
+@pytest.mark.parametrize(
+    (
+        "lhs_dtype",
+        "rhs_dtype",
+        "_lhs_tl_dtype",
+        "_rhs_tl_dtype",
+        "_lhs_codes",
+        "_rhs_codes",
+    ),
+    _MIXED_OCP_FP8_CASES,
+)
+def test_c550_mixed_ocp_fp8_dot_uses_software_upcast_and_fp16_mma(
+    lhs_dtype, rhs_dtype, _lhs_tl_dtype, _rhs_tl_dtype, _lhs_codes, _rhs_codes
+):
+    compiled = _compile_c550(lhs_dtype, rhs_dtype)
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 2
+    assert "llvm.mxc.mma.f32.16x16x16f16" in compiled.asm["llir"]
+    assert "llvm.mxc.mma.f32.16x16x32f8" not in compiled.asm["llir"]
+    assert "llvm.mxc.mma.f32.16x16x32bf8" not in compiled.asm["llir"]
+    assert compiled.asm["mcfatbin"]
+
+
+@pytest.mark.parametrize(
+    (
+        "_lhs_dtype",
+        "_rhs_dtype",
+        "lhs_tl_dtype",
+        "rhs_tl_dtype",
+        "lhs_codes",
+        "rhs_codes",
+    ),
+    _MIXED_OCP_FP8_CASES,
+)
+def test_c550_mixed_ocp_fp8_dot_device(
+    _lhs_dtype, _rhs_dtype, lhs_tl_dtype, rhs_tl_dtype, lhs_codes, rhs_codes
+):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a MetaX device")
+
+    target = triton.runtime.driver.active.get_current_target()
+    if target.backend != "maca" or target.arch != 80:
+        pytest.skip("requires a C550 / maca arch 80 target")
+
+    values = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    lhs_index = ((torch.arange(16 * 32) * 7 + 3) % len(lhs_codes)).reshape(16, 32)
+    rhs_index = ((torch.arange(32 * 16) * 11 + 1) % len(rhs_codes)).reshape(32, 16)
+    lhs_raw = lhs_codes[lhs_index].to("cuda")
+    rhs_raw = rhs_codes[rhs_index].to("cuda")
+    output = torch.empty((16, 16), dtype=torch.float32, device="cuda")
+
+    compiled = _metax_fp8_dot_kernel[(1, )](
+        triton.reinterpret(lhs_raw, lhs_tl_dtype),
+        triton.reinterpret(rhs_raw, rhs_tl_dtype),
         output,
         num_warps=4,
         num_stages=1,
