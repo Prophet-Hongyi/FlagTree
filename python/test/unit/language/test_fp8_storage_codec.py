@@ -49,7 +49,7 @@ def _invalid_fp8_storage_codec_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     values = tl.load(input_ptr + offsets)
     if CASE == "encode_input":
-        result = tl.encode_fp8(values.to(tl.float32))
+        result = tl.encode_fp8(values.to(tl.int32))
     elif CASE == "encode_format":
         result = tl.encode_fp8(values, format="e4m3fnuz")
     elif CASE == "encode_rounding":
@@ -82,6 +82,81 @@ def _assert_software_storage_program(program):
     assert "f8E5M2" not in program.asm["ttir"]
     binary_keys = ("hgbin", "mubin", "mcfatbin", "hsaco", "cubin", "npubin")
     assert any(key in program.asm and len(program.asm[key]) > 0 for key in binary_keys)
+
+
+def _fp32_storage_corpus(torch_fp8_dtype, max_finite_code):
+    finite_codes = torch.arange(max_finite_code + 1, dtype=torch.int16).to(torch.uint8)
+    finite_values = finite_codes.view(torch_fp8_dtype).to(torch.float32)
+    midpoints = (finite_values[:-1] + finite_values[1:]) * 0.5
+    negative_inf = torch.full_like(midpoints, -math.inf)
+    positive_inf = torch.full_like(midpoints, math.inf)
+    midpoint_neighbors = torch.stack(
+        (
+            torch.nextafter(midpoints, negative_inf),
+            midpoints,
+            torch.nextafter(midpoints, positive_inf),
+        ),
+        dim=1,
+    ).flatten()
+
+    indices = torch.arange(65536, dtype=torch.int64)
+    random_bits = (indices * 0x9E3779B1 + 0x7F4A7C15) & 0xFFFFFFFF
+    random_values = random_bits.to(torch.int32).view(torch.float32)
+
+    mantissas = torch.tensor(
+        [
+            0x000000,
+            0x000001,
+            0x07FFFE,
+            0x07FFFF,
+            0x080000,
+            0x080001,
+            0x0FFFFE,
+            0x0FFFFF,
+            0x100000,
+            0x100001,
+            0x1FFFFE,
+            0x1FFFFF,
+            0x200000,
+            0x200001,
+            0x3FFFFF,
+            0x400000,
+            0x400001,
+            0x5FFFFF,
+            0x600000,
+            0x600001,
+            0x7FFFFE,
+            0x7FFFFF,
+        ],
+        dtype=torch.int64,
+    )
+    exponents = torch.arange(256, dtype=torch.int64) << 23
+    structured_bits = (exponents[:, None] | mantissas[None, :]).flatten()
+    structured_bits = torch.cat((structured_bits, structured_bits | 0x80000000))
+    structured_values = structured_bits.to(torch.int32).view(torch.float32)
+
+    special = torch.tensor(
+        [
+            -math.inf,
+            -0.0,
+            0.0,
+            math.inf,
+            math.nan,
+            -math.nan,
+        ],
+        dtype=torch.float32,
+    )
+    return torch.cat(
+        (
+            finite_values,
+            -finite_values,
+            midpoint_neighbors,
+            -midpoint_neighbors,
+            random_values,
+            structured_values,
+            special,
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -240,6 +315,42 @@ def test_fp8_storage_encode_all_bf16_bit_patterns(
 
 
 @pytest.mark.parametrize(
+    "format,torch_fp8_dtype,max_finite,max_finite_code",
+    [
+        ("e4m3fn", torch.float8_e4m3fn, 448.0, 0x7E),
+        ("e5m2", torch.float8_e5m2, 57344.0, 0x7B),
+    ],
+)
+def test_fp8_storage_encode_fp32_boundary_corpus(
+    device,
+    format,
+    torch_fp8_dtype,
+    max_finite,
+    max_finite_code,
+):
+    input_cpu = _fp32_storage_corpus(torch_fp8_dtype, max_finite_code)
+    input = input_cpu.to(device)
+    storage = torch.empty(input_cpu.shape, dtype=torch.uint8, device=device)
+    output = torch.empty(input_cpu.shape, dtype=torch.float16, device=device)
+
+    block_size = 256
+    program = _fp8_storage_roundtrip_kernel[(triton.cdiv(input_cpu.numel(), block_size), )](
+        input,
+        storage,
+        output,
+        n_elements=input_cpu.numel(),
+        BLOCK_SIZE=block_size,
+        OUTPUT_DTYPE=tl.float16,
+        FORMAT=format,
+    )
+
+    expected_fp8 = input_cpu.clamp(-max_finite, max_finite).to(torch_fp8_dtype)
+    torch.testing.assert_close(storage.cpu(), expected_fp8.view(torch.uint8), rtol=0, atol=0)
+    torch.testing.assert_close(output.cpu(), expected_fp8.to(torch.float16), rtol=0, atol=0, equal_nan=True)
+    _assert_software_storage_program(program)
+
+
+@pytest.mark.parametrize(
     "format,torch_fp8_dtype",
     [
         ("e4m3fn", torch.float8_e4m3fn),
@@ -267,7 +378,7 @@ def test_fp8_storage_decode_all_byte_patterns(device, format, torch_fp8_dtype):
 @pytest.mark.parametrize(
     "case,error",
     [
-        ("encode_input", "encode_fp8 input must be tl.float16 or tl.bfloat16"),
+        ("encode_input", "encode_fp8 input must be tl.float16, tl.bfloat16, or tl.float32"),
         ("encode_format", "encode_fp8 format must be 'e4m3fn' or 'e5m2'"),
         ("encode_rounding", "encode_fp8 rounding must be 'rtne'"),
         ("encode_overflow", "encode_fp8 overflow must be 'satfinite'"),
