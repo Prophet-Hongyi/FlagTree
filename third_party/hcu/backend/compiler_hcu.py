@@ -20,6 +20,7 @@ from .llvm17_mmac_compat import (
     NEW_FP16_MMAC,
     NEW_INT8_MMAC,
     LLVM17MmacBridgeStats,
+    bridge_gfx936_buffer_contracts_for_llvm17,
     bridge_gfx936_fp16_mmac_for_llvm17,
     bridge_gfx936_int8_mmac_for_llvm17,
 )
@@ -373,10 +374,33 @@ class HIPBackend(BaseBackend):
                 "-mllvm=-support-512-vgprs=true",
             ],
         }
-        if options.arch in arch_args:
-            options_args = arch_args[options.arch]
-        else:
+        if options.arch not in arch_args:
             raise ValueError(f"Unknown arch: {options.arch}")
+
+        clang_major = HIPBackend._clang_major()
+        clang_args = [
+            "-target",
+            hcu.TARGET_TRIPLE,
+            f"-mcpu={options.arch}:xnack-",
+        ]
+
+        # DTK17 accepts the target and optimization options below, but its
+        # clang does not expose the HCU tuning flags used by DTK18.  Some DTK17
+        # builds even return success without producing assembly for an unknown
+        # -mllvm option, so do not probe these flags by executing the compiler.
+        if clang_major == 17:
+            unsupported_options = []
+            if options.wdra_enabled:
+                unsupported_options.append("wdra_enabled")
+            if options.sched_latency != "none":
+                unsupported_options.append(f"sched_latency={options.sched_latency}")
+            if unsupported_options:
+                raise ValueError(
+                    "HCU clang 17 does not support: " + ", ".join(unsupported_options)
+                )
+            return [*clang_args, "-O3"]
+
+        options_args = list(arch_args[options.arch])
 
         version_args = {
             "18": [
@@ -384,9 +408,9 @@ class HIPBackend(BaseBackend):
                 "-mllvm=-hcu-update-wait-by-reverse-search=true",
             ],
         }
-        clang_major = str(HIPBackend._clang_major())
-        if clang_major in version_args:
-            options_args.extend(version_args[clang_major])
+        clang_major_str = str(clang_major)
+        if clang_major_str in version_args:
+            options_args.extend(version_args[clang_major_str])
 
         if options.sched_latency != 'none':
             sched_latency_args = {
@@ -400,15 +424,12 @@ class HIPBackend(BaseBackend):
             else:
                 raise ValueError(f"Unsupported scheduling latency: {options.sched_latency}")
 
-        clang_args = [
-            "-target",
-            hcu.TARGET_TRIPLE,
-            f"-mcpu={options.arch}:xnack-",
+        clang_args.extend([
             "-mllvm=-check-valu-data-forward-hazards=0",
             "-mllvm=-disable-cluster-lds-memops=true",
             # Note: when register spill after ds_read_matrix, result is wrong for compiler backend. disable current.
             "-mllvm=-hcu-pre-emit-load-store-opt=false",
-        ]
+        ])
         if options.wdra_enabled:
             clang_args.append("-mllvm=-vgpr-greedy-alloc-mode=local-wave")
         clang_args.extend([*options_args, "-O3"])
@@ -787,6 +808,11 @@ class HIPBackend(BaseBackend):
                 and HIPBackend._clang_major() == 17
                 and (NEW_INT8_MMAC in llvm_source or NEW_FP16_MMAC in llvm_source)
             )
+            use_llvm17_buffer_bridge = (
+                options.arch == "gfx936"
+                and HIPBackend._clang_major() == 17
+                and "llvm.amdgcn.raw.ptr.buffer" in llvm_source
+            )
             if use_llvm17_mmac_bridge:
                 unsupported_options = []
                 if options.wdra_enabled:
@@ -814,6 +840,10 @@ class HIPBackend(BaseBackend):
                 else:
                     llvm_source, bridge_stats = bridge_gfx936_fp16_mmac_for_llvm17(llvm_source)
                     bridge_asm_instruction = "v_mmac_f32_16x16x16_f16"
+            elif use_llvm17_buffer_bridge:
+                llvm_source, bridge_stats = bridge_gfx936_buffer_contracts_for_llvm17(
+                    llvm_source
+                )
 
             with tempfile.NamedTemporaryFile(mode='w', suffix=".ll", delete=False) as f:
                 llir_file = f.name
@@ -840,6 +870,12 @@ class HIPBackend(BaseBackend):
 
             # Compile to ASM
             result = subprocess.run(asm_command, check=True, capture_output=True, text=True)
+            if not os.path.isfile(asm_file):
+                diagnostics = (result.stdout + result.stderr).strip()
+                detail = f": {diagnostics}" if diagnostics else ""
+                raise HSACOError(
+                    "HCU compiler returned success without producing assembly" + detail
+                )
             if options.wdra_enabled:
                 log = result.stdout + result.stderr
                 print(log, flush=True)

@@ -1,4 +1,4 @@
-"""Focused LLVM17 compatibility bridges for gfx936 MMAC kernels.
+"""Focused LLVM17 compatibility bridges for gfx936 kernels.
 
 The in-tree LLVM lowering emits the newer HCU MMAC contract and opaque
 address-space-8 buffer descriptors.  The product DTK17 toolchain selects the
@@ -30,8 +30,14 @@ LEGACY_FP16_MMAC = "llvm.amdgcn.mmac.f32.16x16x16f16"
 MAKE_BUFFER_RSRC = "llvm.amdgcn.make.buffer.rsrc.p8.p1"
 PTR_BUFFER_LOAD_I16 = "llvm.amdgcn.raw.ptr.buffer.load.i16"
 RAW_BUFFER_LOAD_I16 = "llvm.amdgcn.raw.buffer.load.i16"
+PTR_BUFFER_LOAD_I8 = "llvm.amdgcn.raw.ptr.buffer.load.i8"
+RAW_BUFFER_LOAD_I8 = "llvm.amdgcn.raw.buffer.load.i8"
+PTR_BUFFER_LOAD_F32 = "llvm.amdgcn.raw.ptr.buffer.load.f32"
+RAW_BUFFER_LOAD_F32 = "llvm.amdgcn.raw.buffer.load.f32"
 PTR_BUFFER_STORE_I32 = "llvm.amdgcn.raw.ptr.buffer.store.i32"
 RAW_BUFFER_STORE_I32 = "llvm.amdgcn.raw.buffer.store.i32"
+PTR_BUFFER_STORE_I8 = "llvm.amdgcn.raw.ptr.buffer.store.i8"
+RAW_BUFFER_STORE_I8 = "llvm.amdgcn.raw.buffer.store.i8"
 PTR_BUFFER_STORE_F32 = "llvm.amdgcn.raw.ptr.buffer.store.f32"
 RAW_BUFFER_STORE_F32 = "llvm.amdgcn.raw.buffer.store.f32"
 
@@ -214,6 +220,30 @@ def _bridge_buffer_contracts(
         make_buffer_calls=make_buffer_calls,
         raw_buffer_load_calls=sum(load_calls.values()),
         raw_buffer_store_calls=sum(store_calls.values()),
+    )
+
+
+def bridge_gfx936_buffer_contracts_for_llvm17(
+    source: str,
+) -> tuple[str, LLVM17MmacBridgeStats]:
+    """Map observed scalar load/store contracts to DTK17 raw buffers.
+
+    Keep this allowlist separate from the MMAC bridges: scalar kernels have
+    different element types, while the native MMAC paths retain their tighter
+    per-instruction ABI checks.
+    """
+
+    return _bridge_buffer_contracts(
+        source,
+        load_contracts={
+            PTR_BUFFER_LOAD_I8: RAW_BUFFER_LOAD_I8,
+            PTR_BUFFER_LOAD_F32: RAW_BUFFER_LOAD_F32,
+        },
+        store_contracts={
+            PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
+            PTR_BUFFER_STORE_F32: RAW_BUFFER_STORE_F32,
+        },
+        label="scalar",
     )
 
 
