@@ -381,7 +381,23 @@ struct FpToFpOpConversion
     Value absRtneRoundTrip = clearFp32SignBit(loc, rewriter, rtneRoundTrip);
     Value roundedAwayFromZero = b.fcmp_ogt(absRtneRoundTrip, absSrc);
     Value rtzFp8 = b.sub(rtneFp8, b.i8_val(1));
-    return b.select(roundedAwayFromZero, rtzFp8, rtneFp8);
+    Value result = b.select(roundedAwayFromZero, rtzFp8, rtneFp8);
+
+    // E5M2 is an IEEE-style format, so infinity must remain infinity.  The
+    // native RTNE conversion saturates infinity before the generic RTZ
+    // correction can observe it; restore the format-defined encoding from the
+    // FP32 source bits.  E4M3FN is finite-only and intentionally keeps the
+    // native saturation behavior.
+    if (isa<Float8E5M2Type>(dstElemTy)) {
+      Value srcBits = b.bitcast(srcFp32, i32_ty);
+      Value absBits = b.and_(srcBits, b.i32_val(0x7fffffff));
+      Value isInfinity = b.icmp_eq(absBits, b.i32_val(0x7f800000));
+      Value topByte = b.trunc(i8_ty, b.lshr(srcBits, b.i32_val(24)));
+      Value sign = b.and_(topByte, b.i8_val(0x80));
+      Value infinity = b.or_(sign, b.i8_val(0x7c));
+      result = b.select(isInfinity, infinity, result);
+    }
+    return result;
   }
 
   SmallVector<Value> createDestOps(triton::FpToFpOp op, OpAdaptor adaptor,
