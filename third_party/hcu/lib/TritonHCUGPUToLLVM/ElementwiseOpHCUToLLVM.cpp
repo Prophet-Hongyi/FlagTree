@@ -2072,12 +2072,13 @@ struct FpToFpOpConversion
       dstType = dstElementType;
     }
 
-    // When direct fp32->fp8/bf8 SW conversion (no fp16 intermediate,
-    // non-CDNA4), numElements must be 2 because SW path
+    // When direct fp32->fp8/bf8 RTNE SW conversion (no fp16 intermediate,
+    // non-CDNA4), numElements must be 2 because the RTNE SW path
     // (Fp32_to_Fp8E4M3FN_RTNE_SW, Fp32_to_Fp8E5M2_RTNE_SW) processes exactly 2
-    // elements per call.
+    // elements per call.  Keep RTZ at 4 elements: Fp32_to_Fp8E5M2_RTZ
+    // deliberately follows the AMD lowering and packs four FP16 high bytes.
     if (!useFP16IntermediateSrc && !capFP8F32 && numElements > 2 &&
-        srcElementType.isF32() &&
+        srcElementType.isF32() && roundingMode == RoundingMode::RTNE &&
         llvm::isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType)) {
       numElements = 2;
     }
