@@ -253,6 +253,7 @@ def bridge_gfx936_buffer_contracts_for_llvm17(
         source,
         load_contracts={
             PTR_BUFFER_LOAD_I8: RAW_BUFFER_LOAD_I8,
+            PTR_BUFFER_LOAD_I16: RAW_BUFFER_LOAD_I16,
             PTR_BUFFER_LOAD_I32: RAW_BUFFER_LOAD_I32,
             PTR_BUFFER_LOAD_F32: RAW_BUFFER_LOAD_F32,
             PTR_BUFFER_LOAD_V4F32: RAW_BUFFER_LOAD_V4F32,
@@ -260,6 +261,7 @@ def bridge_gfx936_buffer_contracts_for_llvm17(
         },
         store_contracts={
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
+            PTR_BUFFER_STORE_I16: RAW_BUFFER_STORE_I16,
             PTR_BUFFER_STORE_I32: RAW_BUFFER_STORE_I32,
             PTR_BUFFER_STORE_V2I32: RAW_BUFFER_STORE_V2I32,
             PTR_BUFFER_STORE_F32: RAW_BUFFER_STORE_F32,
