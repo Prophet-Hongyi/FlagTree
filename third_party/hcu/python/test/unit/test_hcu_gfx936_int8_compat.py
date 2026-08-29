@@ -12,6 +12,7 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     PTR_BUFFER_STORE_I16,
     PTR_BUFFER_STORE_I8,
     PTR_BUFFER_STORE_I32,
+    PTR_BUFFER_STORE_V2F32,
     PTR_BUFFER_STORE_V4F32,
     PTR_BUFFER_STORE_V4I32,
     RAW_BUFFER_LOAD_I16,
@@ -22,6 +23,7 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     RAW_BUFFER_STORE_I16,
     RAW_BUFFER_STORE_I8,
     RAW_BUFFER_STORE_I32,
+    RAW_BUFFER_STORE_V2F32,
     RAW_BUFFER_STORE_V4F32,
     RAW_BUFFER_STORE_V4I32,
     LLVM17Int8MmacBridgeError,
@@ -109,6 +111,7 @@ def test_gfx936_llvm17_int8_mmac_bridge_preserves_legacy_contract():
     [
         ("i16", "i16", PTR_BUFFER_STORE_I16, RAW_BUFFER_STORE_I16),
         ("i32", "i32", PTR_BUFFER_STORE_I32, RAW_BUFFER_STORE_I32),
+        ("v2f32", "<2 x float>", PTR_BUFFER_STORE_V2F32, RAW_BUFFER_STORE_V2F32),
         ("v4f32", "<4 x float>", PTR_BUFFER_STORE_V4F32, RAW_BUFFER_STORE_V4F32),
         ("v4i32", "<4 x i32>", PTR_BUFFER_STORE_V4I32, RAW_BUFFER_STORE_V4I32),
         ("i8", "i8", PTR_BUFFER_STORE_I8, RAW_BUFFER_STORE_I8),

@@ -300,6 +300,7 @@ def bridge_gfx936_int8_mmac_for_llvm17(
             PTR_BUFFER_STORE_I32: RAW_BUFFER_STORE_I32,
             PTR_BUFFER_STORE_V4I32: RAW_BUFFER_STORE_V4I32,
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
+            PTR_BUFFER_STORE_V2F32: RAW_BUFFER_STORE_V2F32,
             PTR_BUFFER_STORE_V4F32: RAW_BUFFER_STORE_V4F32,
         },
         label="signed INT8",
