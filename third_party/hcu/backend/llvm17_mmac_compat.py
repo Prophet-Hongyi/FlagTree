@@ -68,12 +68,16 @@ LLVM17Int8MmacBridgeStats = LLVM17MmacBridgeStats
 _PTR_BUFFER_LOAD_PREFIX = "llvm.amdgcn.raw.ptr.buffer.load"
 _PTR_BUFFER_STORE_PREFIX = "llvm.amdgcn.raw.ptr.buffer.store"
 
+_SSA_VALUE = r"%[-A-Za-z$._0-9]+"
+_I32X4_LITERAL = r"<i32 -?[0-9]+, i32 -?[0-9]+, i32 -?[0-9]+, i32 -?[0-9]+>"
+_I32X4_ACCUMULATOR = rf"(?:{_SSA_VALUE}|zeroinitializer|{_I32X4_LITERAL})"
+
 _CALL_RE = re.compile(
     r"^(?P<indent>\s*)(?P<result>%[-A-Za-z$._0-9]+) = "
     r"(?P<tail>tail )?call <4 x i32> @" + re.escape(NEW_INT8_MMAC) + r"\("
     r"<2 x i32> (?P<lhs>%[-A-Za-z$._0-9]+), "
     r"<2 x i32> (?P<rhs>%[-A-Za-z$._0-9]+), "
-    r"<4 x i32> (?P<acc>[^,]+), "
+    r"<4 x i32> (?P<acc>" + _I32X4_ACCUMULATOR + r"), "
     r"i1 (?P<lit>[^,]+), i1 (?P<clamp>[^,]+), i1 (?P<lts>[^)]+)\)"
     r"(?P<suffix>.*)$"
 )

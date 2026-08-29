@@ -33,12 +33,14 @@ from triton.backends.hcu.llvm17_mmac_compat import (
 )
 
 
-def _int8_mmac_module(lit="false", clamp="false", lts="false"):
+def _int8_mmac_module(
+    lit="false", clamp="false", lts="false", accumulator="zeroinitializer"
+):
     return (
         "define amdgpu_kernel void @kernel() {\n"
         "entry:\n"
         f"  %result = tail call <4 x i32> @{NEW_INT8_MMAC}"
-        f"(<2 x i32> %lhs, <2 x i32> %rhs, <4 x i32> zeroinitializer, "
+        f"(<2 x i32> %lhs, <2 x i32> %rhs, <4 x i32> {accumulator}, "
         f"i1 {lit}, i1 {clamp}, i1 {lts})\n"
         "  ret void\n"
         "}\n\n"
@@ -96,6 +98,34 @@ def test_gfx936_llvm17_int8_mmac_bridge_preserves_legacy_contract():
     assert bridged.count(LEGACY_INT8_MMAC) == 2
     assert "%flagtree.mmac.result.lhs_i64 = bitcast <2 x i32> %lhs to i64" in bridged
     assert "%flagtree.mmac.result.rhs_i64 = bitcast <2 x i32> %rhs to i64" in bridged
+
+
+@pytest.mark.parametrize(
+    "accumulator",
+    [
+        "%acc",
+        "zeroinitializer",
+        "<i32 2147483632, i32 -2147483632, i32 0, i32 17>",
+    ],
+)
+def test_gfx936_llvm17_int8_mmac_bridge_preserves_supported_accumulators(
+    accumulator,
+):
+    bridged, stats = bridge_gfx936_int8_mmac_for_llvm17(
+        _int8_mmac_module(accumulator=accumulator)
+    )
+
+    assert stats.calls == 1
+    assert f"<4 x i32> {accumulator})" in bridged
+
+
+def test_gfx936_llvm17_int8_mmac_bridge_rejects_unknown_accumulator():
+    with pytest.raises(
+        LLVM17Int8MmacBridgeError, match="cannot parse signed INT8 MMAC contract"
+    ):
+        bridge_gfx936_int8_mmac_for_llvm17(
+            _int8_mmac_module(accumulator="poison")
+        )
 
 
 @pytest.mark.parametrize(
