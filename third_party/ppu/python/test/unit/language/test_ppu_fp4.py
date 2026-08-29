@@ -6,7 +6,6 @@ from triton import knobs
 from triton._internal_testing import is_ppu
 from triton.backends.compiler import GPUTarget
 
-
 _PPU0010_TARGET = GPUTarget("cuda", 80, 32)
 _PPU0010_BF16_MMA = "ppu.mma.sync.aligned.m16n16k16.row.col.f32.bf16.bf16.f32"
 
@@ -103,7 +102,32 @@ def _e2m1_both_scaled(lhs, lhs_scale, rhs, rhs_scale, out):
     tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
 
 
-def _compile_through_llir(kernel, signature):
+@triton.jit
+def _e2m1_both_scaled_fast_math(lhs, lhs_scale, rhs, rhs_scale, out, FAST_MATH: tl.constexpr):
+    offsets_m = tl.arange(0, 16)
+    offsets_n = tl.arange(0, 16)
+    offsets_k_packed = tl.arange(0, 16)
+    a = tl.load(lhs + offsets_m[:, None] * 16 + offsets_k_packed[None, :])
+    a_scale = tl.load(lhs_scale + offsets_m[:, None])
+    b = tl.load(rhs + offsets_k_packed[:, None] * 16 + offsets_n[None, :])
+    b_scale = tl.load(rhs_scale + offsets_n[:, None])
+    acc = tl.zeros((16, 16), dtype=tl.float32)
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e2m1",
+        b,
+        b_scale,
+        "e2m1",
+        acc,
+        fast_math=FAST_MATH,
+        lhs_k_pack=True,
+        rhs_k_pack=True,
+    )
+    tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
+
+
+def _compile_through_llir(kernel, signature, constexprs=None):
     previous_hook = knobs.runtime.add_stages_inspection_hook
 
     def stop_before_hgbin(_backend, stages, _options, _language, _capability):
@@ -111,7 +135,7 @@ def _compile_through_llir(kernel, signature):
 
     knobs.runtime.add_stages_inspection_hook = stop_before_hgbin
     try:
-        source = triton.compiler.ASTSource(fn=kernel, signature=signature)
+        source = triton.compiler.ASTSource(fn=kernel, signature=signature, constexprs=constexprs or {})
         return triton.compile(source, target=_PPU0010_TARGET)
     finally:
         knobs.runtime.add_stages_inspection_hook = previous_hook
@@ -136,6 +160,12 @@ def _assert_software_e2m1_dot(compiled):
     assert "ppu.prmt.b32" in compiled.asm["llir"]
 
 
+def _assert_e8m0_nan_guard(compiled, fast_math):
+    expected = 0 if fast_math else 2
+    assert compiled.asm["ttgir"].count("arith.cmpi") == expected
+    assert compiled.asm["ttgir"].count("arith.select") == expected
+
+
 def _compile_scaled(side):
     if side == "lhs":
         kernel = _e2m1_lhs_scaled
@@ -156,6 +186,21 @@ def _compile_scaled(side):
     return _compile_through_llir(kernel, signature)
 
 
+def _compile_fast_math(fast_math):
+    return _compile_through_llir(
+        _e2m1_both_scaled_fast_math,
+        {
+            "lhs": "*u8",
+            "lhs_scale": "*u8",
+            "rhs": "*u8",
+            "rhs_scale": "*u8",
+            "out": "*fp32",
+            "FAST_MATH": "constexpr",
+        },
+        {"FAST_MATH": fast_math},
+    )
+
+
 def test_ppu0010_e2m1_dot_scaled_lowers_through_bf16_mma():
     compiled = _compile_through_llir(
         _e2m1_dot_scaled,
@@ -167,6 +212,13 @@ def test_ppu0010_e2m1_dot_scaled_lowers_through_bf16_mma():
 @pytest.mark.parametrize("side", ["lhs", "rhs", "both"])
 def test_ppu0010_scaled_e2m1_dot_lowers_through_bf16_mma(side):
     _assert_software_e2m1_dot(_compile_scaled(side))
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_ppu0010_e2m1_fast_math_lowers_through_bf16_mma(fast_math):
+    compiled = _compile_fast_math(fast_math)
+    _assert_software_e2m1_dot(compiled)
+    _assert_e8m0_nan_guard(compiled, fast_math)
 
 
 def test_ppu0010_e2m1_dot_scaled_device(device):
@@ -254,4 +306,37 @@ def test_ppu0010_scaled_e2m1_dot_device(device, side):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, lhs_values @ rhs_values)
     _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["hgbin"]
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_ppu0010_e2m1_scale_special_value_device(device, fast_math):
+    if not is_ppu():
+        pytest.skip("requires the PPU backend")
+
+    lhs_packed = torch.full((16, 16), 0x22, dtype=torch.uint8, device=device)
+    rhs_packed = torch.full((16, 16), 0x22, dtype=torch.uint8, device=device)
+    scale_code = 0x7F if fast_math else 0xFF
+    lhs_scale = torch.full((16, ), scale_code, dtype=torch.uint8, device=device)
+    rhs_scale = torch.full((16, ), scale_code, dtype=torch.uint8, device=device)
+    output = torch.empty((16, 16), dtype=torch.float32, device=device)
+
+    compiled = _e2m1_both_scaled_fast_math[(1, )](
+        lhs_packed,
+        lhs_scale,
+        rhs_packed,
+        rhs_scale,
+        output,
+        FAST_MATH=fast_math,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    actual = output.cpu()
+    if fast_math:
+        torch.testing.assert_close(actual, torch.full_like(actual, 32.0), rtol=0, atol=0)
+    else:
+        assert torch.isnan(actual).all()
+    _assert_software_e2m1_dot(compiled)
+    _assert_e8m0_nan_guard(compiled, fast_math)
     assert compiled.asm["hgbin"]
