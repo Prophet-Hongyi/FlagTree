@@ -412,6 +412,8 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-cached-load-cost-per-byte
 //   ttg.rlc-expensive-math-cost-per-byte
 //   ttg.rlc-inter-warp-reduce-cost
+//   ttg.rlc-atomic-writeback-max-elements-per-thread-ratio
+//   ttg.rlc-allow-atomic-writeback-order-change
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -423,6 +425,11 @@ struct RlcBackendPolicy {
   int64_t cachedLoadCostPerByte = 8;
   int64_t expensiveMathCostPerByte = 8;
   int64_t interWarpReduceCost = 8;
+  // Zero leaves atomic writeback retagging unrestricted. Backends whose
+  // atomic lowering serializes every per-thread element can set a positive
+  // ratio to preserve the incumbent lane parallelism.
+  int64_t atomicWritebackMaxElementsPerThreadRatio = 0;
+  bool allowAtomicWritebackOrderChange = false;
 
   static RlcBackendPolicy fromOperation(Operation *op) {
     RlcBackendPolicy policy;
@@ -449,6 +456,11 @@ struct RlcBackendPolicy {
                      policy.expensiveMathCostPerByte);
     overridePositive("ttg.rlc-inter-warp-reduce-cost",
                      policy.interWarpReduceCost);
+    overridePositive("ttg.rlc-atomic-writeback-max-elements-per-thread-ratio",
+                     policy.atomicWritebackMaxElementsPerThreadRatio);
+    if (auto attr = module->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-allow-atomic-writeback-order-change"))
+      policy.allowAtomicWritebackOrderChange = attr.getInt() > 0;
     return policy;
   }
 };
@@ -1039,7 +1051,8 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
                                            RankedTensorType valueType,
                                            Attribute targetEncoding,
                                            bool allowNarrowerContiguity,
-                                           const RlcBackendPolicy &policy);
+                                           const RlcBackendPolicy &policy,
+                                           bool allowOrderChange = false);
 static unsigned getContigAlongMemoryOrder(RankedTensorType type);
 static bool isOrderIndifferentAccess(ModuleAxisInfoAnalysis *axisInfo,
                                      Value ptr);
@@ -2340,7 +2353,8 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
                                            RankedTensorType valueType,
                                            Attribute targetEncoding,
                                            bool allowNarrowerContiguity,
-                                           const RlcBackendPolicy &policy) {
+                                           const RlcBackendPolicy &policy,
+                                           bool allowOrderChange) {
   if (!ptrType || !valueType || !targetEncoding ||
       !isa<DistributedEncodingTrait>(targetEncoding))
     return false;
@@ -2353,8 +2367,9 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
   RankedTensorType targetType = valueType.cloneWithEncoding(targetEncoding);
   SmallVector<unsigned> currentOrder = getOrderForMemory(ptrType);
   SmallVector<unsigned> targetOrder = getOrderForMemory(targetType);
-  if (currentOrder.empty() || targetOrder.empty() ||
-      currentOrder.front() != targetOrder.front())
+  if (currentOrder.empty() || targetOrder.empty())
+    return false;
+  if (currentOrder.front() != targetOrder.front() && !allowOrderChange)
     return false;
 
   unsigned targetContig = getContigAlongMemoryOrder(targetType);
@@ -2643,10 +2658,22 @@ bool LayoutPropagation::solveSmallComponents() {
     auto valType = dyn_cast<RankedTensorType>(atomicOp.getVal().getType());
     if (!ptrType || !valType)
       return false;
+    RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(atomicOp);
+    if (policy.atomicWritebackMaxElementsPerThreadRatio > 0) {
+      int64_t currentElements = getTotalElemsPerThread(valType);
+      int64_t candidateElements = getTotalElemsPerThread(
+          valType.cloneWithEncoding(encoding));
+      if (candidateElements >
+          currentElements * policy.atomicWritebackMaxElementsPerThreadRatio) {
+        traceRlcDecision("2", "reject",
+                         "atomic-elements-per-thread-expansion", atomicOp);
+        return false;
+      }
+    }
     if (!preservesWritebackMemoryAccess(
             ptrType, valType, encoding,
             /*allowNarrowerContiguity=*/false,
-            RlcBackendPolicy::fromOperation(atomicOp)))
+            policy))
       return false;
     if (!collectOperand(atomicOp.getVal()) ||
         !collectOperand(atomicOp.getPtr()))
@@ -4457,9 +4484,12 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   bool allowNarrowerContiguity = isa<AtomicRMWOp>(writebackOp) ||
                                  writebackOp->getParentOfType<scf::ForOp>() ||
                                  writebackOp->getParentOfType<scf::WhileOp>();
+  RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(writebackOp);
+  bool allowAtomicOrderChange =
+      isa<AtomicRMWOp>(writebackOp) && policy.allowAtomicWritebackOrderChange;
   if (!preservesWritebackMemoryAccess(
-          ptrType, valueType, targetEncoding, allowNarrowerContiguity,
-          RlcBackendPolicy::fromOperation(writebackOp)))
+          ptrType, valueType, targetEncoding, allowNarrowerContiguity, policy,
+          allowAtomicOrderChange))
     return reject("memory-access-change");
 
   // A contiguous (coalesced) store moves consecutive addresses across a warp
