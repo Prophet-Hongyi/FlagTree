@@ -161,13 +161,17 @@ def encode_fp8(
     not a native FP8 tensor, so backends can implement storage and software
     dequantization without claiming native FP8 arithmetic.
 
-    Version 1 deliberately supports only OCP E4M3FN, round-to-nearest-even,
-    saturating finite overflow, and FP16 input. Unsupported combinations fail
-    at compile time instead of silently changing numeric semantics.
+    Supported formats are OCP E4M3FN and E5M2. Both use
+    round-to-nearest-even, saturating finite overflow, and FP16 input.
+    Unsupported combinations fail at compile time instead of silently changing
+    numeric semantics.
     """
 
     core.static_assert(input.dtype.is_fp16(), "encode_fp8 input must be tl.float16")
-    core.static_assert(format == "e4m3fn", "encode_fp8 format must be 'e4m3fn'")
+    core.static_assert(
+        format == "e4m3fn" or format == "e5m2",
+        "encode_fp8 format must be 'e4m3fn' or 'e5m2'",
+    )
     core.static_assert(rounding == "rtne", "encode_fp8 rounding must be 'rtne'")
     core.static_assert(overflow == "satfinite", "encode_fp8 overflow must be 'satfinite'")
 
@@ -178,28 +182,37 @@ def encode_fp8(
     sign = ((bits & 0x8000) >> 8).to(core.uint8)
     is_nan = ((absolute & 0x7C00) == 0x7C00) & ((absolute & 0x03FF) != 0)
 
-    rounding_bias = ((absolute & 0x0080) >> 7) + 0x003F
-    encoded = (absolute + rounding_bias) & 0xFF80
-    encoded = core.maximum(encoded, 0x2400)
-    encoded = ((encoded - 0x2000) >> 7).to(core.uint8)
-    encoded = core.where(absolute > 0x5F40, 0x7E, encoded)
+    if format == "e4m3fn":
+        rounding_bias = ((absolute & 0x0080) >> 7) + 0x003F
+        encoded = (absolute + rounding_bias) & 0xFF80
+        encoded = core.maximum(encoded, 0x2400)
+        encoded = ((encoded - 0x2000) >> 7).to(core.uint8)
+        encoded = core.where(absolute > 0x5F40, 0x7E, encoded)
 
-    halfway_points: core.constexpr = (
-        0x1400,
-        0x1A00,
-        0x1D00,
-        0x1F00,
-        0x2080,
-        0x2180,
-        0x2280,
-        0x2380,
-    )
-    for i in core.static_range(7, -1, -1):
-        if i % 2 == 0:
-            below_halfway = absolute <= halfway_points[i]
-        else:
-            below_halfway = absolute < halfway_points[i]
-        encoded = core.where(below_halfway, i, encoded)
+        halfway_points: core.constexpr = (
+            0x1400,
+            0x1A00,
+            0x1D00,
+            0x1F00,
+            0x2080,
+            0x2180,
+            0x2280,
+            0x2380,
+        )
+        for i in core.static_range(7, -1, -1):
+            if i % 2 == 0:
+                below_halfway = absolute <= halfway_points[i]
+            else:
+                below_halfway = absolute < halfway_points[i]
+            encoded = core.where(below_halfway, i, encoded)
+    else:
+        # E5M2 and FP16 share the same five-bit exponent. Round the FP16
+        # mantissa from ten bits to two, clamp overflow and infinities to the
+        # largest finite E5M2 value, then retain the high byte.
+        rounding_bias = ((absolute & 0x0100) >> 8) + 0x007F
+        encoded = absolute + rounding_bias
+        encoded = core.where(absolute >= 0x7B80, 0x7B00, encoded)
+        encoded = (encoded >> 8).to(core.uint8)
 
     encoded = core.where(is_nan, 0x7F, encoded)
     return (encoded | sign).to(core.uint8)
@@ -210,37 +223,47 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
     """Decode one-byte FP8 storage into FP16, BF16, or FP32 values.
 
     ``input`` must be ``tl.uint8`` produced by :func:`encode_fp8` or an
-    equivalent E4M3FN storage source. No native FP8 IR type is introduced.
+    equivalent E4M3FN or E5M2 storage source. No native FP8 IR type is
+    introduced.
     """
 
     core.static_assert(input.dtype.is_uint8(), "decode_fp8 input must be tl.uint8 storage")
-    core.static_assert(format == "e4m3fn", "decode_fp8 format must be 'e4m3fn'")
+    core.static_assert(
+        format == "e4m3fn" or format == "e5m2",
+        "decode_fp8 format must be 'e4m3fn' or 'e5m2'",
+    )
     core.static_assert(
         dtype.is_fp16() or dtype.is_bf16() or dtype.is_fp32(),
         "decode_fp8 dtype must be tl.float16, tl.bfloat16, or tl.float32",
     )
 
     values_i32 = input.to(core.int32)
-    absolute = values_i32 & 0x7F
-    sign = (values_i32 & 0x80) << 8
-    fp16_bits = ((values_i32 << 8) & 0x7FFF) >> 1
-    fp16_bits += 0x2000
-    fp16_bits = core.where(absolute == 0x7F, 0x7E00, fp16_bits)
+    if format == "e4m3fn":
+        absolute = values_i32 & 0x7F
+        sign = (values_i32 & 0x80) << 8
+        fp16_bits = ((values_i32 << 8) & 0x7FFF) >> 1
+        fp16_bits += 0x2000
+        fp16_bits = core.where(absolute == 0x7F, 0x7E00, fp16_bits)
 
-    denormals_and_zero: core.constexpr = (
-        0x0000,
-        0x1800,
-        0x1C00,
-        0x1E00,
-        0x2000,
-        0x2100,
-        0x2200,
-        0x2300,
-    )
-    for i in core.static_range(8):
-        fp16_bits = core.where(absolute == i, denormals_and_zero[i], fp16_bits)
+        denormals_and_zero: core.constexpr = (
+            0x0000,
+            0x1800,
+            0x1C00,
+            0x1E00,
+            0x2000,
+            0x2100,
+            0x2200,
+            0x2300,
+        )
+        for i in core.static_range(8):
+            fp16_bits = core.where(absolute == i, denormals_and_zero[i], fp16_bits)
+        fp16_bits |= sign
+    else:
+        # E5M2 is a high-byte projection of FP16: sign and exponent widths are
+        # identical and the two stored mantissa bits occupy FP16 bits 9-8.
+        fp16_bits = values_i32 << 8
 
-    decoded = (fp16_bits | sign).to(core.int16).to(core.float16, bitcast=True)
+    decoded = fp16_bits.to(core.int16).to(core.float16, bitcast=True)
     return decoded.to(dtype)
 
 
