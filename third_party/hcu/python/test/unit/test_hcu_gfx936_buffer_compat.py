@@ -4,11 +4,15 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     MAKE_BUFFER_RSRC,
     PTR_BUFFER_LOAD_F32,
     PTR_BUFFER_LOAD_I8,
+    PTR_BUFFER_LOAD_V4F32,
     PTR_BUFFER_STORE_F32,
+    PTR_BUFFER_STORE_I32,
     PTR_BUFFER_STORE_I8,
     RAW_BUFFER_LOAD_F32,
     RAW_BUFFER_LOAD_I8,
+    RAW_BUFFER_LOAD_V4F32,
     RAW_BUFFER_STORE_F32,
+    RAW_BUFFER_STORE_I32,
     RAW_BUFFER_STORE_I8,
     LLVM17MmacBridgeError,
     bridge_gfx936_buffer_contracts_for_llvm17,
@@ -19,12 +23,17 @@ def _scalar_buffer_module(load_type="f32", store_type="i8", stride=0):
     load_pointer = {
         "f32": PTR_BUFFER_LOAD_F32,
         "i8": PTR_BUFFER_LOAD_I8,
+        "v4f32": PTR_BUFFER_LOAD_V4F32,
     }.get(load_type, f"llvm.amdgcn.raw.ptr.buffer.load.{load_type}")
     store_pointer = {
         "f32": PTR_BUFFER_STORE_F32,
         "i8": PTR_BUFFER_STORE_I8,
+        "i32": PTR_BUFFER_STORE_I32,
     }.get(store_type, f"llvm.amdgcn.raw.ptr.buffer.store.{store_type}")
-    load_result_type = "float" if load_type == "f32" else load_type
+    load_result_type = {
+        "f32": "float",
+        "v4f32": "<4 x float>",
+    }.get(load_type, load_type)
     store_value_type = "float" if store_type == "f32" else store_type
     store_value = "0.0" if store_type == "f32" else "0"
     return f"""define amdgpu_kernel void @kernel(ptr addrspace(1) %input, ptr addrspace(1) %output) {{
@@ -44,7 +53,9 @@ declare void @{store_pointer}({store_value_type}, ptr addrspace(8), i32, i32, i3
     ("load_type", "store_type", "raw_load", "raw_store"),
     [
         ("f32", "i8", RAW_BUFFER_LOAD_F32, RAW_BUFFER_STORE_I8),
+        ("f32", "i32", RAW_BUFFER_LOAD_F32, RAW_BUFFER_STORE_I32),
         ("i8", "f32", RAW_BUFFER_LOAD_I8, RAW_BUFFER_STORE_F32),
+        ("v4f32", "i32", RAW_BUFFER_LOAD_V4F32, RAW_BUFFER_STORE_I32),
     ],
 )
 def test_scalar_buffer_contracts_are_bridged(
