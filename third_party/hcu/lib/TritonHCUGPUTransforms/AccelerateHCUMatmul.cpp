@@ -1267,6 +1267,36 @@ public:
   }
 };
 
+// gfx936 has no native E2M1 MMAC.  The existing scaled-MFMA rewrite upcasts an
+// E2M1 operand only when a block scale is present, so an unscaled E2M1 pair
+// otherwise reaches DotOp as packed i8 and fails layout verification.  Reuse
+// Triton's software decomposition for this one explicit contract and force the
+// decoded operands to FP16, which is exact for every E2M1 value and uses the
+// already-qualified gfx936 FP16 MMAC/toolchain bridge.  Broader scaled and
+// mixed-format forms remain on their existing paths or fail closed.
+class DecomposeGfx936E2M1DotScaled final
+    : public ttg::DecomposeScaledBlocked {
+public:
+  using DecomposeScaledBlocked::DecomposeScaledBlocked;
+
+  LogicalResult matchAndRewrite(tt::DotScaledOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getAElemType() != tt::ScaleDotElemType::E2M1 ||
+        op.getBElemType() != tt::ScaleDotElemType::E2M1 || op.getAScale() ||
+        op.getBScale() || !op.getLhsKPack() || !op.getRhsKPack())
+      return failure();
+    return DecomposeScaledBlocked::matchAndRewrite(op, rewriter);
+  }
+
+protected:
+  TypedValue<RankedTensorType>
+  scaleArg(PatternRewriter &rewriter, tt::DotScaledOp op, int operandIndex,
+           FloatType) const override {
+    return DecomposeScaledBlocked::scaleArg(rewriter, op, operandIndex,
+                                            rewriter.getF16Type());
+  }
+};
+
 template <typename Op> Op getDefOpBeforeConvertLayout(Value op) {
   while (auto cvtOp = op.getDefiningOp<ttg::ConvertLayoutOp>()) {
     op = cvtOp.getSrc();
@@ -1955,6 +1985,9 @@ struct TritonHCUGPUAccelerateMatmulPass
     case ISAFamily::CDNA1:
     case ISAFamily::CDNA2:
     case ISAFamily::CDNA3:
+      if (archGenerationName == "gfx936")
+        mfmaPatterns.add<::DecomposeGfx936E2M1DotScaled>(
+            context, /*benefit=*/3);
       mfmaPatterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
           context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
           features, mmacLayout,
