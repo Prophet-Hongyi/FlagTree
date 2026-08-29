@@ -11,13 +11,11 @@ from triton.backends import backends
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-
 if not hasattr(libtriton, "metax"):
     pytest.skip("metax backend not built in libtriton", allow_module_level=True)
 
 if "metax" not in backends:
     pytest.skip("metax backend not discovered", allow_module_level=True)
-
 
 _C550_TARGET = GPUTarget("maca", 80, 64)
 
@@ -117,6 +115,32 @@ def _metax_scaled_e2m1_dot_kernel(lhs, lhs_scale, rhs, rhs_scale, out):
     tl.store(out + offsets_m[:, None] * 32 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _metax_scaled_e2m1_fast_math_kernel(lhs, lhs_scale, rhs, rhs_scale, out, FAST_MATH: tl.constexpr):
+    offsets_m = tl.arange(0, 32)
+    offsets_n = tl.arange(0, 32)
+    offsets_k_packed = tl.arange(0, 32)
+    offsets_scale = tl.arange(0, 2)
+    a = tl.load(lhs + offsets_m[:, None] * 32 + offsets_k_packed[None, :])
+    b = tl.load(rhs + offsets_k_packed[:, None] * 32 + offsets_n[None, :])
+    a_scale = tl.load(lhs_scale + offsets_m[:, None] * 2 + offsets_scale[None, :])
+    b_scale = tl.load(rhs_scale + offsets_n[:, None] * 2 + offsets_scale[None, :])
+    acc = tl.zeros((32, 32), dtype=tl.float32)
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e2m1",
+        b,
+        b_scale,
+        "e2m1",
+        acc,
+        fast_math=FAST_MATH,
+        lhs_k_pack=True,
+        rhs_k_pack=True,
+    )
+    tl.store(out + offsets_m[:, None] * 32 + offsets_n[None, :], result)
+
+
 def _compile_no_scale():
     source = ASTSource(
         fn=_metax_e2m1_dot_scaled_kernel,
@@ -149,6 +173,22 @@ def _compile_scaled(side):
     )
 
 
+def _compile_fast_math(fast_math):
+    source = ASTSource(
+        fn=_metax_scaled_e2m1_fast_math_kernel,
+        signature={
+            "lhs": "*u8",
+            "lhs_scale": "*u8",
+            "rhs": "*u8",
+            "rhs_scale": "*u8",
+            "out": "*fp32",
+            "FAST_MATH": "constexpr",
+        },
+        constexprs={"FAST_MATH": fast_math},
+    )
+    return triton.compile(source, target=_C550_TARGET, options={"num_warps": 4})
+
+
 def _pack_along_k(raw_codes, dim):
     if dim == 1:
         low = raw_codes[:, 0::2]
@@ -165,6 +205,12 @@ def _assert_software_e2m1_dot(compiled):
     assert "llvm.mxc.cvt.pk4.f4tobf16.scale" not in compiled.asm["llir"]
 
 
+def _assert_e8m0_nan_guard(compiled, fast_math):
+    expected = 0 if fast_math else 2
+    assert compiled.asm["ttgir"].count("arith.cmpi") == expected
+    assert compiled.asm["ttgir"].count("arith.select") == expected
+
+
 def test_c550_e2m1_dot_scaled_lowers_through_software_decode_and_bf16_mma():
     compiled = _compile_no_scale()
     _assert_software_e2m1_dot(compiled)
@@ -175,6 +221,14 @@ def test_c550_e2m1_dot_scaled_lowers_through_software_decode_and_bf16_mma():
 def test_c550_scaled_e2m1_dot_lowers_through_software_decode_and_bf16_mma(side):
     compiled = _compile_scaled(side)
     _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["mcfatbin"]
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_c550_e2m1_fast_math_lowers_through_software_decode_and_bf16_mma(fast_math):
+    compiled = _compile_fast_math(fast_math)
+    _assert_software_e2m1_dot(compiled)
+    _assert_e8m0_nan_guard(compiled, fast_math)
     assert compiled.asm["mcfatbin"]
 
 
@@ -192,7 +246,7 @@ def test_c550_e2m1_dot_scaled_device():
     rhs_packed = _pack_along_k(codebook[rhs_index], dim=0).cuda()
     output = torch.empty((32, 32), dtype=torch.float32, device="cuda")
 
-    compiled = _metax_e2m1_dot_scaled_kernel[(1,)](
+    compiled = _metax_e2m1_dot_scaled_kernel[(1, )](
         lhs_packed,
         rhs_packed,
         output,
@@ -241,7 +295,7 @@ def test_c550_scaled_e2m1_dot_device(side):
     output = torch.empty((32, 32), dtype=torch.float32, device="cuda")
 
     if side == "lhs":
-        compiled = _metax_lhs_scaled_e2m1_dot_kernel[(1,)](
+        compiled = _metax_lhs_scaled_e2m1_dot_kernel[(1, )](
             lhs_packed,
             lhs_scale_codes.cuda(),
             rhs_packed,
@@ -250,7 +304,7 @@ def test_c550_scaled_e2m1_dot_device(side):
         )
         expected = (lhs_values * lhs_scale_values.repeat_interleave(32, dim=1)) @ rhs_values
     elif side == "rhs":
-        compiled = _metax_rhs_scaled_e2m1_dot_kernel[(1,)](
+        compiled = _metax_rhs_scaled_e2m1_dot_kernel[(1, )](
             lhs_packed,
             rhs_packed,
             rhs_scale_codes.cuda(),
@@ -260,7 +314,7 @@ def test_c550_scaled_e2m1_dot_device(side):
         scaled_rhs = rhs_values * rhs_scale_values.repeat_interleave(32, dim=1).transpose(0, 1)
         expected = lhs_values @ scaled_rhs
     else:
-        compiled = _metax_scaled_e2m1_dot_kernel[(1,)](
+        compiled = _metax_scaled_e2m1_dot_kernel[(1, )](
             lhs_packed,
             lhs_scale_codes.cuda(),
             rhs_packed,
@@ -277,4 +331,39 @@ def test_c550_scaled_e2m1_dot_device(side):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, lhs_values @ rhs_values)
     _assert_software_e2m1_dot(compiled)
+    assert compiled.asm["mcfatbin"]
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_c550_e2m1_scale_special_value_device(fast_math):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a MetaX device")
+    if torch.cuda.get_device_capability(0) != (8, 0):
+        pytest.skip("requires a C550 / maca arch 80 target")
+
+    lhs_packed = torch.full((32, 32), 0x22, dtype=torch.uint8, device="cuda")
+    rhs_packed = torch.full((32, 32), 0x22, dtype=torch.uint8, device="cuda")
+    scale_code = 0x7F if fast_math else 0xFF
+    lhs_scale = torch.full((32, 2), scale_code, dtype=torch.uint8, device="cuda")
+    rhs_scale = torch.full((32, 2), scale_code, dtype=torch.uint8, device="cuda")
+    output = torch.empty((32, 32), dtype=torch.float32, device="cuda")
+
+    compiled = _metax_scaled_e2m1_fast_math_kernel[(1, )](
+        lhs_packed,
+        lhs_scale,
+        rhs_packed,
+        rhs_scale,
+        output,
+        FAST_MATH=fast_math,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+
+    actual = output.cpu()
+    if fast_math:
+        torch.testing.assert_close(actual, torch.full_like(actual, 64.0), rtol=0, atol=0)
+    else:
+        assert torch.isnan(actual).all()
+    _assert_software_e2m1_dot(compiled)
+    _assert_e8m0_nan_guard(compiled, fast_math)
     assert compiled.asm["mcfatbin"]
