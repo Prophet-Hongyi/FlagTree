@@ -81,6 +81,20 @@ def _uint8_storage_fp16_dot_quantize_kernel(
     tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
 
 
+@triton.jit
+def _e4m3fn_rtz_quantize_kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(input_ptr + offsets)
+    result = tl.quantize(
+        values,
+        1.0,
+        dtype=tl.float8e4nv,
+        zero_point=0,
+        rounding="rtz",
+    )
+    tl.store(output_ptr + offsets, result)
+
+
 def _int8_inputs():
     lhs = (((torch.arange(16 * 32) * 7 + 3) % 17) - 8).reshape(16, 32).to(torch.int8)
     rhs = (((torch.arange(32 * 16) * 11 + 5) % 17) - 8).reshape(32, 16).to(torch.int8)
@@ -194,3 +208,22 @@ def test_gfx936_uint8_storage_fp16_compute_uint8_output():
     assert _GFX936_FP16_MMAC_ASM in compiled.asm["amdgcn"]
     assert _GFX936_INT8_MMAC_ASM not in compiled.asm["amdgcn"]
     assert compiled.asm["hsaco"]
+
+
+def test_gfx936_e4m3fn_rtz_quantize_fails_closed(capfd):
+    _require_gfx936()
+
+    values = torch.arange(32, dtype=torch.float32, device="cuda") / 10
+    output = torch.empty(32, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        _e4m3fn_rtz_quantize_kernel[(1, )](
+            values,
+            triton.reinterpret(output, tl.float8e4nv),
+            BLOCK_SIZE=32,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    stderr = capfd.readouterr().err
+    assert "Unsupported conversion from 'f32' to 'f8E4M3FN'" in stderr
+    assert "with rounding mode rtz" in stderr
