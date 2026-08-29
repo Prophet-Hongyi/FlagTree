@@ -62,6 +62,15 @@ def _scaled_fp8_roundtrip_kernel(input_ptr, scale_ptr, output_ptr, BLOCK_SIZE: t
 
 
 @triton.jit
+def _static_quantize_dequantize_kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    input = tl.load(input_ptr + offsets)
+    quantized = tl.quantize(input, 0.5, dtype=tl.int8, zero_point=0)
+    output = tl.dequantize(quantized, 0.5, dtype=tl.float32, zero_point=0)
+    tl.store(output_ptr + offsets, output)
+
+
+@triton.jit
 def _invalid_quantize_kernel(
     input_ptr,
     output_ptr,
@@ -186,6 +195,28 @@ def test_explicit_affine_dequantize_widens_before_subtraction(device, input_dtyp
     )
 
     expected = (input.cpu().to(torch.float32) - zero_point) * 0.25
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+def test_quantize_dequantize_accepts_static_parameters(device):
+    input = torch.tensor(
+        [-100.0, -2.0, -1.25, -0.5, -0.25, 0.0, 0.25, 0.5, 1.25, 2.0, 100.0, math.nan],
+        dtype=torch.float32,
+        device=device,
+    )
+    output = torch.empty_like(input)
+
+    _static_quantize_dequantize_kernel[(1, )](input, output, BLOCK_SIZE=input.numel())
+
+    quantized = _reference_quantize(
+        input.cpu(),
+        scale=0.5,
+        zero_point=0,
+        qmin=-128,
+        qmax=127,
+        rounding="rtne",
+    ).to(torch.int8)
+    expected = quantized.to(torch.float32) * 0.5
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
 

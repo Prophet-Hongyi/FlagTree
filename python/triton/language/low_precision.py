@@ -35,7 +35,6 @@ def _validate_quantization_scale(scale):
         )
     else:
         core.static_assert(scale > 0 and scale < float("inf"), "scale must be finite and greater than zero")
-    return scale
 
 
 @jit
@@ -48,7 +47,6 @@ def _validate_zero_point(zero_point, qmin: core.constexpr, qmax: core.constexpr)
         )
     else:
         core.static_assert(qmin <= zero_point and zero_point <= qmax, "zero_point must be within [qmin, qmax]")
-    return zero_point
 
 
 @jit
@@ -97,7 +95,7 @@ def quantize(
 
     core.static_assert(input.dtype.is_floating(), "quantize input must have a floating-point dtype")
     core.static_assert(rounding == "rtne" or rounding == "rtz", "rounding must be 'rtne' or 'rtz'")
-    scale = _validate_quantization_scale(scale)
+    _validate_quantization_scale(scale)
 
     if dtype.is_fp8():
         core.static_assert(qmin is None and qmax is None, "FP8 quantization does not accept qmin or qmax")
@@ -115,7 +113,7 @@ def quantize(
         _qmax: core.constexpr = dtype_max if qmax is None else qmax
         core.static_assert(dtype_min <= _qmin and _qmin < _qmax and _qmax <= dtype_max,
                            "qmin and qmax must be ordered and within the output dtype range")
-        zero_point = _validate_zero_point(zero_point, _qmin, _qmax)
+        _validate_zero_point(zero_point, _qmin, _qmax)
 
         scaled = input.to(core.float32) / scale
         scaled = core.where(scaled != scaled, 0.0, scaled)
@@ -136,7 +134,7 @@ def dequantize(input, scale, dtype: core.constexpr = core.float32, zero_point=0)
     core.static_assert(dtype.is_standard_floating(), "dequantize dtype must be FP16, BF16, FP32, or FP64")
     core.static_assert(input.dtype.is_int8() or input.dtype.is_uint8() or input.dtype.is_fp8(),
                        "dequantize input must be INT8, UINT8, or FP8")
-    scale = _validate_quantization_scale(scale)
+    _validate_quantization_scale(scale)
 
     if input.dtype.is_fp8():
         if isinstance(zero_point, core.tensor):
