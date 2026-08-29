@@ -130,26 +130,12 @@ void init_triton_mctle_ir(py::module &&m) {
            });
 }
 
-void init_triton_mctle_passes(py::module &&m) {
-  ADD_PASS_WRAPPER_0("add_reject_dot_op", tle::createTritonTleRejectDotOp);
-  ADD_PASS_WRAPPER_0("add_early_assign_memory_space",
-                     tle::createTritonTleEarlyAssignMemorySpace);
-  ADD_PASS_WRAPPER_0("add_select_encodings",
-                     tle::createTritonTleSelectEncodings);
-  ADD_PASS_WRAPPER_0("add_assign_local_pointers_encoding",
-                     tle::createTritonTleSelectEncodings);
-  ADD_PASS_WRAPPER_0("add_insert_local_pointer_barriers",
-                     tle::createTritonTleInsertLocalPointerBarriers);
-  ADD_PASS_WRAPPER_0("add_lower_async_load",
-                     tle::createTritonTleLowerAsyncLoad);
-  ADD_PASS_WRAPPER_0("add_optimize_local_pointer_loads",
-                     tle::createTritonTleOptimizeLocalPointerLoads);
-  ADD_PASS_WRAPPER_0("add_optimize_local_pointer_stores",
-                     tle::createTritonTleOptimizeLocalPointerStores);
-  ADD_PASS_WRAPPER_0("add_lower_extract_tile",
-                     tle::createTritonTleLowerExtractTile);
-  ADD_PASS_WRAPPER_0("add_lower_insert_tile",
-                     tle::createTritonTleLowerInsertTile);
+void init_triton_mctle_passes(py::module &&) {
+  // The source plugin currently provides the MCTLE IR but no pass
+  // implementations.  Do not publish TableGen declarations as callable
+  // Python passes: doing so leaves libtriton with unresolved factories after a
+  // clean build.  The backend enables MCTLE only when every required pass is
+  // actually present.
 }
 
 void init_triton_mctle(py::module &&m) {

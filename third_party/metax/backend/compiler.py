@@ -7,7 +7,17 @@ except ImportError:
     enable_dist = False
 try:
     from triton._C.libtriton import mctle
-    enable_mctle = True
+    enable_mctle = all(
+        hasattr(mctle.passes, name)
+        for name in (
+            "add_reject_dot_op",
+            "add_early_assign_memory_space",
+            "add_select_encodings",
+            "add_insert_local_pointer_barriers",
+            "add_optimize_local_pointer_loads",
+            "add_optimize_local_pointer_stores",
+        )
+    )
 except ImportError:
     enable_mctle = False
 from triton import knobs
