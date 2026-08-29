@@ -728,6 +728,10 @@ class musa_knobs(base_knobs):
     # default-off, and Phase 3 MMA atomic rematerialization is unaffected.
     rlc_atomic_writeback_max_elements_per_thread_ratio: env_int = env_int(
         "FLAGTREE_MUSA_RLC_ATOMIC_WRITEBACK_MAX_ELEMS_PER_THREAD_RATIO", 1)
+    # MUSA scalar and vector int-to-fp paths are not bit-identical at every
+    # rounding boundary. Phase 2 must not change that per-thread vector width.
+    rlc_preserve_int_to_fp_contiguity: env_bool = env_bool(
+        "FLAGTREE_MUSA_RLC_PRESERVE_INT_TO_FP_CONTIGUITY", True)
 
 
 # flagtree ppu
