@@ -84,6 +84,18 @@ def _fp8e5m2_dot(lhs, rhs, out, OUTPUT_FP8: tl.constexpr):
 
 
 @triton.jit
+def _mixed_fp8_dot(lhs, rhs, out):
+    offsets_m = tl.arange(0, 16)
+    offsets_n = tl.arange(0, 16)
+    offsets_k = tl.arange(0, 32)
+    a = tl.load(lhs + offsets_m[:, None] * 32 + offsets_k[None, :])
+    b = tl.load(rhs + offsets_k[:, None] * 16 + offsets_n[None, :])
+    acc = tl.zeros((16, 16), dtype=tl.float32)
+    result = tl.dot(a, b, acc, out_dtype=tl.float32)
+    tl.store(out + offsets_m[:, None] * 16 + offsets_n[None, :], result)
+
+
+@triton.jit
 def _fp8e4m3_dot_illegal_k(lhs, rhs, out):
     offsets_m = tl.arange(0, 16)
     offsets_n = tl.arange(0, 16)
@@ -317,6 +329,57 @@ def test_ppu0010_fp16_to_fp8e5m2_rtne_exhaustive(device):
 
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
     assert _PPU_NATIVE_E5M2_CVT not in compiled.asm["llir"]
+    assert compiled.asm["hgbin"]
+
+
+@pytest.mark.parametrize(
+    "lhs_type,rhs_type",
+    [("fp8e4nv", "fp8e5"), ("fp8e5", "fp8e4nv")],
+)
+def test_ppu0010_mixed_ocp_fp8_dot_lowers_through_fp16_mma(lhs_type, rhs_type):
+    compiled = _compile_through_llir(
+        _mixed_fp8_dot,
+        {"lhs": f"*{lhs_type}", "rhs": f"*{rhs_type}", "out": "*fp32"},
+        constexprs={},
+    )
+
+    assert compiled.asm["ttgir"].count("tt.fp_to_fp") == 2
+    assert compiled.asm["llir"].count(_PPU0010_FP16_MMA) == 2
+    assert _PPU_NATIVE_E4M3_MMA not in compiled.asm["llir"]
+    assert _PPU_NATIVE_E5M2_MMA not in compiled.asm["llir"]
+
+
+@pytest.mark.parametrize("e4m3_on_lhs", [True, False])
+def test_ppu0010_mixed_ocp_fp8_dot_device(device, e4m3_on_lhs):
+    if not is_ppu():
+        pytest.skip("requires the PPU backend")
+
+    values = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+    e4m3_codes = torch.tensor([0xC0, 0xB8, 0x00, 0x38, 0x40], dtype=torch.uint8)
+    e5m2_codes = torch.tensor([0xC0, 0xBC, 0x00, 0x3C, 0x40], dtype=torch.uint8)
+    lhs_index = ((torch.arange(16 * 32) * 7 + 3) % len(values)).reshape(16, 32)
+    rhs_index = ((torch.arange(32 * 16) * 11 + 1) % len(values)).reshape(32, 16)
+    lhs_codes = e4m3_codes if e4m3_on_lhs else e5m2_codes
+    rhs_codes = e5m2_codes if e4m3_on_lhs else e4m3_codes
+    lhs_type = tl.float8e4nv if e4m3_on_lhs else tl.float8e5
+    rhs_type = tl.float8e5 if e4m3_on_lhs else tl.float8e4nv
+    lhs_raw = lhs_codes[lhs_index].to(device)
+    rhs_raw = rhs_codes[rhs_index].to(device)
+    output = torch.empty((16, 16), dtype=torch.float32, device=device)
+
+    compiled = _mixed_fp8_dot[(1, )](
+        triton.reinterpret(lhs_raw, lhs_type),
+        triton.reinterpret(rhs_raw, rhs_type),
+        output,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    expected = values[lhs_index] @ values[rhs_index]
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert compiled.asm["llir"].count(_PPU0010_FP16_MMA) == 2
+    assert _PPU_NATIVE_E4M3_MMA not in compiled.asm["llir"]
+    assert _PPU_NATIVE_E5M2_MMA not in compiled.asm["llir"]
     assert compiled.asm["hgbin"]
 
 
