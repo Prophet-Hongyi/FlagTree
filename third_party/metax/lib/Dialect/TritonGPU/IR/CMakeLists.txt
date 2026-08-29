@@ -16,3 +16,7 @@ add_triton_library(TritonGPUIR
   TritonIR
   TritonTools
 )
+
+if(BUILD_MCTLE)
+  add_dependencies(TritonGPUIR McTleTableGen)
+endif()

@@ -12,3 +12,7 @@ add_triton_library(TritonNvidiaGPUIR
   TritonIR
   TritonGPUIR
 )
+
+if(BUILD_MCTLE)
+  add_dependencies(TritonNvidiaGPUIR McTleTableGen)
+endif()
