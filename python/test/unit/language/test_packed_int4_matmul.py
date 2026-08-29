@@ -5,11 +5,10 @@ import triton
 import triton.language as tl
 
 
-BLOCK_M = 32
-BLOCK_N = 32
 PACKED_K = 32
 LOGICAL_K = 2 * PACKED_K
 INT4_SCALE = 0.25
+MATMUL_SHAPES = ((16, 32), (32, 16), (32, 32))
 
 
 @triton.jit
@@ -91,9 +90,9 @@ def _pack_adjacent_k_values(low, high):
     return low_bits | (high_bits << 4)
 
 
-def _make_inputs(signed):
-    lhs_values = torch.arange(BLOCK_M * LOGICAL_K, dtype=torch.int64).reshape(BLOCK_M, LOGICAL_K)
-    rhs_values = torch.arange(LOGICAL_K * BLOCK_N, dtype=torch.int64).reshape(LOGICAL_K, BLOCK_N)
+def _make_inputs(signed, block_m, block_n):
+    lhs_values = torch.arange(block_m * LOGICAL_K, dtype=torch.int64).reshape(block_m, LOGICAL_K)
+    rhs_values = torch.arange(LOGICAL_K * block_n, dtype=torch.int64).reshape(LOGICAL_K, block_n)
     if signed:
         lhs = (lhs_values % 16 - 8).to(torch.int8)
         rhs = ((rhs_values * 3 + 5) % 16 - 8).to(torch.int8)
@@ -103,13 +102,13 @@ def _make_inputs(signed):
     return lhs, rhs
 
 
-def _make_quantized_inputs(signed, logical_k):
+def _make_quantized_inputs(signed, logical_k, block_m, block_n):
     lhs_steps = (
-        (torch.arange(BLOCK_M * logical_k, dtype=torch.int64) * 7 + 3) % 41 - 20
-    ).reshape(BLOCK_M, logical_k)
+        (torch.arange(block_m * logical_k, dtype=torch.int64) * 7 + 3) % 41 - 20
+    ).reshape(block_m, logical_k)
     rhs_steps = (
-        (torch.arange(logical_k * BLOCK_N, dtype=torch.int64) * 11 + 5) % 51 - 15
-    ).reshape(logical_k, BLOCK_N)
+        (torch.arange(logical_k * block_n, dtype=torch.int64) * 11 + 5) % 51 - 15
+    ).reshape(logical_k, block_n)
     lhs = lhs_steps.to(torch.float32) * (INT4_SCALE / 2)
     rhs = rhs_steps.to(torch.float32) * (INT4_SCALE / 2)
     qmin, qmax = (-8, 7) if signed else (0, 15)
@@ -129,18 +128,19 @@ def _pad_high_k_nibble(values, axis):
 
 
 @pytest.mark.parametrize("signed", [True, False], ids=["int4", "uint4"])
-def test_packed_int4_storage_uses_explicit_int8_dot(device, signed):
-    lhs, rhs = _make_inputs(signed)
+@pytest.mark.parametrize("block_m,block_n", MATMUL_SHAPES, ids=["m16n32", "m32n16", "m32n32"])
+def test_packed_int4_storage_uses_explicit_int8_dot(device, signed, block_m, block_n):
+    lhs, rhs = _make_inputs(signed, block_m, block_n)
     lhs_packed = _pack_adjacent_k_values(lhs[:, 0::2], lhs[:, 1::2]).to(device)
     rhs_packed = _pack_adjacent_k_values(rhs[0::2, :], rhs[1::2, :]).to(device)
-    output = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.int32, device=device)
+    output = torch.empty((block_m, block_n), dtype=torch.int32, device=device)
 
     program = _packed_int4_dot_kernel[(1, )](
         lhs_packed,
         rhs_packed,
         output,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         PACKED_K=PACKED_K,
         SIGNED=signed,
     )
@@ -157,16 +157,19 @@ def test_packed_int4_storage_uses_explicit_int8_dot(device, signed):
 
 @pytest.mark.parametrize("signed", [True, False], ids=["int4", "uint4"])
 @pytest.mark.parametrize("logical_k", [2 * PACKED_K, 2 * PACKED_K - 1], ids=["even-k", "odd-k"])
-def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed, logical_k):
-    lhs, rhs, lhs_quantized, rhs_quantized = _make_quantized_inputs(signed, logical_k)
-    lhs_packed = torch.empty((BLOCK_M, PACKED_K), dtype=torch.uint8, device=device)
-    rhs_packed = torch.empty((PACKED_K, BLOCK_N), dtype=torch.uint8, device=device)
+@pytest.mark.parametrize("block_m,block_n", MATMUL_SHAPES, ids=["m16n32", "m32n16", "m32n32"])
+def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed, logical_k, block_m, block_n):
+    lhs, rhs, lhs_quantized, rhs_quantized = _make_quantized_inputs(
+        signed, logical_k, block_m, block_n
+    )
+    lhs_packed = torch.empty((block_m, PACKED_K), dtype=torch.uint8, device=device)
+    rhs_packed = torch.empty((PACKED_K, block_n), dtype=torch.uint8, device=device)
 
     lhs_pack_program = _quantize_pack_int4_kernel[(1, )](
         lhs.to(device),
         lhs_packed,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         PACKED_K=PACKED_K,
         LOGICAL_K=logical_k,
         SCALE=INT4_SCALE,
@@ -176,8 +179,8 @@ def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed, logical_k):
     rhs_pack_program = _quantize_pack_int4_kernel[(1, )](
         rhs.to(device),
         rhs_packed,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         PACKED_K=PACKED_K,
         LOGICAL_K=logical_k,
         SCALE=INT4_SCALE,
@@ -196,13 +199,13 @@ def test_quantize_pack_int4_storage_feeds_int8_dot(device, signed, logical_k):
     torch.testing.assert_close(lhs_packed.cpu(), expected_lhs_packed, rtol=0, atol=0)
     torch.testing.assert_close(rhs_packed.cpu(), expected_rhs_packed, rtol=0, atol=0)
 
-    output = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.int32, device=device)
+    output = torch.empty((block_m, block_n), dtype=torch.int32, device=device)
     dot_program = _packed_int4_dot_kernel[(1, )](
         lhs_packed,
         rhs_packed,
         output,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         PACKED_K=PACKED_K,
         SIGNED=signed,
     )
