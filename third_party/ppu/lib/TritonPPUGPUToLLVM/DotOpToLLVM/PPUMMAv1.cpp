@@ -393,15 +393,16 @@ static void callMmaV1(mlir::triton::ppu::TIXBuilder &builder, int b, int m,
                       unsigned numMmaRets, unsigned colsPerThread,
                       int numCPackedElem, unsigned batchOffset,
                       ValueTableV2 &ha, ValueTableV2 &hb,
-                      const SmallVector<Value> &fc, bool isAccF16,
-                      bool isIntMMA) {
+                      const SmallVector<Value> &fc, Value intMmaZero,
+                      bool isAccF16, bool isIntMMA) {
   auto retArgs =
       builder.newListOperand(numMmaRets, isIntMMA || isAccF16 ? "=r" : "=f");
   auto cArgs = builder.newListOperand();
   for (int i = 0; i < numMmaRets; ++i) {
+    auto fcIndex =
+        (m * colsPerThread + 4 * n) / numCPackedElem + i + batchOffset * b;
     cArgs->listAppend(builder.newOperand(
-        fc[(m * colsPerThread + 4 * n) / numCPackedElem + i + batchOffset * b],
-        std::to_string(i)));
+        isIntMMA ? intMmaZero : fc[fcIndex], std::to_string(i)));
     // reuse the output registers
   }
   auto aArgs = builder.newListOperand({
@@ -482,17 +483,26 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
     // using =r for float32 works but leads to less readable TIX.
     bool isIntMMA = dTensorTy.getElementType().isInteger(32);
     bool isAccF16 = dTensorTy.getElementType().isF16();
+    Value intMmaZero = tb.i32_val(0);
 
     callMmaV1(builder, b, m, n, k, mma, numMmaRets, colsPerThread,
-              numCPackedElem, batchOffset, ha, hb, fc, isAccF16, isIntMMA);
+              numCPackedElem, batchOffset, ha, hb, fc, intMmaZero, isAccF16,
+              isIntMMA);
 
     Value mmaOut =
         builder.launch(rewriter, loc, getMmaRetType(mmaType, op.getContext()));
 
     Type elemTy = cast<LLVM::LLVMStructType>(mmaOut.getType()).getBody()[0];
     for (int i = 0; i < numMmaRets; ++i) {
-      fc[(m * colsPerThread + 4 * n) / numCPackedElem + i + batchOffset * b] =
-          tb.extract_val(elemTy, mmaOut, i);
+      auto fcIndex =
+          (m * colsPerThread + 4 * n) / numCPackedElem + i + batchOffset * b;
+      Value mmaResult = tb.extract_val(elemTy, mmaOut, i);
+      // PPU integer MMA has satfinite accumulator semantics, while Triton
+      // integer dot accumulates modulo 2^32.  A single native K tile cannot
+      // overflow i32 with supported integer inputs, so compute it with a zero
+      // hardware accumulator and restore the previous accumulator through an
+      // ordinary wrapping LLVM add.
+      fc[fcIndex] = isIntMMA ? tb.add(fc[fcIndex], mmaResult) : mmaResult;
     }
   };
 
