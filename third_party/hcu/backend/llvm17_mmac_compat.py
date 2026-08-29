@@ -390,17 +390,22 @@ def bridge_gfx936_fp16_mmac_for_llvm17(
     """Map the gfx936 FP16 MMAC contract used by software FP8 dot.
 
     The DTK17 intrinsic has no LIT or LTS operands.  The bridge is equivalent
-    only when both controls are false and when packed inputs use the observed
-    i16-load overload. The output may retain the FP32 accumulator or use the
-    explicit quantized i8 epilogue.
+    only when both controls are false. Software FP8 dot may read packed input
+    lanes through the observed i16, i32, or v2i32 overloads. The output may
+    retain the FP32 accumulator or use the explicit quantized i8 epilogue.
     """
 
     source, buffer_stats = _bridge_buffer_contracts(
         source,
-        load_contracts={PTR_BUFFER_LOAD_I16: RAW_BUFFER_LOAD_I16},
+        load_contracts={
+            PTR_BUFFER_LOAD_I16: RAW_BUFFER_LOAD_I16,
+            PTR_BUFFER_LOAD_I32: RAW_BUFFER_LOAD_I32,
+            PTR_BUFFER_LOAD_V2I32: RAW_BUFFER_LOAD_V2I32,
+        },
         store_contracts={
             PTR_BUFFER_STORE_F32: RAW_BUFFER_STORE_F32,
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
+            PTR_BUFFER_STORE_V4F32: RAW_BUFFER_STORE_V4F32,
         },
         label="FP16 MMAC",
     )
