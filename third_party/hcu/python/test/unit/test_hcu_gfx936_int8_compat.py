@@ -6,13 +6,17 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     NEW_INT8_MMAC,
     PTR_BUFFER_LOAD_I16,
     PTR_BUFFER_LOAD_I32,
+    PTR_BUFFER_LOAD_V4I32,
     PTR_BUFFER_STORE_I8,
     PTR_BUFFER_STORE_I32,
+    PTR_BUFFER_STORE_V4F32,
     PTR_BUFFER_STORE_V4I32,
     RAW_BUFFER_LOAD_I16,
     RAW_BUFFER_LOAD_I32,
+    RAW_BUFFER_LOAD_V4I32,
     RAW_BUFFER_STORE_I8,
     RAW_BUFFER_STORE_I32,
+    RAW_BUFFER_STORE_V4F32,
     RAW_BUFFER_STORE_V4I32,
     LLVM17Int8MmacBridgeError,
     bridge_gfx936_int8_mmac_for_llvm17,
@@ -34,8 +38,13 @@ def _int8_mmac_module(lit="false", clamp="false", lts="false"):
 
 
 def _int8_dot_module(
-    stride=0, load_type="i16", store_type="i32", store_ir_type=None
+    stride=0,
+    load_type="i16",
+    load_ir_type=None,
+    store_type="i32",
+    store_ir_type=None,
 ):
+    load_ir_type = load_ir_type or load_type
     store_ir_type = store_ir_type or store_type
     store_value = "zeroinitializer" if store_ir_type.startswith("<") else "0"
     return (
@@ -44,7 +53,7 @@ def _int8_dot_module(
         "entry:\n"
         f"  %input.rsrc = tail call ptr addrspace(8) @{MAKE_BUFFER_RSRC}"
         f"(ptr addrspace(1) %input, i16 {stride}, i32 2147483646, i32 159744)\n"
-        f"  %value = tail call {load_type} "
+        f"  %value = tail call {load_ir_type} "
         f"@llvm.amdgcn.raw.ptr.buffer.load.{load_type}"
         f"(ptr addrspace(8) %input.rsrc, i32 0, i32 0, i32 0)\n"
         f"  %result = tail call <4 x i32> @{NEW_INT8_MMAC}"
@@ -59,7 +68,7 @@ def _int8_dot_module(
         "}\n\n"
         f"declare ptr addrspace(8) @{MAKE_BUFFER_RSRC}"
         "(ptr addrspace(1) readnone, i16, i32, i32)\n"
-        f"declare {load_type} @llvm.amdgcn.raw.ptr.buffer.load.{load_type}"
+        f"declare {load_ir_type} @llvm.amdgcn.raw.ptr.buffer.load.{load_type}"
         "(ptr addrspace(8) readonly nocapture, i32, i32, i32 immarg)\n"
         f"declare void @llvm.amdgcn.raw.ptr.buffer.store.{store_type}"
         f"({store_ir_type}, ptr addrspace(8) writeonly nocapture, "
@@ -80,22 +89,25 @@ def test_gfx936_llvm17_int8_mmac_bridge_preserves_legacy_contract():
 
 
 @pytest.mark.parametrize(
-    ("load_type", "pointer_load", "raw_load"),
+    ("load_type", "load_ir_type", "pointer_load", "raw_load"),
     [
-        ("i16", PTR_BUFFER_LOAD_I16, RAW_BUFFER_LOAD_I16),
-        ("i32", PTR_BUFFER_LOAD_I32, RAW_BUFFER_LOAD_I32),
+        ("i16", "i16", PTR_BUFFER_LOAD_I16, RAW_BUFFER_LOAD_I16),
+        ("i32", "i32", PTR_BUFFER_LOAD_I32, RAW_BUFFER_LOAD_I32),
+        ("v4i32", "<4 x i32>", PTR_BUFFER_LOAD_V4I32, RAW_BUFFER_LOAD_V4I32),
     ],
 )
 @pytest.mark.parametrize(
     ("store_type", "store_ir_type", "pointer_store", "raw_store"),
     [
         ("i32", "i32", PTR_BUFFER_STORE_I32, RAW_BUFFER_STORE_I32),
+        ("v4f32", "<4 x float>", PTR_BUFFER_STORE_V4F32, RAW_BUFFER_STORE_V4F32),
         ("v4i32", "<4 x i32>", PTR_BUFFER_STORE_V4I32, RAW_BUFFER_STORE_V4I32),
         ("i8", "i8", PTR_BUFFER_STORE_I8, RAW_BUFFER_STORE_I8),
     ],
 )
 def test_gfx936_llvm17_int8_dot_bridge_rewrites_observed_buffer_contracts(
     load_type,
+    load_ir_type,
     pointer_load,
     raw_load,
     store_type,
@@ -106,6 +118,7 @@ def test_gfx936_llvm17_int8_dot_bridge_rewrites_observed_buffer_contracts(
     bridged, stats = bridge_gfx936_int8_mmac_for_llvm17(
         _int8_dot_module(
             load_type=load_type,
+            load_ir_type=load_ir_type,
             store_type=store_type,
             store_ir_type=store_ir_type,
         )

@@ -38,6 +38,8 @@ PTR_BUFFER_LOAD_F32 = "llvm.amdgcn.raw.ptr.buffer.load.f32"
 RAW_BUFFER_LOAD_F32 = "llvm.amdgcn.raw.buffer.load.f32"
 PTR_BUFFER_LOAD_V4F32 = "llvm.amdgcn.raw.ptr.buffer.load.v4f32"
 RAW_BUFFER_LOAD_V4F32 = "llvm.amdgcn.raw.buffer.load.v4f32"
+PTR_BUFFER_LOAD_V4I32 = "llvm.amdgcn.raw.ptr.buffer.load.v4i32"
+RAW_BUFFER_LOAD_V4I32 = "llvm.amdgcn.raw.buffer.load.v4i32"
 PTR_BUFFER_STORE_I32 = "llvm.amdgcn.raw.ptr.buffer.store.i32"
 RAW_BUFFER_STORE_I32 = "llvm.amdgcn.raw.buffer.store.i32"
 PTR_BUFFER_STORE_V4I32 = "llvm.amdgcn.raw.ptr.buffer.store.v4i32"
@@ -46,6 +48,8 @@ PTR_BUFFER_STORE_I8 = "llvm.amdgcn.raw.ptr.buffer.store.i8"
 RAW_BUFFER_STORE_I8 = "llvm.amdgcn.raw.buffer.store.i8"
 PTR_BUFFER_STORE_F32 = "llvm.amdgcn.raw.ptr.buffer.store.f32"
 RAW_BUFFER_STORE_F32 = "llvm.amdgcn.raw.buffer.store.f32"
+PTR_BUFFER_STORE_V4F32 = "llvm.amdgcn.raw.ptr.buffer.store.v4f32"
+RAW_BUFFER_STORE_V4F32 = "llvm.amdgcn.raw.buffer.store.v4f32"
 
 # Compatibility names retained for the signed INT8 unit tests and callers.
 LLVM17Int8MmacBridgeError = LLVM17MmacBridgeError
@@ -243,8 +247,10 @@ def bridge_gfx936_buffer_contracts_for_llvm17(
         source,
         load_contracts={
             PTR_BUFFER_LOAD_I8: RAW_BUFFER_LOAD_I8,
+            PTR_BUFFER_LOAD_I32: RAW_BUFFER_LOAD_I32,
             PTR_BUFFER_LOAD_F32: RAW_BUFFER_LOAD_F32,
             PTR_BUFFER_LOAD_V4F32: RAW_BUFFER_LOAD_V4F32,
+            PTR_BUFFER_LOAD_V4I32: RAW_BUFFER_LOAD_V4I32,
         },
         store_contracts={
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
@@ -271,11 +277,13 @@ def bridge_gfx936_int8_mmac_for_llvm17(
         load_contracts={
             PTR_BUFFER_LOAD_I16: RAW_BUFFER_LOAD_I16,
             PTR_BUFFER_LOAD_I32: RAW_BUFFER_LOAD_I32,
+            PTR_BUFFER_LOAD_V4I32: RAW_BUFFER_LOAD_V4I32,
         },
         store_contracts={
             PTR_BUFFER_STORE_I32: RAW_BUFFER_STORE_I32,
             PTR_BUFFER_STORE_V4I32: RAW_BUFFER_STORE_V4I32,
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
+            PTR_BUFFER_STORE_V4F32: RAW_BUFFER_STORE_V4F32,
         },
         label="signed INT8",
     )
