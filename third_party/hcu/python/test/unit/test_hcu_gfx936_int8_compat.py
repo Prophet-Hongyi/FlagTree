@@ -4,18 +4,22 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     LEGACY_INT8_MMAC,
     MAKE_BUFFER_RSRC,
     NEW_INT8_MMAC,
+    PTR_BUFFER_LOAD_I8,
     PTR_BUFFER_LOAD_I16,
     PTR_BUFFER_LOAD_I32,
     PTR_BUFFER_LOAD_V2I32,
     PTR_BUFFER_LOAD_V4I32,
+    PTR_BUFFER_STORE_I16,
     PTR_BUFFER_STORE_I8,
     PTR_BUFFER_STORE_I32,
     PTR_BUFFER_STORE_V4F32,
     PTR_BUFFER_STORE_V4I32,
     RAW_BUFFER_LOAD_I16,
+    RAW_BUFFER_LOAD_I8,
     RAW_BUFFER_LOAD_I32,
     RAW_BUFFER_LOAD_V2I32,
     RAW_BUFFER_LOAD_V4I32,
+    RAW_BUFFER_STORE_I16,
     RAW_BUFFER_STORE_I8,
     RAW_BUFFER_STORE_I32,
     RAW_BUFFER_STORE_V4F32,
@@ -93,6 +97,7 @@ def test_gfx936_llvm17_int8_mmac_bridge_preserves_legacy_contract():
 @pytest.mark.parametrize(
     ("load_type", "load_ir_type", "pointer_load", "raw_load"),
     [
+        ("i8", "i8", PTR_BUFFER_LOAD_I8, RAW_BUFFER_LOAD_I8),
         ("i16", "i16", PTR_BUFFER_LOAD_I16, RAW_BUFFER_LOAD_I16),
         ("i32", "i32", PTR_BUFFER_LOAD_I32, RAW_BUFFER_LOAD_I32),
         ("v2i32", "<2 x i32>", PTR_BUFFER_LOAD_V2I32, RAW_BUFFER_LOAD_V2I32),
@@ -102,6 +107,7 @@ def test_gfx936_llvm17_int8_mmac_bridge_preserves_legacy_contract():
 @pytest.mark.parametrize(
     ("store_type", "store_ir_type", "pointer_store", "raw_store"),
     [
+        ("i16", "i16", PTR_BUFFER_STORE_I16, RAW_BUFFER_STORE_I16),
         ("i32", "i32", PTR_BUFFER_STORE_I32, RAW_BUFFER_STORE_I32),
         ("v4f32", "<4 x float>", PTR_BUFFER_STORE_V4F32, RAW_BUFFER_STORE_V4F32),
         ("v4i32", "<4 x i32>", PTR_BUFFER_STORE_V4I32, RAW_BUFFER_STORE_V4I32),
@@ -155,7 +161,7 @@ def test_gfx936_llvm17_int8_mmac_bridge_rejects_unknown_contract():
         bridge_gfx936_int8_mmac_for_llvm17(source)
 
 
-@pytest.mark.parametrize("load_type, store_type", [("i8", "i32"), ("i16", "i16")])
+@pytest.mark.parametrize("load_type, store_type", [("i64", "i32"), ("i16", "i64")])
 def test_gfx936_llvm17_int8_dot_bridge_rejects_unknown_buffer_overload(
     load_type, store_type
 ):

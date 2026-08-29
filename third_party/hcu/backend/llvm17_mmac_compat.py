@@ -42,6 +42,8 @@ PTR_BUFFER_LOAD_V4F32 = "llvm.amdgcn.raw.ptr.buffer.load.v4f32"
 RAW_BUFFER_LOAD_V4F32 = "llvm.amdgcn.raw.buffer.load.v4f32"
 PTR_BUFFER_LOAD_V4I32 = "llvm.amdgcn.raw.ptr.buffer.load.v4i32"
 RAW_BUFFER_LOAD_V4I32 = "llvm.amdgcn.raw.buffer.load.v4i32"
+PTR_BUFFER_STORE_I16 = "llvm.amdgcn.raw.ptr.buffer.store.i16"
+RAW_BUFFER_STORE_I16 = "llvm.amdgcn.raw.buffer.store.i16"
 PTR_BUFFER_STORE_I32 = "llvm.amdgcn.raw.ptr.buffer.store.i32"
 RAW_BUFFER_STORE_I32 = "llvm.amdgcn.raw.buffer.store.i32"
 PTR_BUFFER_STORE_V2I32 = "llvm.amdgcn.raw.ptr.buffer.store.v2i32"
@@ -280,12 +282,14 @@ def bridge_gfx936_int8_mmac_for_llvm17(
     source, buffer_stats = _bridge_buffer_contracts(
         source,
         load_contracts={
+            PTR_BUFFER_LOAD_I8: RAW_BUFFER_LOAD_I8,
             PTR_BUFFER_LOAD_I16: RAW_BUFFER_LOAD_I16,
             PTR_BUFFER_LOAD_I32: RAW_BUFFER_LOAD_I32,
             PTR_BUFFER_LOAD_V2I32: RAW_BUFFER_LOAD_V2I32,
             PTR_BUFFER_LOAD_V4I32: RAW_BUFFER_LOAD_V4I32,
         },
         store_contracts={
+            PTR_BUFFER_STORE_I16: RAW_BUFFER_STORE_I16,
             PTR_BUFFER_STORE_I32: RAW_BUFFER_STORE_I32,
             PTR_BUFFER_STORE_V4I32: RAW_BUFFER_STORE_V4I32,
             PTR_BUFFER_STORE_I8: RAW_BUFFER_STORE_I8,
