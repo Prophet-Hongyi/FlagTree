@@ -1070,11 +1070,39 @@ struct FpToFpOpConversion
   Fp32ToFp8E5M2RTZ(Location loc, ConversionPatternRewriter &rewriter,
                    const SmallVector<Value> &v, triton::FpToFpOp op) {
     assert(v.size() == 2);
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     SmallVector<Value> ret(2);
-    ret[0] = convertFp32DowncastCommon(loc, rewriter, v[0], RoundingMode::RTZ,
-                                       5, 2, 15);
-    ret[1] = convertFp32DowncastCommon(loc, rewriter, v[1], RoundingMode::RTZ,
-                                       5, 2, 15);
+    for (size_t i = 0; i < ret.size(); ++i) {
+      Value finiteResult = convertFp32DowncastCommon(
+          loc, rewriter, v[i], RoundingMode::RTZ, 5, 2, 15);
+
+      // The common integer downcast implements finite RTZ values.  Detect the
+      // FP32 all-ones exponent before that arithmetic and restore the E5M2
+      // infinity/NaN category.  Payload and NaN sign are intentionally not an
+      // ABI guarantee, but preserving the source sign is deterministic here.
+      Value srcBits = b.bitcast(v[i], i32_ty);
+      Value absBits = b.and_(srcBits, b.i32_val(0x7fffffff));
+      Value topByte = b.trunc(i8_ty, b.lshr(srcBits, b.i32_val(24)));
+      Value sign = b.and_(topByte, b.i8_val(0x80));
+
+      // RTZ finite overflow saturates at E5M2 max finite.  This matters for a
+      // BF16 carrier: 65504 is represented as 65536 before the FP8 cast, and
+      // the common converter otherwise produces infinity.
+      Value absValue = b.bitcast(absBits, f32_ty);
+      Value isFiniteOverflow =
+          b.fcmp_ogt(absValue, b.f32_val(57344.0f));
+      Value maxFinite = b.or_(sign, b.i8_val(0x7b));
+      finiteResult = b.select(isFiniteOverflow, maxFinite, finiteResult);
+
+      Value exponent = b.and_(absBits, b.i32_val(0x7f800000));
+      Value isSpecial = b.icmp_eq(exponent, b.i32_val(0x7f800000));
+      Value mantissa = b.and_(absBits, b.i32_val(0x007fffff));
+      Value isNaN = b.icmp_ne(mantissa, b.i32_val(0));
+      Value specialMagnitude =
+          b.select(isNaN, b.i8_val(0x7f), b.i8_val(0x7c));
+      Value specialResult = b.or_(sign, specialMagnitude);
+      ret[i] = b.select(isSpecial, specialResult, finiteResult);
+    }
     return ret;
   }
 
