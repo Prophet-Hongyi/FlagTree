@@ -49,6 +49,42 @@ _E4M3FN_RTZ_BYTES = [
     0x7E,
     0x29,
 ]
+_E4M3FN_RTZ_SPECIAL_INPUT = [
+    float("-nan"),
+    -float("inf"),
+    -65504.0,
+    -500.0,
+    -448.0,
+    -1.0,
+    -(2**-10),
+    -0.0,
+    0.0,
+    2**-10,
+    1.0,
+    448.0,
+    500.0,
+    65504.0,
+    float("inf"),
+    float("nan"),
+]
+_E4M3FN_RTZ_SPECIAL_BYTES = [
+    None,
+    0xFE,
+    0xFE,
+    0xFE,
+    0xFE,
+    0xB8,
+    0x80,
+    0x80,
+    0x00,
+    0x00,
+    0x38,
+    0x7E,
+    0x7E,
+    0x7E,
+    0x7E,
+    None,
+]
 
 
 @triton.jit
@@ -160,6 +196,10 @@ def _carrier_dtype(carrier):
     raise AssertionError(f"unhandled carrier dtype: {carrier}")
 
 
+def _is_e4m3fn_nan(byte):
+    return byte & 0x7F == 0x7F
+
+
 def _require_ph1():
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")
@@ -260,6 +300,36 @@ def test_ph1_e4m3fn_rtz_quantize_uses_software_correction(carrier):
 
     expected = torch.tensor(_E4M3FN_RTZ_BYTES * 2, dtype=torch.uint8)
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert "rounding = rtz" in compiled.asm["ttir"]
+    assert "llvm.musa.f2e4m3.rn" in compiled.asm["llir"]
+    assert "llvm.musa.e4m32f16.rn" in compiled.asm["llir"]
+    assert "fcmp ogt" in compiled.asm["llir"]
+    assert compiled.asm["mubin"]
+
+
+@pytest.mark.parametrize("carrier", ["fp16", "bf16", "fp32"])
+def test_ph1_e4m3fn_rtz_preserves_special_value_categories(carrier):
+    _require_ph1()
+
+    values = torch.tensor(
+        _E4M3FN_RTZ_SPECIAL_INPUT * 2,
+        dtype=_carrier_dtype(carrier),
+        device="musa",
+    )
+    output = torch.empty(32, dtype=torch.uint8, device="musa")
+    compiled = _e4m3fn_rtz_quantize_kernel[(1, )](
+        values,
+        triton.reinterpret(output, tl.float8e4nv),
+        BLOCK_SIZE=32,
+        num_warps=4,
+    )
+    torch.musa.synchronize()
+
+    for expected, byte in zip(_E4M3FN_RTZ_SPECIAL_BYTES * 2, output.cpu().tolist()):
+        if expected is None:
+            assert _is_e4m3fn_nan(byte), (carrier, byte)
+        else:
+            assert byte == expected, (carrier, expected, byte)
     assert "rounding = rtz" in compiled.asm["ttir"]
     assert "llvm.musa.f2e4m3.rn" in compiled.asm["llir"]
     assert "llvm.musa.e4m32f16.rn" in compiled.asm["llir"]
