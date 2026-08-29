@@ -5,10 +5,9 @@ import triton
 import triton.language as tl
 
 
-BLOCK_M = 32
-BLOCK_N = 32
 GROUPS = 2
 GROUP_K = 32
+MATMUL_SHAPES = ((16, 32), (32, 16), (32, 32))
 
 
 @triton.jit
@@ -23,6 +22,7 @@ def _int8_storage_io_matmul_kernel(
     BLOCK_N: tl.constexpr,
     GROUPS: tl.constexpr,
     GROUP_K: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
     OUTPUT_ZERO_POINT: tl.constexpr,
 ):
     rows = tl.arange(0, BLOCK_M)
@@ -46,40 +46,61 @@ def _int8_storage_io_matmul_kernel(
     quantized = tl.quantize(
         output,
         output_scale,
-        dtype=tl.int8,
+        dtype=OUTPUT_DTYPE,
         zero_point=OUTPUT_ZERO_POINT,
         rounding="rtne",
     )
     tl.store(output_ptr + rows[:, None] * BLOCK_N + columns[None, :], quantized)
 
 
-def _make_inputs():
-    lhs = (
-        (torch.arange(BLOCK_M * GROUPS * GROUP_K, dtype=torch.int64) * 7 + 3) % 9
-        - 4
-    ).reshape(BLOCK_M, GROUPS, GROUP_K).to(torch.int8)
-    rhs = (
-        (torch.arange(GROUPS * GROUP_K * BLOCK_N, dtype=torch.int64) * 11 + 5) % 11
-        - 5
-    ).reshape(GROUPS, GROUP_K, BLOCK_N).to(torch.int8)
+def _make_inputs(block_m, block_n):
+    rows = torch.arange(block_m, dtype=torch.int64)[:, None, None]
+    groups = torch.arange(GROUPS, dtype=torch.int64)[None, :, None]
+    reduction = torch.arange(GROUP_K, dtype=torch.int64)[None, None, :]
+    lhs = ((rows * 3 + groups * 5 + reduction * 7) % 9 - 4).to(torch.int8)
+
+    groups = torch.arange(GROUPS, dtype=torch.int64)[:, None, None]
+    reduction = torch.arange(GROUP_K, dtype=torch.int64)[None, :, None]
+    columns = torch.arange(block_n, dtype=torch.int64)[None, None, :]
+    rhs = ((groups * 2 + reduction * 5 + columns * 3) % 11 - 5).to(torch.int8)
     lhs_scale = torch.tensor(
         [[0.125, 0.5], [0.25, 1.0], [0.5, 0.125], [1.0, 0.25]],
         dtype=torch.float32,
-    ).repeat(BLOCK_M // 4, 1)
+    ).repeat(block_m // 4, 1)
     rhs_scale = torch.tensor(
         [[0.25, 1.0], [0.5, 2.0], [1.0, 0.25], [2.0, 0.5]],
         dtype=torch.float32,
-    ).repeat(BLOCK_N // 4, 1)
-    output_scale = torch.tensor([3.0, 5.0, 7.0, 9.0], dtype=torch.float32).repeat(
-        BLOCK_M // 4
+    ).repeat(block_n // 4, 1)
+    output_scale = torch.tensor([0.25, 0.5, 1.0, 2.0], dtype=torch.float32).repeat(
+        block_m // 4
     )
     return lhs, rhs, lhs_scale, rhs_scale, output_scale
 
 
-@pytest.mark.parametrize("output_zero_point", [0, -7], ids=["symmetric", "affine"])
-def test_int8_storage_input_output_matmul(device, output_zero_point):
-    lhs, rhs, lhs_scale, rhs_scale, output_scale = _make_inputs()
-    output = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.int8, device=device)
+@pytest.mark.parametrize(
+    "output_dtype,torch_dtype,output_zero_point,qmin,qmax",
+    [
+        (tl.int8, torch.int8, 0, -128, 127),
+        (tl.int8, torch.int8, -7, -128, 127),
+        (tl.uint8, torch.uint8, 113, 0, 255),
+    ],
+    ids=["int8-symmetric", "int8-affine", "uint8-affine"],
+)
+@pytest.mark.parametrize(
+    "block_m,block_n", MATMUL_SHAPES, ids=["m16n32", "m32n16", "m32n32"]
+)
+def test_int8_storage_input_output_matmul(
+    device,
+    block_m,
+    block_n,
+    output_dtype,
+    torch_dtype,
+    output_zero_point,
+    qmin,
+    qmax,
+):
+    lhs, rhs, lhs_scale, rhs_scale, output_scale = _make_inputs(block_m, block_n)
+    output = torch.empty((block_m, block_n), dtype=torch_dtype, device=device)
 
     program = _int8_storage_io_matmul_kernel[(1, )](
         lhs.to(device),
@@ -88,14 +109,15 @@ def test_int8_storage_input_output_matmul(device, output_zero_point):
         rhs_scale.to(device),
         output_scale.to(device),
         output,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         GROUPS=GROUPS,
         GROUP_K=GROUP_K,
+        OUTPUT_DTYPE=output_dtype,
         OUTPUT_ZERO_POINT=output_zero_point,
     )
 
-    expected = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float32)
+    expected = torch.zeros((block_m, block_n), dtype=torch.float32)
     for group in range(GROUPS):
         group_accumulator = torch.from_numpy(
             np.matmul(
@@ -110,9 +132,14 @@ def test_int8_storage_input_output_matmul(device, output_zero_point):
         )
     expected = (
         torch.round(expected / output_scale[:, None]) + output_zero_point
-    ).clamp(-128, 127).to(torch.int8)
+    ).clamp(qmin, qmax).to(torch_dtype)
 
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    # The oracle must exercise both saturation directions and non-saturated
+    # values; otherwise an all-zero dot can make the epilogue look correct.
+    assert int(expected.min()) == qmin
+    assert int(expected.max()) == qmax
+    assert torch.any((expected > qmin) & (expected < qmax))
     assert program.asm["ttir"].count("tt.dot") == GROUPS
     assert "xi8" in program.asm["ttir"]
     assert "xi32" in program.asm["ttir"]
