@@ -200,7 +200,24 @@ def test_explicit_affine_dequantize_widens_before_subtraction(device, input_dtyp
 
 def test_quantize_dequantize_accepts_static_parameters(device):
     input = torch.tensor(
-        [-100.0, -2.0, -1.25, -0.5, -0.25, 0.0, 0.25, 0.5, 1.25, 2.0, 100.0, math.nan],
+        [
+            -127.5,
+            -100.0,
+            -2.0,
+            -1.25,
+            -0.75,
+            -0.5,
+            -0.25,
+            0.0,
+            0.25,
+            0.5,
+            0.75,
+            1.25,
+            2.0,
+            100.0,
+            127.5,
+            math.nan,
+        ],
         dtype=torch.float32,
         device=device,
     )
