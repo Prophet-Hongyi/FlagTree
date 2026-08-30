@@ -26,6 +26,7 @@ import pytest
 
 from low_precision_reference import (
     E4M3FN,
+    E4M3FNUZ,
     E5M2,
     decode_fp8,
     dequantize_affine,
@@ -47,6 +48,12 @@ from low_precision_reference import (
         (E4M3FN, 0x38, 1.0),
         (E4M3FN, 0x7E, 448.0),
         (E4M3FN, 0xFE, -448.0),
+        (E4M3FNUZ, 0x00, 0.0),
+        (E4M3FNUZ, 0x01, 2**-10),
+        (E4M3FNUZ, 0x08, 2**-7),
+        (E4M3FNUZ, 0x40, 1.0),
+        (E4M3FNUZ, 0x7F, 240.0),
+        (E4M3FNUZ, 0xFF, -240.0),
         (E5M2, 0x01, 2**-16),
         (E5M2, 0x04, 2**-14),
         (E5M2, 0x3C, 1.0),
@@ -63,16 +70,21 @@ def test_decode_fp8_known_encodings(fmt, code, expected):
         assert math.copysign(1.0, actual) == math.copysign(1.0, expected)
 
 
-@pytest.mark.parametrize("fmt, code", [(E4M3FN, 0x7F), (E4M3FN, 0xFF), (E5M2, 0x7D), (E5M2, 0xFF)])
+@pytest.mark.parametrize(
+    "fmt, code",
+    [(E4M3FN, 0x7F), (E4M3FN, 0xFF), (E4M3FNUZ, 0x80), (E5M2, 0x7D), (E5M2, 0xFF)],
+)
 def test_decode_fp8_nan_encodings(fmt, code):
     assert math.isnan(decode_fp8(code, fmt))
 
 
-@pytest.mark.parametrize("fmt", [E4M3FN, E5M2])
+@pytest.mark.parametrize("fmt", [E4M3FN, E4M3FNUZ, E5M2])
 def test_all_finite_encodings_roundtrip(fmt):
     for magnitude in range(fmt.max_finite_code + 1):
         for sign in (0x00, 0x80):
             code = sign | magnitude
+            if fmt.unsigned_zero and code == fmt.canonical_nan_code:
+                continue
             assert encode_fp8_rtne(decode_fp8(code, fmt), fmt) == code
             assert encode_fp8_rtz(decode_fp8(code, fmt), fmt) == code
 
@@ -86,6 +98,10 @@ def test_all_finite_encodings_roundtrip(fmt):
         (E4M3FN, 3 * 2**-10, 0x02),
         (E4M3FN, 5 * 2**-10, 0x02),
         (E4M3FN, 7 * 2**-10, 0x04),
+        (E4M3FNUZ, 2**-11, 0x00),
+        (E4M3FNUZ, 3 * 2**-11, 0x02),
+        (E4M3FNUZ, 5 * 2**-11, 0x02),
+        (E4M3FNUZ, 7 * 2**-11, 0x04),
         (E5M2, 2**-17, 0x00),
         (E5M2, 3 * 2**-17, 0x02),
         (E5M2, 5 * 2**-17, 0x02),
@@ -93,11 +109,13 @@ def test_all_finite_encodings_roundtrip(fmt):
         # E4M3FN top-bin ties exercise the finite-only exponent encoding.
         (E4M3FN, 400.0, 0x7C),
         (E4M3FN, 432.0, 0x7E),
+        (E4M3FNUZ, 232.0, 0x7E),
     ],
 )
 def test_encode_fp8_rtne_ties(fmt, value, expected):
     assert encode_fp8_rtne(value, fmt) == expected
-    assert encode_fp8_rtne(-value, fmt) == (expected | 0x80)
+    expected_negative = 0 if fmt.unsigned_zero and expected == 0 else expected | 0x80
+    assert encode_fp8_rtne(-value, fmt) == expected_negative
 
 
 @pytest.mark.parametrize(
@@ -111,10 +129,21 @@ def test_encode_fp8_rtne_ties(fmt, value, expected):
         (E4M3FN, math.copysign(math.nan, -1.0), 0xFF),
         (E5M2, math.nan, 0x7F),
         (E5M2, math.copysign(math.nan, -1.0), 0xFF),
+        (E4M3FNUZ, 241.0, 0x7F),
+        (E4M3FNUZ, -241.0, 0xFF),
+        (E4M3FNUZ, math.inf, 0x80),
+        (E4M3FNUZ, -math.inf, 0x80),
+        (E4M3FNUZ, math.nan, 0x80),
+        (E4M3FNUZ, math.copysign(math.nan, -1.0), 0x80),
     ],
 )
 def test_encode_fp8_saturation_and_nan(fmt, value, expected):
     assert encode_fp8_rtne(value, fmt) == expected
+
+
+def test_encode_e4m3fnuz_has_one_unsigned_zero():
+    assert encode_fp8_rtne(0.0, E4M3FNUZ) == 0x00
+    assert encode_fp8_rtne(-0.0, E4M3FNUZ) == 0x00
 
 
 @pytest.mark.parametrize(

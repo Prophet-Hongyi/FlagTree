@@ -41,6 +41,7 @@ class Float8Format:
     finite_only: bool
     max_finite_code: int
     canonical_nan_code: int
+    unsigned_zero: bool = False
 
 
 E4M3FN = Float8Format(
@@ -63,6 +64,17 @@ E5M2 = Float8Format(
     canonical_nan_code=0x7F,
 )
 
+E4M3FNUZ = Float8Format(
+    name="e4m3fnuz",
+    exponent_bits=4,
+    mantissa_bits=3,
+    exponent_bias=8,
+    finite_only=True,
+    max_finite_code=0x7F,
+    canonical_nan_code=0x80,
+    unsigned_zero=True,
+)
+
 
 def _validate_byte(value: int) -> int:
     value = int(value)
@@ -75,6 +87,9 @@ def decode_fp8(value: int, fmt: Float8Format) -> float:
     """Decode one physical FP8 byte according to ``fmt``."""
 
     value = _validate_byte(value)
+    if fmt.unsigned_zero and value == fmt.canonical_nan_code:
+        return math.nan
+
     sign = -1.0 if value & 0x80 else 1.0
     magnitude = value & 0x7F
     mantissa_mask = (1 << fmt.mantissa_bits) - 1
@@ -84,7 +99,7 @@ def decode_fp8(value: int, fmt: Float8Format) -> float:
 
     if exponent == exponent_mask:
         if fmt.finite_only:
-            if mantissa == mantissa_mask:
+            if not fmt.unsigned_zero and mantissa == mantissa_mask:
                 return math.copysign(math.nan, sign)
         elif mantissa == 0:
             return math.copysign(math.inf, sign)
@@ -110,22 +125,27 @@ def _positive_finite_values(fmt: Float8Format) -> tuple[float, ...]:
 def encode_fp8_rtne(value: float, fmt: Float8Format) -> int:
     """Encode with round-to-nearest-even and saturating overflow.
 
-    This matches the software contract used by AMD's generic FP8 downcast:
-    finite overflow and infinities clamp to the largest finite value, NaNs are
-    canonicalized, and signed zero is preserved.
+    This matches the software contract used by AMD's generic FP8 downcast.
+    OCP formats preserve signed zero and saturate infinity.  FNUZ has one
+    unsigned zero and maps NaN or infinity to its sole NaN encoding; finite
+    overflow still saturates to the largest finite value.
     """
 
     value = float(value)
     sign = 0x80 if math.copysign(1.0, value) < 0 else 0
     if math.isnan(value):
-        return sign | fmt.canonical_nan_code
+        return fmt.canonical_nan_code if fmt.unsigned_zero else sign | fmt.canonical_nan_code
 
     magnitude = abs(value)
     if magnitude == 0.0:
-        return sign
+        return 0 if fmt.unsigned_zero else sign
+    if math.isinf(magnitude):
+        if fmt.unsigned_zero:
+            return fmt.canonical_nan_code
+        return sign | fmt.max_finite_code
 
     candidates = _positive_finite_values(fmt)
-    if math.isinf(magnitude) or magnitude >= candidates[-1]:
+    if magnitude >= candidates[-1]:
         return sign | fmt.max_finite_code
 
     upper = bisect_left(candidates, magnitude)
@@ -146,6 +166,8 @@ def encode_fp8_rtne(value: float, fmt: Float8Format) -> int:
             # midpoint, the encoding whose retained significand LSB is zero is
             # the round-to-nearest-even result.
             code = lower if lower % 2 == 0 else upper
+    if fmt.unsigned_zero and code == 0:
+        return 0
     return sign | code
 
 
@@ -164,12 +186,14 @@ def encode_fp8_rtz(value: float, fmt: Float8Format) -> int:
     value = float(value)
     sign = 0x80 if math.copysign(1.0, value) < 0 else 0
     if math.isnan(value):
-        return sign | fmt.canonical_nan_code
+        return fmt.canonical_nan_code if fmt.unsigned_zero else sign | fmt.canonical_nan_code
 
     magnitude = abs(value)
     if magnitude == 0.0:
-        return sign
+        return 0 if fmt.unsigned_zero else sign
     if math.isinf(magnitude):
+        if fmt.unsigned_zero:
+            return fmt.canonical_nan_code
         if fmt.finite_only:
             return sign | fmt.max_finite_code
         infinity_code = ((1 << fmt.exponent_bits) - 1) << fmt.mantissa_bits
@@ -181,6 +205,8 @@ def encode_fp8_rtz(value: float, fmt: Float8Format) -> int:
 
     upper = bisect_left(candidates, magnitude)
     code = upper if candidates[upper] == magnitude else max(0, upper - 1)
+    if fmt.unsigned_zero and code == 0:
+        return 0
     return sign | code
 
 
