@@ -1864,9 +1864,9 @@ struct ElementwiseOpConversionWithTargetInfoBase
       PatternBenefit benefit = patternBenefitDefault)
       : Base(typeConverter, axisAnalysisPass, benefit), isaFamily(isaFamily),
         gpuKind(gpuKind) {
-    capFP8F32 = gpuKind == llvm::AMDGPU::GPUKind::GK_GFX938 ||
-                gpuKind == llvm::AMDGPU::GPUKind::GK_GFX92A ||
-                gpuKind == llvm::AMDGPU::GPUKind::GK_GFX946;
+    HCU::LowPrecisionTargetFeatures targetFeatures(gpuKind);
+    ocpFp8ConversionMode = targetFeatures.getOcpFp8ConversionMode();
+    capFP8F32 = ocpFp8ConversionMode == HCU::LowPrecisionMode::Native;
     capFP8FP16 = false;
     capBF16F32 = gpuKind == llvm::AMDGPU::GPUKind::GK_GFX938 ||
                  gpuKind == llvm::AMDGPU::GPUKind::GK_GFX92A ||
@@ -1882,6 +1882,7 @@ protected:
   bool capFP8F32;
   bool capFP8FP16;
   bool capBF16F32;
+  HCU::LowPrecisionMode ocpFp8ConversionMode;
 };
 
 // Attempts to use vectorized conversions via inline PTX when possible.
@@ -1902,6 +1903,13 @@ struct FpToFpOpConversion
   mlir::FailureOr<ConverterT>
   getConversionFunc(Type srcTy, Type dstTy,
                     std::optional<RoundingMode> roundingMode) const {
+    bool usesOcpFp8 =
+        llvm::isa<Float8E4M3FNType, Float8E5M2Type>(srcTy) ||
+        llvm::isa<Float8E4M3FNType, Float8E5M2Type>(dstTy);
+    if (usesOcpFp8 &&
+        ocpFp8ConversionMode == HCU::LowPrecisionMode::Unsupported)
+      return failure();
+
     auto F8E4M3B15TyID = TypeID::get<Float8E4M3B11FNUZType>();
     auto F8E4M3FNUZTyID = TypeID::get<Float8E4M3FNUZType>();
     auto F8E5M2FNUZTyID = TypeID::get<Float8E5M2FNUZType>();
@@ -1914,8 +1922,7 @@ struct FpToFpOpConversion
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
-    static DenseMap<std::tuple<TypeID, TypeID, RoundingMode>, ConverterT>
-        srcMap = {
+    DenseMap<std::tuple<TypeID, TypeID, RoundingMode>, ConverterT> srcMap = {
             // F8 -> F16
             // {{F8E4M3FNUZTyID, F16TyID, undefRounding},
             //  Fp8E4M3FNUZ_to_Fp16(isaFamily)},

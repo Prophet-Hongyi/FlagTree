@@ -77,6 +77,65 @@ def _compile_gfx936(dtype, out_dtype="fp32", rhs_dtype=None):
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "arch, architecture, ocp_conversion, fp8_mma, fp4_conversion, "
+        "fp4_mma, int8_mma"
+    ),
+    [
+        (
+            "gfx936",
+            "bw1000",
+            "software",
+            "software",
+            "software",
+            "software",
+            "native",
+        ),
+        (
+            "gfx999",
+            "unknown",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+        ),
+    ],
+)
+def test_hcu_low_precision_target_features(
+    arch,
+    architecture,
+    ocp_conversion,
+    fp8_mma,
+    fp4_conversion,
+    fp4_mma,
+    int8_mma,
+):
+    features = libtriton.hcu.get_low_precision_target_features(arch)
+    assert features["architecture"] == architecture
+    assert features["ocp_fp8_conversion"] == ocp_conversion
+    assert features["custom_fp8_conversion"] == "unsupported"
+    assert features["fp8_mma"] == fp8_mma
+    assert features["fp4_conversion"] == fp4_conversion
+    assert features["fp4_mma"] == fp4_mma
+    assert features["signed_int8_mma"] == int8_mma
+
+
+def test_unknown_hcu_target_fails_closed_for_fp8():
+    backend = backends["hcu"].compiler(GPUTarget("hip", "gfx999", 64))
+    options = backend.parse_options({})
+    assert options.supported_fp8_dtypes == ()
+    assert not options.supports_batched_dot_scaled
+    with pytest.raises(ValueError, match="not supported on HCU target gfx999"):
+        backend.parse_options({"supported_fp8_dtypes": ("fp8e4nv",)})
+    with pytest.raises(
+        ValueError,
+        match="batched dot_scaled is not supported on HCU target gfx999",
+    ):
+        backend.parse_options({"supports_batched_dot_scaled": True})
+
+
 @pytest.mark.parametrize("dtype", ["fp8e4nv", "fp8e5"])
 def test_gfx936_ocp_fp8_dot_lowers_through_fp16_mmac(dtype):
     compiled = _compile_gfx936(dtype)

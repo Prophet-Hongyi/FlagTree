@@ -1974,6 +1974,8 @@ struct TritonHCUGPUAccelerateMatmulPass
 
     RewritePatternSet mfmaPatterns(context);
     auto features = triton::HCU::deduceHCUISAFeature(archGenerationName);
+    triton::HCU::LowPrecisionTargetFeatures lowPrecisionFeatures(
+        archGenerationName);
     auto mmacLayout = mmacLayoutForce != -1
                           ? *ttg::symbolizeMmacLayout(mmacLayoutForce)
                           : getDefaultMmacLayout(archGenerationName);
@@ -1986,7 +1988,7 @@ struct TritonHCUGPUAccelerateMatmulPass
     case ISAFamily::CDNA1:
     case ISAFamily::CDNA2:
     case ISAFamily::CDNA3:
-      if (archGenerationName == "gfx936")
+      if (lowPrecisionFeatures.supportsSoftwareFp4DotScaled())
         mfmaPatterns.add<::DecomposeGfx936E2M1DotScaled>(
             context, /*benefit=*/3);
       mfmaPatterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(

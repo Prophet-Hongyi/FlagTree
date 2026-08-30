@@ -5,7 +5,10 @@
 namespace mlir::triton::HCU {
 
 ISAFamily deduceISAFamily(llvm::StringRef arch) {
-  llvm::AMDGPU::GPUKind kind = llvm::AMDGPU::parseArchAMDGCN(arch);
+  return deduceISAFamily(llvm::AMDGPU::parseArchAMDGCN(arch));
+}
+
+ISAFamily deduceISAFamily(llvm::AMDGPU::GPUKind kind) {
 
   // See https://llvm.org/docs/HCUGPUUsage.html#processors for how to categorize
   // the following target gfx architectures.
@@ -99,6 +102,10 @@ bool isRDNA(ISAFamily isaFamily) {
 
 // HCU ISA features
 HCUISAFeature deduceHCUISAFeature(llvm::StringRef arch) {
+  return deduceHCUISAFeature(llvm::AMDGPU::parseArchAMDGCN(arch));
+}
+
+HCUISAFeature deduceHCUISAFeature(llvm::AMDGPU::GPUKind kind) {
   HCUISAFeature commonFeatures1 = HCUISAFeature::MMAC_LAYOUT |
                                   HCUISAFeature::MAMC_FP8 | HCUISAFeature::MLS |
                                   HCUISAFeature::CVT_FP8F32;
@@ -114,7 +121,6 @@ HCUISAFeature deduceHCUISAFeature(llvm::StringRef arch) {
                                         HCUISAFeature::MMAC_SCALE},
       };
 
-  llvm::AMDGPU::GPUKind kind = llvm::AMDGPU::parseArchAMDGCN(arch);
   auto it = hcuIsaFeatures.find(kind);
   if (it == hcuIsaFeatures.end())
     return HCUISAFeature::NONE;
@@ -125,6 +131,61 @@ bool supportsHCUISAFeature(llvm::StringRef arch, HCUISAFeature feature) {
   HCUISAFeature hcuIsaFeatures = deduceHCUISAFeature(arch);
   uint64_t featureBits = static_cast<uint64_t>(feature);
   return (uint64_t(hcuIsaFeatures) & featureBits) == featureBits;
+}
+
+LowPrecisionTargetFeatures::LowPrecisionTargetFeatures(llvm::StringRef arch)
+    : kind(llvm::AMDGPU::parseArchAMDGCN(arch)) {}
+
+bool LowPrecisionTargetFeatures::isBW1000() const {
+  return kind == llvm::AMDGPU::GK_GFX936;
+}
+
+bool LowPrecisionTargetFeatures::isKnownTarget() const {
+  return deduceISAFamily(kind) != ISAFamily::Unknown;
+}
+
+const char *LowPrecisionTargetFeatures::getArchitectureName() const {
+  if (isBW1000())
+    return "bw1000";
+  return isKnownTarget() ? "hcu-known" : "unknown";
+}
+
+LowPrecisionMode
+LowPrecisionTargetFeatures::getOcpFp8ConversionMode() const {
+  if (!isKnownTarget())
+    return LowPrecisionMode::Unsupported;
+  if (deduceHCUISAFeature(kind) & HCUISAFeature::CVT_FP8F32)
+    return LowPrecisionMode::Native;
+  return LowPrecisionMode::Software;
+}
+
+LowPrecisionMode
+LowPrecisionTargetFeatures::getCustomFp8ConversionMode() const {
+  return LowPrecisionMode::Unsupported;
+}
+
+LowPrecisionMode LowPrecisionTargetFeatures::getFp8MmaMode() const {
+  if (deduceHCUISAFeature(kind) & HCUISAFeature::MAMC_FP8)
+    return LowPrecisionMode::Native;
+  return isBW1000() ? LowPrecisionMode::Software
+                    : LowPrecisionMode::Unsupported;
+}
+
+LowPrecisionMode LowPrecisionTargetFeatures::getFp4ConversionMode() const {
+  return isBW1000() ? LowPrecisionMode::Software
+                    : LowPrecisionMode::Unsupported;
+}
+
+LowPrecisionMode LowPrecisionTargetFeatures::getFp4MmaMode() const {
+  if (deduceHCUISAFeature(kind) & HCUISAFeature::MMAC_FP6FP4)
+    return LowPrecisionMode::Native;
+  return isBW1000() ? LowPrecisionMode::Software
+                    : LowPrecisionMode::Unsupported;
+}
+
+LowPrecisionMode LowPrecisionTargetFeatures::getSignedInt8MmaMode() const {
+  return isBW1000() ? LowPrecisionMode::Native
+                    : LowPrecisionMode::Unsupported;
 }
 
 } // namespace mlir::triton::HCU

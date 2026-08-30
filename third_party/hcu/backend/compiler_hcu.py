@@ -54,7 +54,7 @@ class HIPOptions:
     # We have native support for OCP fp8 variants since CDNA4/RDNA4. For earlier generations,
     # we software emulate the support for them.
     # For leagcy HCU, enable software emulation for fp8e4nv conversions.
-    supported_fp8_dtypes: Tuple[str] = ("fp8e4nv", "fp8e5")
+    supported_fp8_dtypes: Tuple[str, ...] = ()
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
     supports_batched_dot_scaled: bool = False
     default_dot_input_precision: str = "ieee"
@@ -165,6 +165,7 @@ class HIPBackend(BaseBackend):
     def parse_options(self, opts) -> Any:
         legacy_sched_variant = opts.pop("instruction_sched_variant", None)
         args = {'arch': knobs.runtime.override_arch or self.target.arch}
+        target_features = hcu.get_low_precision_target_features(args["arch"])
 
         if opts.get("num_ctas", 1) > 1 and not hcu.supports_multi_cta_launch(self.target.arch):
             raise ValueError(f"num_ctas > 1 not supported on {self.target.arch}")
@@ -174,9 +175,6 @@ class HIPBackend(BaseBackend):
             allowed_dot_input_precisions = set(HIPOptions.allowed_dot_input_precisions)
             allowed_dot_input_precisions.update({'tf32'})
             args["allowed_dot_input_precisions"] = tuple(sorted(allowed_dot_input_precisions))
-
-        if "supported_fp8_dtypes" not in opts:
-            args["supported_fp8_dtypes"] = tuple(sorted(HIPOptions.supported_fp8_dtypes))
 
         if self.target.arch == 'gfx950':
             deprecated_fp8_dot_operand_dtypes = set(HIPOptions.deprecated_fp8_dot_operand_dtypes)
@@ -196,6 +194,36 @@ class HIPBackend(BaseBackend):
 
         args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() \
                      if k in opts and opts[k] is not None})
+
+        if "supported_fp8_dtypes" not in args:
+            args["supported_fp8_dtypes"] = tuple(
+                target_features["supported_fp8_dtypes"]
+            )
+        requested_fp8_dtypes = args["supported_fp8_dtypes"]
+        if isinstance(requested_fp8_dtypes, str):
+            raise TypeError("supported_fp8_dtypes must be a sequence of dtype names")
+        requested_fp8_dtypes = tuple(sorted(set(requested_fp8_dtypes)))
+        unsupported = set(requested_fp8_dtypes) - set(
+            target_features["supported_fp8_dtypes"]
+        )
+        if unsupported:
+            names = ", ".join(sorted(unsupported))
+            raise ValueError(
+                f"supported_fp8_dtypes dtype(s) {names} are not supported "
+                f"on HCU target {args['arch']}"
+            )
+        args["supported_fp8_dtypes"] = requested_fp8_dtypes
+
+        if "supports_batched_dot_scaled" not in args:
+            args["supports_batched_dot_scaled"] = target_features[
+                "supports_batched_dot_scaled"
+            ]
+        elif args["supports_batched_dot_scaled"] and not target_features[
+            "supports_batched_dot_scaled"
+        ]:
+            raise ValueError(
+                f"batched dot_scaled is not supported on HCU target {args['arch']}"
+            )
 
         # Consume the legacy `instruction_sched_variant` option and map it to
         # `schedule_hint`. If both are present, keep the explicit schedule_hint.

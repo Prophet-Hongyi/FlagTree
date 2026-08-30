@@ -2,6 +2,7 @@
 #define TRITON_THIRD_PARTY_HCU_INCLUDE_TRITONHCUGPUTOLLVM_TARGETUTILS_H_
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/TargetParser/TargetParser.h"
 
 namespace mlir::triton::HCU {
 
@@ -21,6 +22,7 @@ enum class ISAFamily {
 
 // Deduces the corresponding ISA family for the given target gfx |arch|.
 ISAFamily deduceISAFamily(llvm::StringRef arch);
+ISAFamily deduceISAFamily(llvm::AMDGPU::GPUKind kind);
 
 // Retursn true if given architecture support V_DOT instruction.
 bool supportsVDot(llvm::StringRef arch);
@@ -60,7 +62,53 @@ inline constexpr HCUISAFeature operator|(HCUISAFeature lhs, HCUISAFeature rhs) {
                                     static_cast<uint64_t>(rhs));
 }
 HCUISAFeature deduceHCUISAFeature(llvm::StringRef arch);
+HCUISAFeature deduceHCUISAFeature(llvm::AMDGPU::GPUKind kind);
 bool supportsHCUISAFeature(llvm::StringRef arch, HCUISAFeature feature);
+
+enum class LowPrecisionMode { Unsupported, Software, Native };
+
+constexpr const char *stringifyLowPrecisionMode(LowPrecisionMode mode) {
+  switch (mode) {
+  case LowPrecisionMode::Unsupported:
+    return "unsupported";
+  case LowPrecisionMode::Software:
+    return "software";
+  case LowPrecisionMode::Native:
+    return "native";
+  }
+  return "unsupported";
+}
+
+// Compiler-routing source of truth for low-precision paths.  Product claims
+// remain exact-target claims: gfx936 identifies the qualified BW1000 path;
+// unrelated numeric gfx values must not inherit its capabilities.
+class LowPrecisionTargetFeatures {
+public:
+  explicit LowPrecisionTargetFeatures(llvm::StringRef arch);
+  explicit LowPrecisionTargetFeatures(llvm::AMDGPU::GPUKind kind)
+      : kind(kind) {}
+
+  bool isBW1000() const;
+  bool isKnownTarget() const;
+  const char *getArchitectureName() const;
+
+  LowPrecisionMode getOcpFp8ConversionMode() const;
+  LowPrecisionMode getCustomFp8ConversionMode() const;
+  LowPrecisionMode getFp8MmaMode() const;
+  LowPrecisionMode getFp4ConversionMode() const;
+  LowPrecisionMode getFp4MmaMode() const;
+  LowPrecisionMode getSignedInt8MmaMode() const;
+
+  bool supportsSoftwareFp8Dot() const {
+    return getFp8MmaMode() == LowPrecisionMode::Software;
+  }
+  bool supportsSoftwareFp4DotScaled() const {
+    return getFp4MmaMode() == LowPrecisionMode::Software;
+  }
+
+private:
+  llvm::AMDGPU::GPUKind kind;
+};
 
 } // namespace mlir::triton::HCU
 

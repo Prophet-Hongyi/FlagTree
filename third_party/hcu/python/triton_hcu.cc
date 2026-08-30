@@ -337,6 +337,35 @@ static std::optional<std::string> lldInvoke(const char *inPath,
 void init_triton_hcu(py::module &&m) {
   m.doc() = "Python bindings to the HCU Triton backend";
 
+  m.def("get_low_precision_target_features", [](const std::string &arch) {
+    mlir::triton::HCU::LowPrecisionTargetFeatures features(arch);
+    py::dict result;
+    result["architecture"] = features.getArchitectureName();
+    result["ocp_fp8_conversion"] =
+        mlir::triton::HCU::stringifyLowPrecisionMode(
+            features.getOcpFp8ConversionMode());
+    result["custom_fp8_conversion"] =
+        mlir::triton::HCU::stringifyLowPrecisionMode(
+            features.getCustomFp8ConversionMode());
+    result["fp8_mma"] = mlir::triton::HCU::stringifyLowPrecisionMode(
+        features.getFp8MmaMode());
+    result["fp4_conversion"] =
+        mlir::triton::HCU::stringifyLowPrecisionMode(
+            features.getFp4ConversionMode());
+    result["fp4_mma"] = mlir::triton::HCU::stringifyLowPrecisionMode(
+        features.getFp4MmaMode());
+    result["signed_int8_mma"] =
+        mlir::triton::HCU::stringifyLowPrecisionMode(
+            features.getSignedInt8MmaMode());
+    result["supported_fp8_dtypes"] =
+        features.getOcpFp8ConversionMode() !=
+                mlir::triton::HCU::LowPrecisionMode::Unsupported
+            ? py::make_tuple("fp8e4nv", "fp8e5")
+            : py::tuple();
+    result["supports_batched_dot_scaled"] = false;
+    return result;
+  });
+
   auto passes = m.def_submodule("passes");
   init_triton_hcu_passes_ttgpuir(passes.def_submodule("ttgpuir"));
 
