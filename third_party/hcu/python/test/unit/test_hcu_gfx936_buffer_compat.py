@@ -15,6 +15,7 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     PTR_BUFFER_STORE_I32,
     PTR_BUFFER_STORE_I8,
     PTR_BUFFER_STORE_V2I32,
+    PTR_BUFFER_STORE_V4F32,
     RAW_BUFFER_LOAD_F32,
     RAW_BUFFER_LOAD_I16,
     RAW_BUFFER_LOAD_I32,
@@ -28,6 +29,7 @@ from triton.backends.hcu.llvm17_mmac_compat import (
     RAW_BUFFER_STORE_I32,
     RAW_BUFFER_STORE_I8,
     RAW_BUFFER_STORE_V2I32,
+    RAW_BUFFER_STORE_V4F32,
     LLVM17MmacBridgeError,
     bridge_gfx936_buffer_contracts_for_llvm17,
 )
@@ -50,6 +52,7 @@ def _scalar_buffer_module(load_type="f32", store_type="i8", stride=0):
         "i8": PTR_BUFFER_STORE_I8,
         "i32": PTR_BUFFER_STORE_I32,
         "v2i32": PTR_BUFFER_STORE_V2I32,
+        "v4f32": PTR_BUFFER_STORE_V4F32,
     }.get(store_type, f"llvm.amdgcn.raw.ptr.buffer.store.{store_type}")
     load_result_type = {
         "f32": "float",
@@ -65,6 +68,7 @@ def _scalar_buffer_module(load_type="f32", store_type="i8", stride=0):
     store_value = {
         "f32": "0.0",
         "v2i32": "zeroinitializer",
+        "v4f32": "zeroinitializer",
     }.get(store_type, "0")
     return f"""define amdgpu_kernel void @kernel(ptr addrspace(1) %input, ptr addrspace(1) %output) {{
   %input.rsrc = tail call ptr addrspace(8) @{MAKE_BUFFER_RSRC}(ptr addrspace(1) %input, i16 {stride}, i32 1024, i32 159744)
@@ -93,6 +97,7 @@ declare void @{store_pointer}({store_value_type}, ptr addrspace(8), i32, i32, i3
         ("v4f32", "i32", RAW_BUFFER_LOAD_V4F32, RAW_BUFFER_STORE_I32),
         ("v4i32", "f32", RAW_BUFFER_LOAD_V4I32, RAW_BUFFER_STORE_F32),
         ("f32", "v2i32", RAW_BUFFER_LOAD_F32, RAW_BUFFER_STORE_V2I32),
+        ("f32", "v4f32", RAW_BUFFER_LOAD_F32, RAW_BUFFER_STORE_V4F32),
     ],
 )
 def test_scalar_buffer_contracts_are_bridged(

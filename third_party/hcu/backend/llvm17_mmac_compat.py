@@ -275,6 +275,7 @@ def bridge_gfx936_buffer_contracts_for_llvm17(
             PTR_BUFFER_STORE_I32: RAW_BUFFER_STORE_I32,
             PTR_BUFFER_STORE_V2I32: RAW_BUFFER_STORE_V2I32,
             PTR_BUFFER_STORE_F32: RAW_BUFFER_STORE_F32,
+            PTR_BUFFER_STORE_V4F32: RAW_BUFFER_STORE_V4F32,
         },
         label="scalar",
     )
