@@ -732,6 +732,19 @@ class musa_knobs(base_knobs):
     # rounding boundary. Phase 2 must not change that per-thread vector width.
     rlc_preserve_int_to_fp_contiguity: env_bool = env_bool(
         "FLAGTREE_MUSA_RLC_PRESERVE_INT_TO_FP_CONTIGUITY", True)
+    # S5000 profitability selector. The master switch remains default-off;
+    # when enabled, a caller must still provide the product launch count.
+    # Missing/zero launch count is intentionally fail-closed in the C++ pass.
+    rlc_profitability_policy: env_bool = env_bool(
+        "FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY", False)
+    rlc_product_launch_count: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT", 0)
+    rlc_profitability_min_adjusted_saved_cost_per_tensor_op: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 1800)
+    rlc_profitability_phase3_saved_cost_multiplier: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER", 2)
+    rlc_profitability_max_external_use_edges: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", 0)
 
 
 # flagtree ppu

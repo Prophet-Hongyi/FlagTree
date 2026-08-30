@@ -125,6 +125,23 @@ def _effective_preserve_int_to_fp_contiguity() -> bool:
     return bool(getattr(musa, "rlc_preserve_int_to_fp_contiguity", True))
 
 
+def _effective_profitability_policy() -> tuple[int, int, int, int, int]:
+    """Return the cache/IR identity for the opt-in online selector."""
+    musa = knobs.musa
+    owns_decision_point = int(musa.rlc_phase_mask) & 0b1100
+    enabled = bool(musa.rlc_enhance and owns_decision_point and
+                   getattr(musa, "rlc_profitability_policy", False))
+    if not enabled:
+        return (0, 0, 0, 0, 0)
+    return (
+        1,
+        int(getattr(musa, "rlc_product_launch_count", 0) or 0),
+        int(getattr(musa, "rlc_profitability_min_adjusted_saved_cost_per_tensor_op", 0) or 0),
+        int(getattr(musa, "rlc_profitability_phase3_saved_cost_multiplier", 0) or 0),
+        int(getattr(musa, "rlc_profitability_max_external_use_edges", 0) or 0),
+    )
+
+
 def _apply_musa_rlc_policy(mod) -> None:
     """Set optional ttg.rlc-* module attrs. Zero keeps C++ conservative defaults."""
     if not knobs.musa.rlc_enhance:
@@ -148,6 +165,23 @@ def _apply_musa_rlc_policy(mod) -> None:
     if _effective_preserve_int_to_fp_contiguity():
         mod.set_attr("ttg.rlc-preserve-int-to-fp-contiguity",
                      builder.get_int32_attr(1))
+    (profitability_enabled, launch_count, min_score, phase3_multiplier,
+     max_external_uses) = _effective_profitability_policy()
+    if profitability_enabled:
+        mod.set_attr("ttg.rlc-profitability-policy-enabled",
+                     builder.get_int32_attr(1))
+        if launch_count > 0:
+            mod.set_attr("ttg.rlc-product-launch-count",
+                         builder.get_int32_attr(launch_count))
+        if min_score > 0:
+            mod.set_attr("ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op",
+                         builder.get_int32_attr(min_score))
+        if phase3_multiplier > 0:
+            mod.set_attr("ttg.rlc-profitability-phase3-saved-cost-multiplier",
+                         builder.get_int32_attr(phase3_multiplier))
+        if max_external_uses >= 0:
+            mod.set_attr("ttg.rlc-profitability-max-external-use-edges",
+                         builder.get_int32_attr(max_external_uses))
 
 
 def _rlc_policy_signature() -> str:
@@ -157,6 +191,7 @@ def _rlc_policy_signature() -> str:
     FLAGTREE_MUSA_RLC_* environment changes in the same process.
     """
     musa = knobs.musa
+    profitability_policy = _effective_profitability_policy()
     return "-".join([
         str(int(bool(musa.rlc_enhance))),
         str(int(musa.rlc_phase_mask)),
@@ -169,6 +204,7 @@ def _rlc_policy_signature() -> str:
         str(int(getattr(musa, "rlc_inter_warp_reduce_cost", 0) or 0)),
         str(_effective_atomic_writeback_ratio()),
         str(int(_effective_preserve_int_to_fp_contiguity())),
+        *(str(value) for value in profitability_policy),
     ])
 
 

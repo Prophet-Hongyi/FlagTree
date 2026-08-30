@@ -12,6 +12,7 @@ import os
 import inspect
 
 from triton.backends.compiler import GPUTarget
+from triton.backends.mthreads import compiler as musa_compiler
 from triton.backends.mthreads.compiler import MUSABackend, _rlc_policy_signature
 from triton.runtime import jit
 
@@ -178,6 +179,138 @@ def test_backend_hash_ignores_int_to_fp_policy_without_phase2():
         assert guarded == unguarded, (guarded, unguarded)
         assert guarded_options.rlc_policy == unguarded_options.rlc_policy
         assert guarded_options.hash() == unguarded_options.hash()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_backend_hash_tracks_profitability_policy_contract():
+    keys = (
+        "FLAGTREE_MUSA_RLC_ENHANCE",
+        "FLAGTREE_MUSA_RLC_PHASE_MASK",
+        "FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY",
+        "FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT",
+        "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
+        "FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER",
+        "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES",
+    )
+    previous = {key: os.environ.get(key) for key in keys}
+    backend = _backend()
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY"] = "1"
+        os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1800"
+        os.environ["FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "2"
+        os.environ["FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES"] = "0"
+        baseline = backend.hash()
+        baseline_options = backend.parse_options({})
+
+        os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1900"
+        retuned = backend.hash()
+        retuned_options = backend.parse_options({})
+        os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "2"
+        two_launches = backend.hash()
+
+        assert baseline != retuned
+        assert baseline_options.rlc_policy != retuned_options.rlc_policy
+        assert baseline_options.hash() != retuned_options.hash()
+        assert retuned != two_launches
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_backend_hash_ignores_profitability_tuning_when_selector_is_off():
+    keys = (
+        "FLAGTREE_MUSA_RLC_ENHANCE",
+        "FLAGTREE_MUSA_RLC_PHASE_MASK",
+        "FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY",
+        "FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT",
+        "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
+    )
+    previous = {key: os.environ.get(key) for key in keys}
+    backend = _backend()
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY"] = "0"
+        os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1800"
+        first = backend.hash()
+        first_options = backend.parse_options({})
+        os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "7"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "9000"
+        second = backend.hash()
+        second_options = backend.parse_options({})
+
+        assert first == second
+        assert first_options.rlc_policy == second_options.rlc_policy
+        assert first_options.hash() == second_options.hash()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_profitability_policy_module_attrs_are_explicit_and_fail_closed(monkeypatch):
+    keys = (
+        "FLAGTREE_MUSA_RLC_ENHANCE",
+        "FLAGTREE_MUSA_RLC_PHASE_MASK",
+        "FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY",
+        "FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT",
+        "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
+        "FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER",
+        "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES",
+    )
+    previous = {key: os.environ.get(key) for key in keys}
+
+    class FakeBuilder:
+        @staticmethod
+        def get_int32_attr(value):
+            return value
+
+    class FakeModule:
+        context = object()
+
+        def __init__(self):
+            self.attrs = {}
+
+        def set_attr(self, name, value):
+            self.attrs[name] = value
+
+    monkeypatch.setattr(musa_compiler.ir, "builder", lambda context: FakeBuilder())
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY"] = "1"
+        os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1800"
+        os.environ["FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "2"
+        os.environ["FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES"] = "0"
+
+        single_launch = FakeModule()
+        musa_compiler._apply_musa_rlc_policy(single_launch)
+        assert single_launch.attrs["ttg.rlc-profitability-policy-enabled"] == 1
+        assert single_launch.attrs["ttg.rlc-product-launch-count"] == 1
+        assert single_launch.attrs[
+            "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op"] == 1800
+        assert single_launch.attrs[
+            "ttg.rlc-profitability-phase3-saved-cost-multiplier"] == 2
+        assert single_launch.attrs[
+            "ttg.rlc-profitability-max-external-use-edges"] == 0
+
+        os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "0"
+        unknown_launch = FakeModule()
+        musa_compiler._apply_musa_rlc_policy(unknown_launch)
+        assert unknown_launch.attrs["ttg.rlc-profitability-policy-enabled"] == 1
+        assert "ttg.rlc-product-launch-count" not in unknown_launch.attrs
     finally:
         for key, value in previous.items():
             if value is None:

@@ -181,11 +181,26 @@ def test_ppu_rlc_knobs(fresh_knobs, monkeypatch):
 def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
     assert not fresh_knobs.musa.rlc_enhance
     assert fresh_knobs.musa.rlc_phase_mask == 0xF
+    assert not fresh_knobs.musa.rlc_profitability_policy
+    assert fresh_knobs.musa.rlc_product_launch_count == 0
+    assert fresh_knobs.musa.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1800
+    assert fresh_knobs.musa.rlc_profitability_phase3_saved_cost_multiplier == 2
+    assert fresh_knobs.musa.rlc_profitability_max_external_use_edges == 0
 
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_ENHANCE", "1")
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_PHASE_MASK", "5")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY", "1")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT", "1")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", "1900")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER", "3")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", "2")
     assert fresh_knobs.musa.rlc_enhance
     assert fresh_knobs.musa.rlc_phase_mask == 5
+    assert fresh_knobs.musa.rlc_profitability_policy
+    assert fresh_knobs.musa.rlc_product_launch_count == 1
+    assert fresh_knobs.musa.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1900
+    assert fresh_knobs.musa.rlc_profitability_phase3_saved_cost_multiplier == 3
+    assert fresh_knobs.musa.rlc_profitability_max_external_use_edges == 2
 
     fresh_knobs.musa.rlc_enhance = False
     fresh_knobs.musa.rlc_phase_mask = 9
