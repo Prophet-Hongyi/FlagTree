@@ -56,6 +56,7 @@ class HIPOptions:
     # For leagcy HCU, enable software emulation for fp8e4nv conversions.
     supported_fp8_dtypes: Tuple[str] = ("fp8e4nv", "fp8e5")
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
+    supports_batched_dot_scaled: bool = False
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: Tuple[str] = ("ieee", )
     enable_fp_fusion: bool = True

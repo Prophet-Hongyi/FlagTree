@@ -43,6 +43,7 @@ class HIPOptions:
     # architectures they are software emulated.
     supported_fp8_dtypes: Tuple[str] = ("fp8e4nv", "fp8e5", "fp8e5b16", "fp8e4b8")
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
+    supports_batched_dot_scaled: bool = False
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: Tuple[str] = ("ieee", 'bf16x3', 'bf16x6')
     enable_fp_fusion: bool = True
