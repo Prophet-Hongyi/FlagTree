@@ -829,6 +829,11 @@ void init_triton_ir(py::module &&m) {
           },
           ret::reference)
       //  .def("has_attr", &::FuncOp::hasAttr)
+      // Keep the vendor binding API-compatible with the common Triton
+      // frontend. The frontend finalizes every generated function; MLIR owns
+      // the actual finalization work, so this hook intentionally remains a
+      // no-op just like python/src/ir.cc.
+      .def("finalize", [](FuncOp &self) -> void {})
       .def_property_readonly("type", &FuncOp::getFunctionType)
       .def("reset_type", &FuncOp::setType);
 
