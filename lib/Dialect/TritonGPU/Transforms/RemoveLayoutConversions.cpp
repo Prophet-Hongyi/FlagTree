@@ -135,6 +135,7 @@ struct RlcProfitabilityFeatures {
   int64_t productLaunchCount = -1;
   int64_t proposalValues = -1;
   int64_t removedConverts = -1;
+  int64_t removedConvertDensityPer1024ProposalValues = -1;
   int64_t estimatedSavedCost = -1;
   int64_t adjustedSavedCostPerTensorOp = -1;
   int64_t externalUseEdges = -1;
@@ -198,6 +199,8 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
       os << "unknown";
     os << " online_proposal_values=" << features->proposalValues
        << " online_removed_converts=" << features->removedConverts
+       << " online_removed_convert_density_per_1024_proposal_values="
+       << features->removedConvertDensityPer1024ProposalValues
        << " online_saved_cost=" << features->estimatedSavedCost
        << " online_adjusted_saved_cost_per_tensor_op="
        << features->adjustedSavedCostPerTensorOp
@@ -475,6 +478,7 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op
 //   ttg.rlc-profitability-phase3-saved-cost-multiplier
 //   ttg.rlc-profitability-max-external-use-edges
+//   ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -513,6 +517,7 @@ struct RlcBackendPolicy {
   int64_t profitabilityMinAdjustedSavedCostPerTensorOp = -1;
   int64_t profitabilityPhase3SavedCostMultiplier = -1;
   int64_t profitabilityMaxExternalUseEdges = -1;
+  int64_t profitabilityMinRemovedConvertDensityPer1024ProposalValues = 0;
 
   bool hasCompleteProfitabilityConfiguration() const {
     return profitabilityMinAdjustedSavedCostPerTensorOp > 0 &&
@@ -576,6 +581,9 @@ struct RlcBackendPolicy {
             "ttg.rlc-profitability-max-external-use-edges"))
       if (attr.getInt() >= 0)
         policy.profitabilityMaxExternalUseEdges = attr.getInt();
+    overridePositive(
+        "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values",
+        policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues);
     return policy;
   }
 };
@@ -635,6 +643,17 @@ static StringRef applyRlcProfitabilityPolicy(
   features.adjustedSavedCostPerTensorOp = score;
   if (score < policy.profitabilityMinAdjustedSavedCostPerTensorOp)
     return "profitability-score-below-threshold";
+  if (features.removedConverts >
+      std::numeric_limits<int64_t>::max() / 1024)
+    features.removedConvertDensityPer1024ProposalValues =
+        std::numeric_limits<int64_t>::max();
+  else
+    features.removedConvertDensityPer1024ProposalValues =
+        features.removedConverts * 1024 / features.proposalValues;
+  if (policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues > 0 &&
+      features.removedConvertDensityPer1024ProposalValues <
+          policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues)
+    return "profitability-removed-convert-density-below-threshold";
   // A locally profitable proposal can still be compile-time churn when the
   // surrounding reduction or scan pipeline later canonicalizes it away.  The
   // online selector cannot prove that such a rewrite survives to emitted IR,

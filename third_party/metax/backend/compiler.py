@@ -112,14 +112,14 @@ def get_lld_version():
         return 0
 
 
-def _effective_profitability_policy() -> tuple[int, int, int, int, int]:
+def _effective_profitability_policy() -> tuple[int, int, int, int, int, int]:
     """Return the live MetaX selector identity only at owned decision points."""
     metax_knob = knobs.metax
     owns_decision_point = int(metax_knob.rlc_phase_mask) & 0b1100
     enabled = bool(metax_knob.rlc_enhance and owns_decision_point and
                    getattr(metax_knob, "rlc_profitability_policy", False))
     if not enabled:
-        return (0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0)
     return (
         1,
         int(getattr(metax_knob, "rlc_product_launch_count", 0) or 0),
@@ -138,6 +138,11 @@ def _effective_profitability_policy() -> tuple[int, int, int, int, int]:
             "rlc_profitability_max_external_use_edges",
             0,
         ) or 0),
+        int(getattr(
+            metax_knob,
+            "rlc_profitability_min_removed_convert_density_per_1024_proposal_values",
+            0,
+        ) or 0),
     )
 
 
@@ -146,8 +151,8 @@ def _apply_metax_rlc_policy(mod) -> None:
     if not knobs.metax.rlc_enhance:
         return
     builder = ir.builder(mod.context)
-    (enabled, launch_count, min_score, phase3_multiplier,
-     max_external_uses) = _effective_profitability_policy()
+    (enabled, launch_count, min_score, phase3_multiplier, max_external_uses,
+     min_removed_convert_density) = _effective_profitability_policy()
     if not enabled:
         return
     mod.set_attr("ttg.rlc-profitability-policy-enabled",
@@ -166,6 +171,11 @@ def _apply_metax_rlc_policy(mod) -> None:
     if max_external_uses >= 0:
         mod.set_attr("ttg.rlc-profitability-max-external-use-edges",
                      builder.get_int32_attr(max_external_uses))
+    if min_removed_convert_density > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values",
+            builder.get_int32_attr(min_removed_convert_density),
+        )
 
 
 def _rlc_policy_signature() -> str:

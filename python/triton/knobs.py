@@ -703,6 +703,8 @@ class metax_knobs(base_knobs):
         "FLAGTREE_METAX_RLC_PHASE3_SAVED_COST_MULTIPLIER", 0)
     rlc_profitability_max_external_use_edges: env_int = env_int(
         "FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", 0)
+    rlc_profitability_min_removed_convert_density_per_1024_proposal_values: env_int = env_int(
+        "FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 0)
 
 
 # flagtree mthreads
@@ -766,6 +768,11 @@ class musa_knobs(base_knobs):
     # calibrated budget back to zero for strict screening.
     rlc_profitability_max_external_use_edges: env_int = env_int(
         "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", 8)
+    # Optional topology-density gate. Zero preserves the qualified S5000
+    # selector while allowing other backends to reject broad propagation that
+    # removes too few conversions for the number of rewritten SSA values.
+    rlc_profitability_min_removed_convert_density_per_1024_proposal_values: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 0)
 
 
 # flagtree ppu

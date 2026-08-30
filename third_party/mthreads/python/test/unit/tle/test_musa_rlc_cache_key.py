@@ -252,6 +252,7 @@ def test_backend_hash_tracks_profitability_policy_contract():
         "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
         "FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER",
         "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES",
+        "FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
     )
     previous = {key: os.environ.get(key) for key in keys}
     backend = _backend()
@@ -262,13 +263,14 @@ def test_backend_hash_tracks_profitability_policy_contract():
         os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1800"
         os.environ["FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "2"
         os.environ.pop("FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", None)
+        os.environ.pop("FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", None)
         calibrated = backend.hash()
         calibrated_options = backend.parse_options({})
         os.environ["FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES"] = "0"
         baseline = backend.hash()
         baseline_options = backend.parse_options({})
 
-        os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1900"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
         retuned = backend.hash()
         retuned_options = backend.parse_options({})
         os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "2"
@@ -296,6 +298,7 @@ def test_backend_hash_ignores_profitability_tuning_when_selector_is_off():
         "FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY",
         "FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT",
         "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
+        "FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
     )
     previous = {key: os.environ.get(key) for key in keys}
     backend = _backend()
@@ -304,10 +307,12 @@ def test_backend_hash_ignores_profitability_tuning_when_selector_is_off():
         os.environ["FLAGTREE_MUSA_RLC_PROFITABILITY_POLICY"] = "0"
         os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
         os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1800"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "0"
         first = backend.hash()
         first_options = backend.parse_options({})
         os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "7"
         os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "9000"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "512"
         second = backend.hash()
         second_options = backend.parse_options({})
 
@@ -331,6 +336,7 @@ def test_profitability_policy_module_attrs_are_explicit_and_fail_closed(monkeypa
         "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
         "FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER",
         "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES",
+        "FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
     )
     previous = {key: os.environ.get(key) for key in keys}
 
@@ -356,13 +362,16 @@ def test_profitability_policy_module_attrs_are_explicit_and_fail_closed(monkeypa
         os.environ["FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1800"
         os.environ["FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "2"
         os.environ.pop("FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", None)
+        os.environ.pop("FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", None)
 
         calibrated = FakeModule()
         musa_compiler._apply_musa_rlc_policy(calibrated)
         assert calibrated.attrs[
             "ttg.rlc-profitability-max-external-use-edges"] == 8
+        assert "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values" not in calibrated.attrs
 
         os.environ["FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES"] = "0"
+        os.environ["FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
 
         single_launch = FakeModule()
         musa_compiler._apply_musa_rlc_policy(single_launch)
@@ -380,6 +389,8 @@ def test_profitability_policy_module_attrs_are_explicit_and_fail_closed(monkeypa
             "ttg.rlc-profitability-phase3-saved-cost-multiplier"] == 2
         assert single_launch.attrs[
             "ttg.rlc-profitability-max-external-use-edges"] == 0
+        assert single_launch.attrs[
+            "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values"] == 128
 
         os.environ["FLAGTREE_MUSA_RLC_PRODUCT_LAUNCH_COUNT"] = "0"
         unknown_launch = FakeModule()

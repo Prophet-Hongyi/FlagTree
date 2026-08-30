@@ -186,6 +186,7 @@ def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.musa.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1800
     assert fresh_knobs.musa.rlc_profitability_phase3_saved_cost_multiplier == 2
     assert fresh_knobs.musa.rlc_profitability_max_external_use_edges == 8
+    assert fresh_knobs.musa.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 0
     assert fresh_knobs.musa.rlc_preserve_fp_to_fp_contiguity
 
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_ENHANCE", "1")
@@ -195,6 +196,7 @@ def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", "1900")
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER", "3")
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", "2")
+    monkeypatch.setenv("FLAGTREE_MUSA_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", "128")
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_PRESERVE_FP_TO_FP_CONTIGUITY", "0")
     assert fresh_knobs.musa.rlc_enhance
     assert fresh_knobs.musa.rlc_phase_mask == 5
@@ -203,6 +205,7 @@ def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.musa.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1900
     assert fresh_knobs.musa.rlc_profitability_phase3_saved_cost_multiplier == 3
     assert fresh_knobs.musa.rlc_profitability_max_external_use_edges == 2
+    assert fresh_knobs.musa.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 128
     assert not fresh_knobs.musa.rlc_preserve_fp_to_fp_contiguity
 
     fresh_knobs.musa.rlc_enhance = False
@@ -219,6 +222,7 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.metax.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 0
     assert fresh_knobs.metax.rlc_profitability_phase3_saved_cost_multiplier == 0
     assert fresh_knobs.metax.rlc_profitability_max_external_use_edges == 0
+    assert fresh_knobs.metax.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 0
 
     monkeypatch.setenv("FLAGTREE_METAX_RLC_ENHANCE", "1")
     monkeypatch.setenv("FLAGTREE_METAX_RLC_PHASE_MASK", "5")
@@ -227,6 +231,7 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
     monkeypatch.setenv("FLAGTREE_METAX_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", "2200")
     monkeypatch.setenv("FLAGTREE_METAX_RLC_PHASE3_SAVED_COST_MULTIPLIER", "3")
     monkeypatch.setenv("FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", "2")
+    monkeypatch.setenv("FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", "128")
     assert fresh_knobs.metax.rlc_enhance
     assert fresh_knobs.metax.rlc_phase_mask == 5
     assert fresh_knobs.metax.rlc_profitability_policy
@@ -234,6 +239,7 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.metax.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 2200
     assert fresh_knobs.metax.rlc_profitability_phase3_saved_cost_multiplier == 3
     assert fresh_knobs.metax.rlc_profitability_max_external_use_edges == 2
+    assert fresh_knobs.metax.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 128
 
     fresh_knobs.metax.rlc_enhance = False
     fresh_knobs.metax.rlc_phase_mask = 9

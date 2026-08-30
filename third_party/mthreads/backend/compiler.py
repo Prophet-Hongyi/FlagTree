@@ -133,20 +133,25 @@ def _effective_preserve_fp_to_fp_contiguity() -> bool:
     return bool(getattr(musa, "rlc_preserve_fp_to_fp_contiguity", True))
 
 
-def _effective_profitability_policy() -> tuple[int, int, int, int, int]:
+def _effective_profitability_policy() -> tuple[int, int, int, int, int, int]:
     """Return the cache/IR identity for the opt-in online selector."""
     musa = knobs.musa
     owns_decision_point = int(musa.rlc_phase_mask) & 0b1100
     enabled = bool(musa.rlc_enhance and owns_decision_point and
                    getattr(musa, "rlc_profitability_policy", False))
     if not enabled:
-        return (0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0)
     return (
         1,
         int(getattr(musa, "rlc_product_launch_count", 0) or 0),
         int(getattr(musa, "rlc_profitability_min_adjusted_saved_cost_per_tensor_op", 0) or 0),
         int(getattr(musa, "rlc_profitability_phase3_saved_cost_multiplier", 0) or 0),
         int(getattr(musa, "rlc_profitability_max_external_use_edges", 0) or 0),
+        int(getattr(
+            musa,
+            "rlc_profitability_min_removed_convert_density_per_1024_proposal_values",
+            0,
+        ) or 0),
     )
 
 
@@ -184,7 +189,8 @@ def _apply_musa_rlc_policy(mod) -> None:
         mod.set_attr("ttg.rlc-fp-to-fp-vector-width-mask",
                      builder.get_int32_attr((1 << 2) | (1 << 4)))
     (profitability_enabled, launch_count, min_score, phase3_multiplier,
-     max_external_uses) = _effective_profitability_policy()
+     max_external_uses,
+     min_removed_convert_density) = _effective_profitability_policy()
     if profitability_enabled:
         mod.set_attr("ttg.rlc-profitability-policy-enabled",
                      builder.get_int32_attr(1))
@@ -200,6 +206,11 @@ def _apply_musa_rlc_policy(mod) -> None:
         if max_external_uses >= 0:
             mod.set_attr("ttg.rlc-profitability-max-external-use-edges",
                          builder.get_int32_attr(max_external_uses))
+        if min_removed_convert_density > 0:
+            mod.set_attr(
+                "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values",
+                builder.get_int32_attr(min_removed_convert_density),
+            )
 
 
 def _rlc_policy_signature() -> str:
