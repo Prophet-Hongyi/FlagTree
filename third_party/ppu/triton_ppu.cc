@@ -23,6 +23,7 @@
 
 #include "Dialect/PPUGPU/IR/Dialect.h"
 #include "Dialect/TritonPPUGPU/IR/Dialect.h"
+#include "Dialect/TritonPPUGPU/IR/TargetFeatures.h"
 #include "PPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUTransforms/Passes.h"
@@ -109,6 +110,25 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 }
 
 void init_triton_ppu(py::module &&m) {
+  m.def("get_low_precision_target_features", [](int32_t capability) {
+    mlir::triton::ppu::TargetFeatures features(capability);
+    py::dict result;
+    result["architecture"] = features.getArchitectureName();
+    result["fp8_conversion"] = mlir::triton::ppu::stringifyLowPrecisionMode(
+        features.getFp8ConversionMode());
+    result["fp8_mma"] = mlir::triton::ppu::stringifyLowPrecisionMode(
+        features.getFp8MmaMode());
+    result["signed_int8_mma"] = mlir::triton::ppu::stringifyLowPrecisionMode(
+        features.getSignedInt8MmaMode());
+    result["supported_fp8_dtypes"] =
+        features.supportsFp8Dtypes()
+            ? py::make_tuple("fp8e4b15", "fp8e4nv", "fp8e5")
+            : py::tuple();
+    result["supports_batched_dot_scaled"] =
+        features.supportsBatchedDotScaled();
+    return result;
+  });
+
   auto passes = m.def_submodule("passes");
   init_triton_ppu_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_ppu_passes_ttppugpuir(passes.def_submodule("ttppugpuir"));

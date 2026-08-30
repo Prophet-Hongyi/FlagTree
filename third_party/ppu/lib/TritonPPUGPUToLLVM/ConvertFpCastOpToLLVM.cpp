@@ -30,6 +30,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ConvertFpCastOpToLLVM.h"
+#include "Dialect/TritonPPUGPU/IR/TargetFeatures.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonPPUGPUToLLVM/TIXAsmFormat.h"
 #include "Utility.h"
@@ -615,7 +616,7 @@ struct FpToFpOpConversion
                               int computeCapability,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
-        computeCapability(computeCapability) {}
+        targetFeatures(computeCapability) {}
 
   static Value convertFp16ToFp32(Location loc,
                                  ConversionPatternRewriter &rewriter,
@@ -687,7 +688,11 @@ struct FpToFpOpConversion
 
     bool involvesFp8E4M3 = llvm::isa<Float8E4M3FNType>(srcTy) ||
                            llvm::isa<Float8E4M3FNType>(dstTy);
-    if (computeCapability == 80) {
+    bool involvesFp8 =
+        llvm::isa<Float8E4M3FNType, Float8E5M2Type>(srcTy) ||
+        llvm::isa<Float8E4M3FNType, Float8E5M2Type>(dstTy);
+    LowPrecisionMode fp8Mode = targetFeatures.getFp8ConversionMode();
+    if (fp8Mode == LowPrecisionMode::Software) {
       if (srcTy.isF16() && llvm::isa<Float8E5M2Type>(dstTy) &&
           roundingMode == RoundingMode::RTNE)
         return {downcastFp16ToFp8E5M2RTNESoftware, 4};
@@ -707,16 +712,17 @@ struct FpToFpOpConversion
           return {upcastFp8E4M3FNToBf16Software, 4};
       }
     }
-    if (involvesFp8E4M3 && computeCapability < 89) {
-      if (computeCapability == 80) {
-        llvm::report_fatal_error(
-            "Unsupported f8e4m3nv conversion on PPU capability 80; only "
-            "FP32/FP16/BF16 RTNE encode and FP16/BF16 decode are supported\n");
-      }
+    if (involvesFp8 && fp8Mode == LowPrecisionMode::Unsupported) {
       llvm::report_fatal_error(
-          "Conversion from/to f8e4m3nv is only supported on PPU capability "
-          "80 or >= 89\n");
+          "FP8 conversion is only supported on PPU capability 80 or 89\n");
     }
+    if (fp8Mode == LowPrecisionMode::Software && involvesFp8E4M3) {
+      llvm::report_fatal_error(
+          "Unsupported f8e4m3nv conversion on PPU capability 80; only "
+          "FP32/FP16/BF16 RTNE encode and FP16/BF16 decode are supported\n");
+    }
+    bool hasNativeFp8Conversion = fp8Mode == LowPrecisionMode::Native;
+    bool hasPackedBf16Arithmetic = targetFeatures.isKnownArchitecture();
 
     // Descriptors depend on the current target. Keeping this map static would
     // leak the first compiled capability into later compilations in the same
@@ -726,21 +732,23 @@ struct FpToFpOpConversion
             // F8 -> F16
             {{F8E4M3TyID, F16TyID, undefRounding}, Fp8E4M3Nv_to_Fp16},
             {{F8E5M2TyID, F16TyID, undefRounding},
-             Fp8E5M2_to_Fp16(computeCapability >= 89)},
+             Fp8E5M2_to_Fp16(hasNativeFp8Conversion)},
             {{F16TyID, F8E4M3TyID, RoundingMode::RTNE}, Fp16_to_Fp8E4M3Nv},
             {{F16TyID, F8E5M2TyID, RoundingMode::RTNE},
-             Fp16_to_Fp8E5M2_RTNE(computeCapability >= 89)},
+             Fp16_to_Fp8E5M2_RTNE(hasNativeFp8Conversion)},
             {{F16TyID, F8E5M2TyID, RoundingMode::RTZ}, Fp16_to_Fp8E5M2_RTZ},
             // F8 -> BF16
-            // mul{.rnd}.bf16 and mul{.rnd}.bf16x2 requires sm_90 or higher.
+            // Only known PPU targets may select the packed BF16 arithmetic
+            // sequence used by this conversion.
             {{F8E5M2TyID, BF16TyID, undefRounding},
-             Fp8E5M2_to_Bf16(computeCapability >= 80)},
-            // cvt with .bf16.f16' requires .target sm_90 or higher
+             Fp8E5M2_to_Bf16(hasPackedBf16Arithmetic)},
+            // PPU0010 has already returned its software E4M3 conversion above;
+            // PPU0015 retains the native conversion sequence.
             {{F8E4M3TyID, BF16TyID, undefRounding},
-             Fp8E4M3Nv_to_Bf16(computeCapability >= 89)},
+             Fp8E4M3Nv_to_Bf16(hasNativeFp8Conversion)},
             // BF16 -> F8
             {{BF16TyID, F8E5M2TyID, RoundingMode::RTNE},
-             Bf16_to_Fp8E5M2(computeCapability >= 89)},
+             Bf16_to_Fp8E5M2(hasNativeFp8Conversion)},
             {{BF16TyID, F8E4M3TyID, RoundingMode::RTNE}, Bf16_to_Fp8E4M3Nv},
             // F32 -> F8
             {{F32TyID, F8E4M3TyID, RoundingMode::RTNE}, Fp32_to_Fp8E4M3Nv},
@@ -817,10 +825,13 @@ struct FpToFpOpConversion
     }
 
     bool useSoftwareFp8E4M3Downcast =
-        computeCapability == 80 && llvm::isa<Float8E4M3FNType>(dstElementType);
+        targetFeatures.getFp8ConversionMode() == LowPrecisionMode::Software &&
+        llvm::isa<Float8E4M3FNType>(dstElementType);
+    bool hasNativeFp8Conversion =
+        targetFeatures.getFp8ConversionMode() == LowPrecisionMode::Native;
     bool useFP16IntermediateSrc =
         srcElementType.isF32() && !useSoftwareFp8E4M3Downcast &&
-        (!(computeCapability >= 89 &&
+        (!(hasNativeFp8Conversion &&
            (llvm::isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType))) ||
          roundingMode.value() == RoundingMode::RTZ);
     bool isDstFP32 = dstElementType.isF32();
@@ -847,7 +858,7 @@ struct FpToFpOpConversion
   }
 
 private:
-  int computeCapability;
+  TargetFeatures targetFeatures;
 };
 
 } // namespace

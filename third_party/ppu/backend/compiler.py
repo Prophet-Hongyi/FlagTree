@@ -161,9 +161,9 @@ class HGGCOptions:
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
     launch_pdl: bool = False
-    supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15")
+    supported_fp8_dtypes: Tuple[str, ...] = ()
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
-    supports_batched_dot_scaled: bool = True
+    supports_batched_dot_scaled: bool = False
     default_dot_input_precision: str = "tf32"
     allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee", 'bf16x3', 'bf16x6')
     max_num_imprecise_acc_default: bool = None
@@ -221,26 +221,39 @@ class PPUBackend(BaseBackend):
         args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in HGGCOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
+        target_features = ppu.get_low_precision_target_features(capability)
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires SM90+. "
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
 
-        supports_fp8e4m3 = capability == 80 or capability >= 89
         if "supported_fp8_dtypes" not in args:
-            supported_fp8_dtypes = set(HGGCOptions.supported_fp8_dtypes)
-            # ppu0010 uses the software conversion lowering added by this backend;
-            # newer targets keep using their existing native conversion path.
-            if supports_fp8e4m3:
-                supported_fp8_dtypes.add("fp8e4nv")
-            args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
-        elif "fp8e4nv" in args["supported_fp8_dtypes"] and not supports_fp8e4m3:
-            raise ValueError("fp8e4nv is only supported on PPU capability 80 or >= 89")
+            args["supported_fp8_dtypes"] = tuple(target_features["supported_fp8_dtypes"])
+        else:
+            requested_fp8_dtypes = tuple(sorted(set(args["supported_fp8_dtypes"])))
+            unsupported_fp8_dtypes = set(requested_fp8_dtypes) - set(
+                target_features["supported_fp8_dtypes"]
+            )
+            if unsupported_fp8_dtypes:
+                unsupported = ", ".join(sorted(unsupported_fp8_dtypes))
+                raise ValueError(
+                    f"FP8 dtype(s) {unsupported} are not supported on PPU capability {capability}"
+                )
+            args["supported_fp8_dtypes"] = requested_fp8_dtypes
+
+        if "supports_batched_dot_scaled" not in args:
+            args["supports_batched_dot_scaled"] = target_features["supports_batched_dot_scaled"]
+        elif (
+            args["supports_batched_dot_scaled"]
+            and not target_features["supports_batched_dot_scaled"]
+        ):
+            raise ValueError(
+                f"batched dot_scaled is not supported on PPU capability {capability}"
+            )
 
         if "deprecated_fp8_dot_operand_dtypes" not in args:
-            if capability >= 90:
-                args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15", )
+            args["deprecated_fp8_dot_operand_dtypes"] = ()
 
         if "enable_fp_fusion" not in args:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion

@@ -3,13 +3,14 @@ import torch
 import triton
 import triton.language as tl
 from triton import knobs
+from triton._C.libtriton import ppu
 from triton._internal_testing import is_ppu
 from triton.backends.compiler import GPUTarget
 from triton.backends.ppu.compiler import PPUBackend
 from triton.compiler.errors import CompilationError
 
 _PPU0010_TARGET = GPUTarget("cuda", 80, 32)
-_NATIVE_FP8_COMPAT_TARGET = GPUTarget("cuda", 90, 32)
+_PPU0015_TARGET = GPUTarget("cuda", 89, 32)
 _SIGNATURE = {"src": "*fp32", "dst": "*fp8e4nv", "BLOCK": "constexpr"}
 _CONSTANTS = {"BLOCK": 64}
 _PPU0010_FP16_MMA = "ppu.mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32"
@@ -131,7 +132,7 @@ def _compile_through_llir(kernel, signature, target=_PPU0010_TARGET, constexprs=
         (80, True),
         (88, False),
         (89, True),
-        (90, True),
+        (90, False),
     ],
 )
 def test_ppu_advertises_fp8e4m3_by_capability(capability, expected):
@@ -141,9 +142,57 @@ def test_ppu_advertises_fp8e4m3_by_capability(capability, expected):
 
 
 def test_ppu_rejects_fp8e4m3_override_on_unsupported_capability():
-    target = GPUTarget("cuda", 88, 32)
-    with pytest.raises(ValueError, match="only supported on PPU capability 80 or >= 89"):
+    target = GPUTarget("cuda", 90, 32)
+    with pytest.raises(ValueError, match="not supported on PPU capability 90"):
         PPUBackend(target).parse_options({"supported_fp8_dtypes": ("fp8e4nv", )})
+
+
+@pytest.mark.parametrize(
+    "capability, architecture, fp8_conversion, fp8_mma, int8_mma",
+    [
+        (
+            80,
+            "ppu0010",
+            "software",
+            "software",
+            "native",
+        ),
+        (
+            89,
+            "ppu0015",
+            "native",
+            "native",
+            "native",
+        ),
+        (
+            90,
+            "unknown",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+        ),
+    ],
+)
+def test_ppu_low_precision_target_features(
+    capability, architecture, fp8_conversion, fp8_mma, int8_mma
+):
+    features = ppu.get_low_precision_target_features(capability)
+    assert features["architecture"] == architecture
+    assert features["fp8_conversion"] == fp8_conversion
+    assert features["fp8_mma"] == fp8_mma
+    assert features["signed_int8_mma"] == int8_mma
+
+
+def test_unknown_ppu_capability_fails_closed_for_low_precision():
+    target = GPUTarget("cuda", 90, 32)
+    options = PPUBackend(target).parse_options({})
+    assert options.supported_fp8_dtypes == ()
+    assert not options.supports_batched_dot_scaled
+    with pytest.raises(
+        ValueError,
+        match="batched dot_scaled is not supported on PPU capability 90",
+    ):
+        PPUBackend(target).parse_options({"supports_batched_dot_scaled": True})
 
 
 def test_ppu0010_lowers_fp8e4m3_conversions_to_llir():
@@ -157,10 +206,10 @@ def test_ppu0010_lowers_fp8e4m3_conversions_to_llir():
     assert "e4m3x2" not in upcast.asm["llir"]
 
 
-@pytest.mark.parametrize("capability", [89, 90])
-def test_newer_ppu_capability_keeps_native_fp8e4m3_lowering(capability):
-    target = GPUTarget("cuda", capability, 32)
-    compiled = _compile_through_llir(_fp_to_fp8e4m3, _SIGNATURE, target=target)
+def test_ppu0015_keeps_native_fp8e4m3_lowering():
+    compiled = _compile_through_llir(
+        _fp_to_fp8e4m3, _SIGNATURE, target=_PPU0015_TARGET
+    )
     assert "f8E4M3FN" in compiled.asm["ttir"]
     assert "e4m3x2" in compiled.asm["llir"]
 
@@ -168,7 +217,7 @@ def test_newer_ppu_capability_keeps_native_fp8e4m3_lowering(capability):
 def test_ppu_conversion_selection_is_scoped_to_target():
     signature = {"src": "*fp16", "dst": "*fp8e5", "BLOCK": "constexpr"}
     software = _compile_through_llir(_fp16_to_fp8e5, signature, target=_PPU0010_TARGET)
-    native = _compile_through_llir(_fp16_to_fp8e5, signature, target=_NATIVE_FP8_COMPAT_TARGET)
+    native = _compile_through_llir(_fp16_to_fp8e5, signature, target=_PPU0015_TARGET)
 
     assert "e5m2x2" not in software.asm["llir"]
     assert "e5m2x2" in native.asm["llir"]
