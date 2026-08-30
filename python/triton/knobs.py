@@ -705,6 +705,10 @@ class metax_knobs(base_knobs):
         "FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", 0)
     rlc_profitability_min_removed_convert_density_per_1024_proposal_values: env_int = env_int(
         "FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 0)
+    # Optional MetaX escape hatch for low-density, pure global-writeback math
+    # networks. Zero keeps the common density gate strict and fail-closed.
+    rlc_profitability_low_density_global_writeback_min_math_ops: env_int = env_int(
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", 0)
 
 
 # flagtree mthreads

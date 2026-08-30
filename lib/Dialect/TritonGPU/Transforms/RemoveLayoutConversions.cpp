@@ -150,6 +150,7 @@ struct RlcProfitabilityFeatures {
   int64_t compareOps = 0;
   int64_t arithmeticOps = 0;
   int64_t mathOps = 0;
+  bool lowDensityGlobalWritebackMathEligible = false;
   bool loopResident = false;
 };
 
@@ -216,7 +217,10 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
        << " online_dot_ops=" << features->dotOps
        << " online_compare_ops=" << features->compareOps
        << " online_arithmetic_ops=" << features->arithmeticOps
-       << " online_math_ops=" << features->mathOps;
+       << " online_math_ops=" << features->mathOps
+       << " online_low_density_global_writeback_math_eligible="
+       << static_cast<int>(
+              features->lowDensityGlobalWritebackMathEligible);
   }
   os << '\n';
 }
@@ -479,6 +483,7 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-profitability-phase3-saved-cost-multiplier
 //   ttg.rlc-profitability-max-external-use-edges
 //   ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values
+//   ttg.rlc-profitability-low-density-global-writeback-min-math-ops
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -518,6 +523,7 @@ struct RlcBackendPolicy {
   int64_t profitabilityPhase3SavedCostMultiplier = -1;
   int64_t profitabilityMaxExternalUseEdges = -1;
   int64_t profitabilityMinRemovedConvertDensityPer1024ProposalValues = 0;
+  int64_t profitabilityLowDensityGlobalWritebackMinMathOps = 0;
 
   bool hasCompleteProfitabilityConfiguration() const {
     return profitabilityMinAdjustedSavedCostPerTensorOp > 0 &&
@@ -584,6 +590,9 @@ struct RlcBackendPolicy {
     overridePositive(
         "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values",
         policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues);
+    overridePositive(
+        "ttg.rlc-profitability-low-density-global-writeback-min-math-ops",
+        policy.profitabilityLowDensityGlobalWritebackMinMathOps);
     return policy;
   }
 };
@@ -650,9 +659,19 @@ static StringRef applyRlcProfitabilityPolicy(
   else
     features.removedConvertDensityPer1024ProposalValues =
         features.removedConverts * 1024 / features.proposalValues;
+  features.lowDensityGlobalWritebackMathEligible =
+      policy.profitabilityLowDensityGlobalWritebackMinMathOps > 0 &&
+      features.mathOps >=
+          policy.profitabilityLowDensityGlobalWritebackMinMathOps &&
+      features.globalLoadOps == 0 && features.globalStoreOps > 0 &&
+      features.removedConverts >= features.globalStoreOps &&
+      features.localLoadOps == 0 && features.localStoreOps == 0 &&
+      features.atomicOps == 0 && features.reduceScanOps == 0 &&
+      features.dotOps == 0 && features.externalUseEdges == 0;
   if (policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues > 0 &&
       features.removedConvertDensityPer1024ProposalValues <
-          policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues)
+          policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues &&
+      !features.lowDensityGlobalWritebackMathEligible)
     return "profitability-removed-convert-density-below-threshold";
   // A locally profitable proposal can still be compile-time churn when the
   // surrounding reduction or scan pipeline later canonicalizes it away.  The
