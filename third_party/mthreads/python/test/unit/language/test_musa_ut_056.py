@@ -175,6 +175,27 @@ def test_musa_ph1_uint8_dot_fails_closed():
         _compile_to_llir(_musa_int8_dot_kernel, {"a": "*u8", "b": "*u8", "out": "*i32"})
 
 
+@triton.jit
+def _musa_bitcast_fp16_dot_kernel(lhs_bits, rhs_bits, out):
+    offsets_m = tl.arange(0, 32)
+    offsets_n = tl.arange(0, 32)
+    offsets_k = tl.arange(0, 32)
+    lhs = tl.load(lhs_bits + offsets_m[:, None] * 32 + offsets_k[None, :])
+    rhs = tl.load(rhs_bits + offsets_k[:, None] * 32 + offsets_n[None, :])
+    lhs = lhs.to(tl.float16, bitcast=True)
+    rhs = rhs.to(tl.float16, bitcast=True)
+    result = tl.dot(lhs, rhs, out_dtype=tl.float32)
+    tl.store(out + offsets_m[:, None] * 32 + offsets_n[None, :], result)
+
+
+def test_musa_ph1_bitcast_fp16_dot_preserves_sqmma_operand_type():
+    llir, _ = _compile_to_llir(
+        _musa_bitcast_fp16_dot_kernel,
+        {"lhs_bits": "*u16", "rhs_bits": "*u16", "out": "*fp32"},
+    )
+    assert "llvm.musa.sqmma.fmma.m32n32k32.mma" in llir
+
+
 def test_musa_ph1_signed_int8_dot_device():
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")

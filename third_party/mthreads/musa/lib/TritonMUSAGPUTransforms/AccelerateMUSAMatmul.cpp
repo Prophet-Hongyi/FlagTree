@@ -956,10 +956,10 @@ static Value getSharedMemorySqmmaOperand(Value v, PatternRewriter &rewriter,
       arg = cvtOp.getSrc();
       continue;
     }
-    if (auto bitcastOp = arg.getDefiningOp<tt::BitcastOp>()) {
-      arg = bitcastOp.getSrc();
-      continue;
-    }
+    // Keep the bitcast result as the value to restage.  Its result element
+    // type is the logical SQMMA operand type even when the source has the same
+    // physical width (for example i16 bits decoded to f16).  Provenance-only
+    // descriptor tracing below may still look through the bitcast.
     if (arg.getDefiningOp<tt::TransOp>())
       break;
     break;
