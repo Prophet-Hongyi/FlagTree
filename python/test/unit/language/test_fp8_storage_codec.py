@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from low_precision_reference import E4M3FNUZ, decode_fp8, encode_fp8_rtne
+from low_precision_reference import E4M3FNUZ, E5M2FNUZ, decode_fp8, encode_fp8_rtne
 
 
 @triton.jit
@@ -168,16 +168,16 @@ def _fp32_storage_corpus(torch_fp8_dtype, max_finite_code, reference_format=None
     )
 
 
-def _reference_fnuz_storage(values):
+def _reference_fnuz_storage(values, fp8_format=E4M3FNUZ):
     return torch.tensor(
-        [encode_fp8_rtne(value, E4M3FNUZ) for value in values.to(torch.float32).tolist()],
+        [encode_fp8_rtne(value, fp8_format) for value in values.to(torch.float32).tolist()],
         dtype=torch.uint8,
     )
 
 
-def _reference_fnuz_decoded(storage, dtype):
+def _reference_fnuz_decoded(storage, dtype, fp8_format=E4M3FNUZ):
     return torch.tensor(
-        [decode_fp8(value, E4M3FNUZ) for value in storage.tolist()],
+        [decode_fp8(value, fp8_format) for value in storage.tolist()],
         dtype=torch.float32,
     ).to(dtype)
 
@@ -522,14 +522,137 @@ def test_e4m3fnuz_storage_decode_all_byte_patterns(device):
 
 
 @pytest.mark.parametrize(
+    "output_dtype,torch_dtype",
+    [
+        (tl.float16, torch.float16),
+        (tl.bfloat16, torch.bfloat16),
+        (tl.float32, torch.float32),
+    ],
+)
+def test_e5m2fnuz_storage_roundtrip_device(device, output_dtype, torch_dtype):
+    input_cpu = torch.tensor(
+        [
+            -math.inf,
+            -60000.0,
+            -57344.0,
+            -53248.0,
+            -1.125,
+            -(2**-15),
+            -(3 * 2**-17),
+            -(2**-17),
+            -(2**-18),
+            -0.0,
+            0.0,
+            2**-18,
+            2**-17,
+            3 * 2**-17,
+            2**-15,
+            1.125,
+            53248.0,
+            57344.0,
+            60000.0,
+            math.inf,
+            math.nan,
+        ],
+        dtype=torch.float16,
+    )
+    input = input_cpu.to(device)
+    storage = torch.empty(input_cpu.shape, dtype=torch.uint8, device=device)
+    output = torch.empty(input_cpu.shape, dtype=torch_dtype, device=device)
+
+    program = _fp8_storage_roundtrip_kernel[(1, )](
+        input,
+        storage,
+        output,
+        n_elements=input_cpu.numel(),
+        BLOCK_SIZE=32,
+        OUTPUT_DTYPE=output_dtype,
+        FORMAT="e5m2fnuz",
+    )
+
+    expected_storage = _reference_fnuz_storage(input_cpu, E5M2FNUZ)
+    expected_output = _reference_fnuz_decoded(expected_storage, torch_dtype, E5M2FNUZ)
+    torch.testing.assert_close(storage.cpu(), expected_storage, rtol=0, atol=0)
+    torch.testing.assert_close(output.cpu(), expected_output, rtol=0, atol=0, equal_nan=True)
+    _assert_software_storage_program(program)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+def test_e5m2fnuz_storage_encode_all_16bit_patterns(device, input_dtype):
+    input_cpu = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(input_dtype)
+    input = input_cpu.to(device)
+    storage = torch.empty(input_cpu.shape, dtype=torch.uint8, device=device)
+    output = torch.empty(input_cpu.shape, dtype=torch.float16, device=device)
+
+    block_size = 256
+    program = _fp8_storage_roundtrip_kernel[(triton.cdiv(input_cpu.numel(), block_size), )](
+        input,
+        storage,
+        output,
+        n_elements=input_cpu.numel(),
+        BLOCK_SIZE=block_size,
+        OUTPUT_DTYPE=tl.float16,
+        FORMAT="e5m2fnuz",
+    )
+
+    expected_storage = _reference_fnuz_storage(input_cpu, E5M2FNUZ)
+    expected_output = _reference_fnuz_decoded(expected_storage, torch.float16, E5M2FNUZ)
+    torch.testing.assert_close(storage.cpu(), expected_storage, rtol=0, atol=0)
+    torch.testing.assert_close(output.cpu(), expected_output, rtol=0, atol=0, equal_nan=True)
+    _assert_software_storage_program(program)
+
+
+def test_e5m2fnuz_storage_encode_fp32_boundary_corpus(device):
+    input_cpu = _fp32_storage_corpus(None, 0x7F, reference_format=E5M2FNUZ)
+    input = input_cpu.to(device)
+    storage = torch.empty(input_cpu.shape, dtype=torch.uint8, device=device)
+    output = torch.empty(input_cpu.shape, dtype=torch.float16, device=device)
+
+    block_size = 256
+    program = _fp8_storage_roundtrip_kernel[(triton.cdiv(input_cpu.numel(), block_size), )](
+        input,
+        storage,
+        output,
+        n_elements=input_cpu.numel(),
+        BLOCK_SIZE=block_size,
+        OUTPUT_DTYPE=tl.float16,
+        FORMAT="e5m2fnuz",
+    )
+
+    expected_storage = _reference_fnuz_storage(input_cpu, E5M2FNUZ)
+    expected_output = _reference_fnuz_decoded(expected_storage, torch.float16, E5M2FNUZ)
+    torch.testing.assert_close(storage.cpu(), expected_storage, rtol=0, atol=0)
+    torch.testing.assert_close(output.cpu(), expected_output, rtol=0, atol=0, equal_nan=True)
+    _assert_software_storage_program(program)
+
+
+def test_e5m2fnuz_storage_decode_all_byte_patterns(device):
+    storage_cpu = torch.arange(256, dtype=torch.int16).to(torch.uint8)
+    storage = storage_cpu.to(device)
+    output = torch.empty(storage_cpu.shape, dtype=torch.float16, device=device)
+
+    program = _fp8_storage_decode_kernel[(1, )](
+        storage,
+        output,
+        n_elements=storage_cpu.numel(),
+        BLOCK_SIZE=256,
+        FORMAT="e5m2fnuz",
+    )
+
+    expected = _reference_fnuz_decoded(storage_cpu, torch.float16, E5M2FNUZ)
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    _assert_software_storage_program(program)
+
+
+@pytest.mark.parametrize(
     "case,error",
     [
         ("encode_input", "encode_fp8 input must be tl.float16, tl.bfloat16, or tl.float32"),
-        ("encode_format", "encode_fp8 format must be 'e4m3fn', 'e4m3fnuz', or 'e5m2'"),
+        ("encode_format", "encode_fp8 format must be 'e4m3fn', 'e4m3fnuz', 'e5m2', or 'e5m2fnuz'"),
         ("encode_rounding", "encode_fp8 rounding must be 'rtne'"),
         ("encode_overflow", "encode_fp8 overflow must be 'satfinite'"),
         ("decode_input", "decode_fp8 input must be tl.uint8 storage"),
-        ("decode_format", "decode_fp8 format must be 'e4m3fn', 'e4m3fnuz', or 'e5m2'"),
+        ("decode_format", "decode_fp8 format must be 'e4m3fn', 'e4m3fnuz', 'e5m2', or 'e5m2fnuz'"),
         ("decode_dtype", "decode_fp8 dtype must be tl.float16, tl.bfloat16, or tl.float32"),
     ],
 )
