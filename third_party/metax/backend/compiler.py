@@ -112,13 +112,74 @@ def get_lld_version():
         return 0
 
 
+def _effective_profitability_policy() -> tuple[int, int, int, int, int]:
+    """Return the live MetaX selector identity only at owned decision points."""
+    metax_knob = knobs.metax
+    owns_decision_point = int(metax_knob.rlc_phase_mask) & 0b1100
+    enabled = bool(metax_knob.rlc_enhance and owns_decision_point and
+                   getattr(metax_knob, "rlc_profitability_policy", False))
+    if not enabled:
+        return (0, 0, 0, 0, 0)
+    return (
+        1,
+        int(getattr(metax_knob, "rlc_product_launch_count", 0) or 0),
+        int(getattr(
+            metax_knob,
+            "rlc_profitability_min_adjusted_saved_cost_per_tensor_op",
+            0,
+        ) or 0),
+        int(getattr(
+            metax_knob,
+            "rlc_profitability_phase3_saved_cost_multiplier",
+            0,
+        ) or 0),
+        int(getattr(
+            metax_knob,
+            "rlc_profitability_max_external_use_edges",
+            0,
+        ) or 0),
+    )
+
+
+def _apply_metax_rlc_policy(mod) -> None:
+    """Attach a complete opt-in policy or leave the common pass fail-closed."""
+    if not knobs.metax.rlc_enhance:
+        return
+    builder = ir.builder(mod.context)
+    (enabled, launch_count, min_score, phase3_multiplier,
+     max_external_uses) = _effective_profitability_policy()
+    if not enabled:
+        return
+    mod.set_attr("ttg.rlc-profitability-policy-enabled",
+                 builder.get_int32_attr(1))
+    if launch_count > 0:
+        mod.set_attr("ttg.rlc-product-launch-count",
+                     builder.get_int32_attr(launch_count))
+    if min_score > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op",
+            builder.get_int32_attr(min_score),
+        )
+    if phase3_multiplier > 0:
+        mod.set_attr("ttg.rlc-profitability-phase3-saved-cost-multiplier",
+                     builder.get_int32_attr(phase3_multiplier))
+    if max_external_uses >= 0:
+        mod.set_attr("ttg.rlc-profitability-max-external-use-edges",
+                     builder.get_int32_attr(max_external_uses))
+
+
 def _rlc_policy_signature() -> str:
     """Live RLC identity for disk and in-memory compile keys.
 
     Must be read on every compile. Do not cache this string across
     FLAGTREE_METAX_RLC_* environment changes in the same process.
     """
-    return f"{int(bool(knobs.metax.rlc_enhance))}-{int(knobs.metax.rlc_phase_mask)}"
+    fields = (
+        int(bool(knobs.metax.rlc_enhance)),
+        int(knobs.metax.rlc_phase_mask),
+        *_effective_profitability_policy(),
+    )
+    return "-".join(str(value) for value in fields)
 
 
 @dataclass(frozen=True)
@@ -257,6 +318,7 @@ class MACABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
+        _apply_metax_rlc_policy(mod)
         assert opt.pipeline_load_num >= -1, "invalid pipeline_load_num value!"
         scenarios = parse_option(opt.scenario)
         disable_prefetch = "unprefetch" in scenarios

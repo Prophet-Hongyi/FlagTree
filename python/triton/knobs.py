@@ -690,6 +690,19 @@ class metax_knobs(base_knobs):
     # until backend-specific IR, correctness, and performance gates pass.
     rlc_enhance: env_bool = env_bool("FLAGTREE_METAX_RLC_ENHANCE", False)
     rlc_phase_mask: env_int = env_int("FLAGTREE_METAX_RLC_PHASE_MASK", 0xF)
+    # MetaX profitability calibration is independent from MUSA. Every value is
+    # fail-closed by default; device harnesses must opt in and provide a full
+    # contract before the common selector can commit a proposal.
+    rlc_profitability_policy: env_bool = env_bool(
+        "FLAGTREE_METAX_RLC_PROFITABILITY_POLICY", False)
+    rlc_product_launch_count: env_int = env_int(
+        "FLAGTREE_METAX_RLC_PRODUCT_LAUNCH_COUNT", 0)
+    rlc_profitability_min_adjusted_saved_cost_per_tensor_op: env_int = env_int(
+        "FLAGTREE_METAX_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 0)
+    rlc_profitability_phase3_saved_cost_multiplier: env_int = env_int(
+        "FLAGTREE_METAX_RLC_PHASE3_SAVED_COST_MULTIPLIER", 0)
+    rlc_profitability_max_external_use_edges: env_int = env_int(
+        "FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", 0)
 
 
 # flagtree mthreads
