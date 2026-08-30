@@ -2,14 +2,14 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=8" | FileCheck %s --check-prefix=PHASE3
 // RUN: env FLAGTREE_RLC_TRACE_REJECTS=1 triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=8" 2>&1 | FileCheck %s --check-prefix=TRACE
 
-// TRACE-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=accept reason=writeback-rematerialized op=tt.atomic_rmw
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=accept reason=writeback-rematerialized op=tt.atomic_rmw{{.*}}online_launch_count=1{{.*}}online_removed_converts=1{{.*}}online_saved_cost={{[1-9][0-9]*}}{{.*}}online_atomic_ops=1
 // TRACE-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=reject reason=memory-access-change op=tt.store
 
 #blocked_atomic = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked_store = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 4], instrShape = [16, 8]}>
 
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-product-launch-count" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // MASK0-LABEL: tt.func @atomic_writeback
   // MASK0: ttg.convert_layout
   // MASK0: tt.atomic_rmw

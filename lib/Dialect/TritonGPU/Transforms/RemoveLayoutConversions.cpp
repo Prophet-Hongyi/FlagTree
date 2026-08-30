@@ -4632,8 +4632,16 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   auto valueConvert = valueOperand.get().getDefiningOp<ConvertLayoutOp>();
   if (!valueConvert)
     return false;
+  int64_t beforeCost = -1;
+  int64_t afterCost = -1;
+  bool hasProfitabilityFeatures = false;
+  RlcProfitabilityFeatures profitabilityFeatures;
   auto reject = [&](StringRef reason) {
-    traceRlcDecision("3", "reject", reason, writebackOp);
+    traceRlcDecision("3", "reject", reason, writebackOp,
+                     /*proposalSize=*/-1, /*removedConverts=*/-1, beforeCost,
+                     afterCost,
+                     hasProfitabilityFeatures ? &profitabilityFeatures
+                                              : nullptr);
     return false;
   };
   // The conversion must feed this writeback exclusively; otherwise it stays
@@ -4716,6 +4724,34 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
       !collectWritebackOperandSlice(*maskOperand, maskSlice, maskLayout))
     return reject("mask-slice-not-rematerializable");
 
+  profitabilityFeatures = collectFunctionProfitabilityFeatures(funcOp);
+  profitabilityFeatures.proposalValues =
+      1 + static_cast<int64_t>(ptrSlice.size() + maskSlice.size());
+  profitabilityFeatures.removedConverts = 1;
+  beforeCost = getConvertLayoutCost(valueConvert.getSrc());
+  afterCost = 0;
+  profitabilityFeatures.estimatedSavedCost = beforeCost;
+  profitabilityFeatures.loopResident =
+      writebackOp->getParentOfType<scf::ForOp>() ||
+      writebackOp->getParentOfType<scf::WhileOp>();
+  profitabilityFeatures.externalUseEdges = 0;
+  DenseSet<Operation *> rematerializedOps;
+  for (Value value : ptrSlice)
+    if (Operation *defOp = value.getDefiningOp())
+      rematerializedOps.insert(defOp);
+  for (Value value : maskSlice)
+    if (Operation *defOp = value.getDefiningOp())
+      rematerializedOps.insert(defOp);
+  auto countExternalUses = [&](const SetVector<Value> &slice) {
+    for (Value value : slice)
+      for (Operation *user : value.getUsers())
+        if (user != writebackOp && !rematerializedOps.contains(user))
+          ++profitabilityFeatures.externalUseEdges;
+  };
+  countExternalUses(ptrSlice);
+  countExternalUses(maskSlice);
+  hasProfitabilityFeatures = true;
+
   // All checks passed: commit. Insert a temporary convert on each address/mask
   // operand, then reuse the existing slice-rewrite machinery to push the
   // conversion up into the (cheap) producer chain and drop it.
@@ -4742,7 +4778,10 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
     atomicOp.getResult().setType(targetType);
   if (valueConvert.getResult().use_empty())
     opToDelete.insert(valueConvert);
-  traceRlcDecision("3", "accept", "writeback-rematerialized", writebackOp);
+  traceRlcDecision("3", "accept", "writeback-rematerialized", writebackOp,
+                   profitabilityFeatures.proposalValues,
+                   profitabilityFeatures.removedConverts, beforeCost,
+                   afterCost, &profitabilityFeatures);
   return true;
 }
 
