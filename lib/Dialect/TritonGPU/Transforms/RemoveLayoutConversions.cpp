@@ -64,6 +64,7 @@
 #include <cstdlib>
 #include <deque>
 #ifdef __FLAGTREE_RLC_ENHANCE__
+#include <limits>
 #include <optional>
 #endif // __FLAGTREE_RLC_ENHANCE__
 
@@ -135,6 +136,7 @@ struct RlcProfitabilityFeatures {
   int64_t proposalValues = -1;
   int64_t removedConverts = -1;
   int64_t estimatedSavedCost = -1;
+  int64_t adjustedSavedCostPerTensorOp = -1;
   int64_t externalUseEdges = -1;
   int64_t tensorOps = 0;
   int64_t globalLoadOps = 0;
@@ -197,6 +199,8 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
     os << " online_proposal_values=" << features->proposalValues
        << " online_removed_converts=" << features->removedConverts
        << " online_saved_cost=" << features->estimatedSavedCost
+       << " online_adjusted_saved_cost_per_tensor_op="
+       << features->adjustedSavedCostPerTensorOp
        << " online_external_use_edges=" << features->externalUseEdges
        << " online_loop_resident=" << static_cast<int>(features->loopResident)
        << " online_tensor_ops=" << features->tensorOps
@@ -464,6 +468,10 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-atomic-writeback-max-elements-per-thread-ratio
 //   ttg.rlc-allow-atomic-writeback-order-change
 //   ttg.rlc-preserve-int-to-fp-contiguity
+//   ttg.rlc-profitability-policy-enabled
+//   ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op
+//   ttg.rlc-profitability-phase3-saved-cost-multiplier
+//   ttg.rlc-profitability-max-external-use-edges
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -485,10 +493,27 @@ struct RlcBackendPolicy {
   // per-thread contiguous width can therefore change deterministic RNG bits.
   // Keep this opt-in so NVIDIA and already-qualified backends are unchanged.
   bool preserveIntToFpContiguity = false;
+  // The online selector is deliberately opt-in and fail-closed. The backend
+  // must provide every threshold together with an explicit product launch
+  // count and target. Keeping the defaults incomplete preserves the incumbent
+  // behavior when the selector is absent.
+  bool profitabilityPolicyEnabled = false;
+  bool profitabilityTargetKnown = false;
+  int64_t profitabilityMinAdjustedSavedCostPerTensorOp = -1;
+  int64_t profitabilityPhase3SavedCostMultiplier = -1;
+  int64_t profitabilityMaxExternalUseEdges = -1;
+
+  bool hasCompleteProfitabilityConfiguration() const {
+    return profitabilityMinAdjustedSavedCostPerTensorOp > 0 &&
+           profitabilityPhase3SavedCostMultiplier > 0 &&
+           profitabilityMaxExternalUseEdges >= 0;
+  }
 
   static RlcBackendPolicy fromOperation(Operation *op) {
     RlcBackendPolicy policy;
-    ModuleOp module = op ? op->getParentOfType<ModuleOp>() : ModuleOp();
+    ModuleOp module = op ? dyn_cast<ModuleOp>(op) : ModuleOp();
+    if (!module && op)
+      module = op->getParentOfType<ModuleOp>();
     if (!module)
       return policy;
 
@@ -519,20 +544,86 @@ struct RlcBackendPolicy {
     if (auto attr = module->getAttrOfType<IntegerAttr>(
             "ttg.rlc-preserve-int-to-fp-contiguity"))
       policy.preserveIntToFpContiguity = attr.getInt() > 0;
+    if (auto attr = module->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-profitability-policy-enabled"))
+      policy.profitabilityPolicyEnabled = attr.getInt() > 0;
+    if (auto target = module->getAttrOfType<StringAttr>("ttg.target"))
+      policy.profitabilityTargetKnown = !target.getValue().empty();
+    overridePositive(
+        "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op",
+        policy.profitabilityMinAdjustedSavedCostPerTensorOp);
+    overridePositive("ttg.rlc-profitability-phase3-saved-cost-multiplier",
+                     policy.profitabilityPhase3SavedCostMultiplier);
+    if (auto attr = module->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-profitability-max-external-use-edges"))
+      if (attr.getInt() >= 0)
+        policy.profitabilityMaxExternalUseEdges = attr.getInt();
     return policy;
   }
 };
 
 #ifdef __FLAGTREE_RLC_ENHANCE__
+static int64_t getRlcProductLaunchCount(Operation *op) {
+  ModuleOp module = op ? dyn_cast<ModuleOp>(op) : ModuleOp();
+  if (!module && op)
+    module = op->getParentOfType<ModuleOp>();
+  if (auto attr = module ? module->getAttrOfType<IntegerAttr>(
+                              "ttg.rlc-product-launch-count")
+                         : IntegerAttr())
+    if (attr.getInt() > 0)
+      return attr.getInt();
+  return -1;
+}
+
+static StringRef
+getRlcProfitabilityContextRejectReason(const RlcBackendPolicy &policy,
+                                       int64_t productLaunchCount) {
+  if (!policy.profitabilityPolicyEnabled)
+    return {};
+  if (!policy.profitabilityTargetKnown)
+    return "profitability-target-missing";
+  if (!policy.hasCompleteProfitabilityConfiguration())
+    return "profitability-policy-incomplete";
+  if (productLaunchCount != 1)
+    return "profitability-requires-single-product-launch";
+  return {};
+}
+
+static StringRef applyRlcProfitabilityPolicy(
+    const RlcBackendPolicy &policy, RlcProfitabilityFeatures &features,
+    bool isPhase3) {
+  if (!policy.profitabilityPolicyEnabled)
+    return {};
+  if (StringRef reason = getRlcProfitabilityContextRejectReason(
+          policy, features.productLaunchCount);
+      !reason.empty())
+    return reason;
+  if (features.proposalValues <= 0 || features.removedConverts <= 0 ||
+      features.estimatedSavedCost <= 0 || features.tensorOps <= 0 ||
+      features.externalUseEdges < 0)
+    return "profitability-online-features-incomplete";
+  if (features.externalUseEdges >
+      policy.profitabilityMaxExternalUseEdges)
+    return "profitability-external-use-budget";
+
+  int64_t score = features.estimatedSavedCost / features.tensorOps;
+  if (isPhase3) {
+    if (score > std::numeric_limits<int64_t>::max() /
+                    policy.profitabilityPhase3SavedCostMultiplier)
+      score = std::numeric_limits<int64_t>::max();
+    else
+      score *= policy.profitabilityPhase3SavedCostMultiplier;
+  }
+  features.adjustedSavedCostPerTensorOp = score;
+  if (score < policy.profitabilityMinAdjustedSavedCostPerTensorOp)
+    return "profitability-score-below-threshold";
+  return {};
+}
+
 static RlcProfitabilityFeatures
 collectFunctionProfitabilityFeatures(FuncOp funcOp) {
   RlcProfitabilityFeatures features;
-  if (ModuleOp module = funcOp->getParentOfType<ModuleOp>()) {
-    if (auto attr = module->getAttrOfType<IntegerAttr>(
-            "ttg.rlc-product-launch-count"))
-      if (attr.getInt() > 0)
-        features.productLaunchCount = attr.getInt();
-  }
+  features.productLaunchCount = getRlcProductLaunchCount(funcOp);
 
   funcOp.walk([&](Operation *op) {
     StringRef opName = op->getName().getStringRef();
@@ -2760,6 +2851,10 @@ bool LayoutPropagation::solveSmallComponents() {
       return reject("rank-changing-reduction-bridge");
     if (requireBenefit && !costIsLower)
       return reject("cost-not-lower", beforeCost, afterCost);
+    if (StringRef reason = applyRlcProfitabilityPolicy(
+            backendPolicy, profitabilityFeatures, /*isPhase3=*/false);
+        !reason.empty())
+      return reject(reason, beforeCost, afterCost);
     bool committed = commitProposal(proposal);
     traceProposal(committed ? "accept" : "reject",
                   committed ? "committed" : "commit-no-change", beforeCost,
@@ -4751,6 +4846,10 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   countExternalUses(ptrSlice);
   countExternalUses(maskSlice);
   hasProfitabilityFeatures = true;
+  if (StringRef reason = applyRlcProfitabilityPolicy(
+          policy, profitabilityFeatures, /*isPhase3=*/true);
+      !reason.empty())
+    return reject(reason);
 
   // All checks passed: commit. Insert a temporary convert on each address/mask
   // operand, then reuse the existing slice-rewrite machinery to push the
@@ -5524,6 +5623,25 @@ public:
         configuredByFactory ? rlcEnhance : enableRlcPhaseTesting;
     unsigned effectiveRlcPhaseMask =
         configuredByFactory ? rlcPhaseMask : rlcPhaseTestMask;
+    RlcBackendPolicy modulePolicy = RlcBackendPolicy::fromOperation(m);
+    if (modulePolicy.profitabilityPolicyEnabled) {
+      RlcProfitabilityFeatures contextFeatures;
+      contextFeatures.productLaunchCount = getRlcProductLaunchCount(m);
+      StringRef contextRejectReason = getRlcProfitabilityContextRejectReason(
+          modulePolicy, contextFeatures.productLaunchCount);
+      if (!contextRejectReason.empty()) {
+        traceRlcDecision("policy", "reject", contextRejectReason, m,
+                         /*proposalSize=*/-1, /*removedConverts=*/-1,
+                         /*beforeCost=*/-1, /*afterCost=*/-1,
+                         &contextFeatures);
+        effectiveRlcEnhance = false;
+      } else {
+        traceRlcDecision("policy", "accept", "context-ready", m,
+                         /*proposalSize=*/-1, /*removedConverts=*/-1,
+                         /*beforeCost=*/-1, /*afterCost=*/-1,
+                         &contextFeatures);
+      }
+    }
     bool costBased = effectiveRlcEnhance &&
                      (effectiveRlcPhaseMask & kRlcCostBasedResolution) != 0;
     bool backwardProp = effectiveRlcEnhance &&
@@ -5539,6 +5657,12 @@ public:
       backwardProp = false;
       smallComponentSolving = false;
     }
+    // Phase 1b commits propagation changes without a complete proposal-local
+    // score. A policy-enabled pipeline therefore uses the measured Phase 2/3
+    // decision points only; the incumbent all-phases behavior is unchanged
+    // when the selector is absent.
+    if (modulePolicy.profitabilityPolicyEnabled)
+      backwardProp = false;
     // The phase extensions consult the real address pattern of loads (see
     // isOrderIndifferentAccess); the analysis is only built when they
     // are enabled so the all-disabled path stays identical to the original
