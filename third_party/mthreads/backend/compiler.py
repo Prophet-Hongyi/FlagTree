@@ -601,11 +601,11 @@ class MUSAOptions:
     cluster_dims: tuple = (1, 1, 1)  # flagtree mthreads3.2
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
-    supported_fp8_dtypes: Tuple[str, ...] = ("fp8e5", )
-    supported_fp8_storage_dtypes: Tuple[str, ...] = ("fp8e5", )
+    supported_fp8_dtypes: Tuple[str, ...] = ()
+    supported_fp8_storage_dtypes: Tuple[str, ...] = ()
     custom_fp8_dtypes: Tuple[str, ...] = ()
     deprecated_fp8_dot_operand_dtypes: Tuple[str, ...] = ()
-    supports_batched_dot_scaled: bool = True
+    supports_batched_dot_scaled: bool = False
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: Tuple[str, ...] = ("ieee", "tf32", "tf32x3", "bf16x3", "bf16x6")
     max_num_imprecise_acc_default: int = 0
@@ -667,27 +667,54 @@ class MUSABackend(BaseBackend):
         opts = dict(opts)
         arch = knobs.runtime.override_arch or opts.get("arch", None) or self.target.arch
         args = {"arch": _normalize_arch(arch)}
+        args.update({
+            k: opts[k]
+            for k in MUSAOptions.__dataclass_fields__.keys()
+            if k in opts and opts[k] is not None
+        })
         capability = _capability_from_arch(args["arch"])
+        target_features = mthreads.get_low_precision_target_features(capability)
         if opts.get("num_ctas", 1) > 1 and capability == 31:
             raise ValueError("num_ctas > 1 requires MUSA cluster launch support. "
                              f"Current target is {args['arch']} (capability {capability}).")
         if "enable_fp_fusion" not in opts:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
-        if "supported_fp8_dtypes" not in opts:
-            supported_fp8_dtypes = {"fp8e5"}
-            if capability >= 31:
-                supported_fp8_dtypes.add("fp8e4nv")
-            args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
-        if "supported_fp8_storage_dtypes" not in opts:
-            supported_fp8_storage_dtypes = set(args.get("supported_fp8_dtypes", ()))
-            if capability >= 31:
-                supported_fp8_storage_dtypes.update({"fp8e4b15", "fp8e4b8", "fp8e5b16"})
-            args["supported_fp8_storage_dtypes"] = tuple(sorted(supported_fp8_storage_dtypes))
-        if "custom_fp8_dtypes" not in opts:
-            custom_fp8_dtypes = set()
-            if capability >= 31:
-                custom_fp8_dtypes.update({"fp8e4b15", "fp8e4b8", "fp8e5b16"})
-            args["custom_fp8_dtypes"] = tuple(sorted(custom_fp8_dtypes))
+        if "supported_fp8_dtypes" not in args:
+            args["supported_fp8_dtypes"] = tuple(
+                target_features["supported_fp8_dtypes"]
+            )
+        if "supported_fp8_storage_dtypes" not in args:
+            args["supported_fp8_storage_dtypes"] = tuple(
+                target_features["supported_fp8_storage_dtypes"]
+            )
+        if "custom_fp8_dtypes" not in args:
+            args["custom_fp8_dtypes"] = tuple(target_features["custom_fp8_dtypes"])
+        for option_name in (
+            "supported_fp8_dtypes",
+            "supported_fp8_storage_dtypes",
+            "custom_fp8_dtypes",
+        ):
+            requested = args[option_name]
+            if isinstance(requested, str):
+                raise TypeError(f"{option_name} must be a sequence of dtype names")
+            requested = tuple(sorted(set(requested)))
+            unsupported = set(requested) - set(target_features[option_name])
+            if unsupported:
+                names = ", ".join(sorted(unsupported))
+                raise ValueError(
+                    f"{option_name} dtype(s) {names} are not supported on MUSA capability {capability}"
+                )
+            args[option_name] = requested
+        if "supports_batched_dot_scaled" not in args:
+            args["supports_batched_dot_scaled"] = target_features[
+                "supports_batched_dot_scaled"
+            ]
+        elif args["supports_batched_dot_scaled"] and not target_features[
+            "supports_batched_dot_scaled"
+        ]:
+            raise ValueError(
+                f"batched dot_scaled is not supported on MUSA capability {capability}"
+            )
         if "deprecated_fp8_dot_operand_dtypes" not in opts:
             args["deprecated_fp8_dot_operand_dtypes"] = ()
         if "llc_path" not in opts:
@@ -704,7 +731,6 @@ class MUSABackend(BaseBackend):
             args["enable_fp8_burst2"] = knobs.musa.enable_fp8_burst2
         if "enable_llvm_compat" not in opts:
             args["enable_llvm_compat"] = knobs.musa.enable_llvm_compat
-        args.update({k: opts[k] for k in MUSAOptions.__dataclass_fields__.keys() if k in opts and opts[k] is not None})
         if "warp_size" not in args:
             args["warp_size"] = _warp_size_from_capability(capability)
         return MUSAOptions(**args)

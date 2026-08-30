@@ -26,6 +26,77 @@ def _get_musa_backend():
     return backends["mthreads"].compiler(target)
 
 
+def _get_musa_backend_for_capability(capability):
+    if "mthreads" not in backends:
+        pytest.skip("musa backend not discovered")
+    target = GPUTarget("musa", capability, 32)
+    return backends["mthreads"].compiler(target)
+
+
+@pytest.mark.parametrize(
+    (
+        "capability, architecture, ocp_conversion, custom_conversion, "
+        "fp8_mma, fp4_conversion, int8_mma"
+    ),
+    [
+        (31, "ph1", "native", "software", "native", "software", "native"),
+        (
+            40,
+            "unknown",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+        ),
+    ],
+)
+def test_musa_low_precision_target_features(
+    capability,
+    architecture,
+    ocp_conversion,
+    custom_conversion,
+    fp8_mma,
+    fp4_conversion,
+    int8_mma,
+):
+    features = libtriton.mthreads.get_low_precision_target_features(capability)
+    assert features["architecture"] == architecture
+    assert features["ocp_fp8_conversion"] == ocp_conversion
+    assert features["custom_fp8_conversion"] == custom_conversion
+    assert features["fp8_mma"] == fp8_mma
+    assert features["fp4_conversion"] == fp4_conversion
+    assert features["signed_int8_mma"] == int8_mma
+
+
+@pytest.mark.parametrize(
+    "option_name, value",
+    [
+        ("supported_fp8_dtypes", ("fp8e4nv",)),
+        ("supported_fp8_storage_dtypes", ("fp8e4b8",)),
+        ("custom_fp8_dtypes", ("fp8e4b8",)),
+    ],
+)
+def test_unknown_musa_capability_rejects_fp8_options(option_name, value):
+    backend = _get_musa_backend_for_capability(40)
+    with pytest.raises(ValueError, match="not supported on MUSA capability 40"):
+        backend.parse_options({option_name: value})
+
+
+def test_unknown_musa_capability_fails_closed_for_low_precision():
+    backend = _get_musa_backend_for_capability(40)
+    options = backend.parse_options({})
+    assert options.supported_fp8_dtypes == ()
+    assert options.supported_fp8_storage_dtypes == ()
+    assert options.custom_fp8_dtypes == ()
+    assert not options.supports_batched_dot_scaled
+    with pytest.raises(
+        ValueError,
+        match="batched dot_scaled is not supported on MUSA capability 40",
+    ):
+        backend.parse_options({"supports_batched_dot_scaled": True})
+
+
 def _compile_to_llir(fn, signature, constexprs=None):
     target = GPUTarget("musa", "ph1", 32)
     backend = _get_musa_backend()

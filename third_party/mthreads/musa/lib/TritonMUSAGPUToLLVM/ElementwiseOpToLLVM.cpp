@@ -1,4 +1,5 @@
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TritonMUSACommon/TargetFeatures.h"
 #include "TritonMUSAGPUToLLVM/TargetInfo.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -143,8 +144,10 @@ struct FpToFpOpConversion
 
   explicit FpToFpOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
+                              int computeCapability,
                               PatternBenefit benefit = patternBenefitDefault)
-      : Base(typeConverter, axisAnalysisPass, benefit) {}
+      : Base(typeConverter, axisAnalysisPass, benefit),
+        targetFeatures(computeCapability) {}
 
   struct Fp8ConversionDesc {
     StringRef funcName;
@@ -418,6 +421,11 @@ struct FpToFpOpConversion
 
     bool isFp8Conversion = isFp8Type(srcElemTy) || isFp8Type(dstElemTy);
     if (isFp8Conversion) {
+      if (targetFeatures.getOcpFp8ConversionMode() !=
+          mlir::triton::musa::LowPrecisionMode::Native) {
+        llvm::report_fatal_error(
+            "native OCP FP8 conversion requires MUSA capability 31");
+      }
       if (isFp8Type(dstElemTy)) {
         if (roundingMode.has_value() &&
             roundingMode.value() == RoundingMode::RTZ) {
@@ -512,6 +520,9 @@ struct FpToFpOpConversion
 
     return {};
   }
+
+private:
+  mlir::triton::musa::TargetFeatures targetFeatures;
 };
 
 template <typename OpType>
@@ -870,7 +881,7 @@ struct TruncFOpConversion
 
 void mlir::triton::MUSA::populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    ModuleAxisInfoAnalysis &axisInfoAnalysis, int /*computeCapability*/,
+    ModuleAxisInfoAnalysis &axisInfoAnalysis, int computeCapability,
     const TargetInfo &targetInfo, PatternBenefit benefit) {
   PatternBenefit priorityBenefit(benefit.getBenefit() + 1);
   patterns.add<FDivOpConversion>(typeConverter, axisInfoAnalysis,
@@ -893,7 +904,8 @@ void mlir::triton::MUSA::populateElementwiseOpToLLVMPatterns(
   patterns.add<TruncFOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FPToSIOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<SIToFPOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-  patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+  patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
+                                   computeCapability, benefit);
   patterns.add<PreciseSqrtOpConversion>(typeConverter, axisInfoAnalysis,
                                         priorityBenefit);
   patterns.add<PreciseDivOpConversion>(typeConverter, axisInfoAnalysis,

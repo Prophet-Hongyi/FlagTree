@@ -6,6 +6,7 @@
 #endif // __TLE__
 #include "TritonMUSACommon/MemDescUtils.h"
 #include "TritonMUSACommon/SqmmaAttrUtils.h"
+#include "TritonMUSACommon/TargetFeatures.h"
 #include "TritonMUSAGPUTransforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -1735,6 +1736,7 @@ struct TritonMUSAGPUAccelerateMatmulPass
     int computeCapability = getMusaComputeCapability(mod);
     if (computeCapability < 0)
       return;
+    triton::musa::TargetFeatures targetFeatures(computeCapability);
 
     bool disableSqmma = ::triton::tools::getBoolEnv("DISABLE_SQMMA");
     bool disableWmma = ::triton::tools::getBoolEnv("DISABLE_WMMA");
@@ -1751,10 +1753,10 @@ struct TritonMUSAGPUAccelerateMatmulPass
     }
 #endif // __TLE__
 
-    bool sqmmaCandidate = computeCapability >= 31 && !disableSqmma;
+    bool sqmmaCandidate = targetFeatures.supportsMmaLowering() && !disableSqmma;
     // Preserve the 3.6 fallback behavior: descriptor/TME modules may still
     // fall back to WMMA when SQMMA predicate matching rejects a dot.
-    bool wmmaCandidate = computeCapability == 31 && !disableWmma;
+    bool wmmaCandidate = targetFeatures.supportsMmaLowering() && !disableWmma;
 
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);

@@ -1,6 +1,7 @@
 #include "Dialect/MTGPU/IR/Dialect.h"
 #include "Dialect/MUSA/IR/Dialect.h"
 #include "MTGPUToLLVM/Passes.h"
+#include "TritonMUSACommon/TargetFeatures.h"
 #include "TritonMUSAGPUToLLVM/Passes.h"
 #include "TritonMUSAGPUTransforms/Passes.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -150,6 +151,35 @@ void init_triton_musa_passes_ttgpuir(py::module m) {
 }
 
 void init_triton_mthreads(py::module &&m) {
+  m.def("get_low_precision_target_features", [](int32_t capability) {
+    mlir::triton::musa::TargetFeatures features(capability);
+    py::dict result;
+    result["architecture"] = features.getArchitectureName();
+    result["ocp_fp8_conversion"] =
+        mlir::triton::musa::stringifyLowPrecisionMode(
+            features.getOcpFp8ConversionMode());
+    result["custom_fp8_conversion"] =
+        mlir::triton::musa::stringifyLowPrecisionMode(
+            features.getCustomFp8ConversionMode());
+    result["fp8_mma"] =
+        mlir::triton::musa::stringifyLowPrecisionMode(features.getFp8MmaMode());
+    result["fp4_conversion"] = mlir::triton::musa::stringifyLowPrecisionMode(
+        features.getFp4ConversionMode());
+    result["signed_int8_mma"] = mlir::triton::musa::stringifyLowPrecisionMode(
+        features.getSignedInt8MmaMode());
+    result["supported_fp8_dtypes"] =
+        features.isPH1() ? py::make_tuple("fp8e4nv", "fp8e5") : py::tuple();
+    result["supported_fp8_storage_dtypes"] =
+        features.isPH1() ? py::make_tuple("fp8e4b15", "fp8e4b8", "fp8e4nv",
+                                          "fp8e5", "fp8e5b16")
+                         : py::tuple();
+    result["custom_fp8_dtypes"] =
+        features.isPH1() ? py::make_tuple("fp8e4b15", "fp8e4b8", "fp8e5b16")
+                         : py::tuple();
+    result["supports_batched_dot_scaled"] = features.supportsBatchedDotScaled();
+    return result;
+  });
+
 #ifdef __TLE__
   init_triton_musa_tle_ir(m.def_submodule("ir"));
 #endif // __TLE__
