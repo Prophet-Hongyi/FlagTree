@@ -1,5 +1,6 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
+#include "TritonMETAXGPUCommon/TargetFeatures.h"
 #include "Utility.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
@@ -1130,7 +1131,9 @@ struct FpToFpOpConversion
 
   static std::pair<ConverterT, size_t>
   Fp32_to_Fp8E5M2FNUZ_RTNE(int computeCapability) {
-    return computeCapability >= 89
+    mlir::triton::metax::TargetFeatures features(computeCapability);
+    return features.getCustomFp8ConversionMode() ==
+                   mlir::triton::metax::LowPrecisionMode::Native
                ? std::make_pair(Fp32_to_Fp8E5M2FNUZ_RTNE_HW, 4)
                : std::make_pair(Fp32_to_Fp8E5M2FNUZ_RTNE_SW, 2);
   }
@@ -1259,7 +1262,9 @@ struct FpToFpOpConversion
 
   static std::pair<ConverterT, size_t>
   Fp32_to_Fp8E4M3FNUZ_RTNE(int computeCapability) {
-    return computeCapability >= 89
+    mlir::triton::metax::TargetFeatures features(computeCapability);
+    return features.getCustomFp8ConversionMode() ==
+                   mlir::triton::metax::LowPrecisionMode::Native
                ? std::make_pair(Fp32_to_Fp8E4M3FNUZ_RTNE_HW, 4)
                : std::make_pair(Fp32_to_Fp8E4M3FNUZ_RTNE_SW, 2);
   }
@@ -1293,9 +1298,12 @@ struct FpToFpOpConversion
 
   static std::pair<ConverterT, size_t>
   Fp32_to_Fp8E4M3FN_RTNE(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F32_F8_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp32_to_Fp8E4M3FN_RTNE_HW, 4)
                : std::make_pair(Fp32_to_Fp8E4M3FN_RTNE_SW, 2);
   }
@@ -1444,66 +1452,91 @@ struct FpToFpOpConversion
 
   static std::pair<ConverterT, size_t>
   Fp32_to_Fp8E5M2_RTNE(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F32_F8_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp32_to_Fp8E5M2_RTNE_HW, 4)
                : std::make_pair(Fp32_to_Fp8E5M2_RTNE_SW, 2);
   }
 
   static std::pair<ConverterT, size_t>
   Fp8E4M3FN_to_Fp16(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F8_F16_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp8E4M3FN_to_Fp16_HW, 2)
                : std::make_pair(Fp8E4M3FN_to_Fp16_SW, 2);
   }
 
   static std::pair<ConverterT, size_t> Fp8E5M2_to_Fp16(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F8_F16_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp8E5M2_to_Fp16_HW, 2)
                : std::make_pair(Fp8E5M2_to_Fp16_SW, 4);
   }
 
   static std::pair<ConverterT, size_t>
   Fp8E4M3FN_to_Bf16(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F8_F16_CVT") == nullptr;
-    return (computeCapability >= 80 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp8E4M3FN_to_Bf16_FAST, 2)
                : std::make_pair(Fp8E4M3FN_to_Bf16_SW, 2);
   }
 
   static std::pair<ConverterT, size_t>
   Fp16_to_Fp8E4M3FN(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F16_F8_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp16_to_Fp8E4M3FN_RTNE_FAST, 2)
                : std::make_pair(Fp16_to_Fp8E4M3FN_RTNE_SW, 2);
   }
 
   static std::pair<ConverterT, size_t> Fp16_to_Fp8E5M2(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F16_F8_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Fp16_to_Fp8E5M2_RTNE_FAST, 2)
                : std::make_pair(Fp16_to_Fp8E5M2_RTNE_SW, 2);
   }
 
   static std::pair<ConverterT, size_t>
   Bf16_to_Fp8E4M3FN(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
     bool enableFastCvt =
         std::getenv("TRITON_DISABLE_FAST_F16_F8_CVT") == nullptr;
-    return (computeCapability >= 89 && enableFastCvt)
+    return (features.getOcpFp8ConversionMode() ==
+                mlir::triton::metax::LowPrecisionMode::Native &&
+            enableFastCvt)
                ? std::make_pair(Bf16_to_Fp8E4M3FN_FAST, 2)
                : std::make_pair(Bf16_to_Fp8E4M3FN_RTNE_SW, 2);
   }
 
   static ConversionMap buildConversionMap(int computeCapability) {
+    mlir::triton::metax::TargetFeatures features(computeCapability);
+    if (!features.supportsFp8Conversion())
+      return ConversionMap();
+
     auto F8E4M3B15TyID = TypeID::get<mlir::Float8E4M3B11FNUZType>();
     auto F8E4M3FNUZTyID = TypeID::get<mlir::Float8E4M3FNUZType>();
     auto F8E5M2FNUZTyID = TypeID::get<mlir::Float8E5M2FNUZType>();
@@ -1617,8 +1650,10 @@ struct FpToFpOpConversion
       return outVals;
     }
 
-    auto enableFastF8Cvt =
-        (computeCapability >= 89 && std::getenv("TRITON_ENABLE_FAST_FP8_CVT"));
+    mlir::triton::metax::TargetFeatures targetFeatures(computeCapability);
+    auto enableFastF8Cvt = targetFeatures.getOcpFp8ConversionMode() ==
+                               mlir::triton::metax::LowPrecisionMode::Native &&
+                           std::getenv("TRITON_ENABLE_FAST_FP8_CVT");
     bool useFP16IntermediateSrc =
         srcElementType.isF32() && !(dstElementType.isFloat(8));
     bool useFP32IntermediateSrcF16 = srcElementType.isF16() &&

@@ -127,6 +127,61 @@ def _compile_downcast(dtype_name, arch):
     )
 
 
+def _get_metax_backend_for_capability(capability):
+    target = GPUTarget("maca", capability, 64)
+    return backends["metax"].compiler(target)
+
+
+@pytest.mark.parametrize(
+    (
+        "capability, architecture, ocp_conversion, custom_conversion, "
+        "fp8_mma, fp4_conversion, int8_mma"
+    ),
+    [
+        (80, "c550", "software", "software", "software", "software", "native"),
+        (
+            89,
+            "unknown",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+        ),
+    ],
+)
+def test_metax_low_precision_target_features(
+    capability,
+    architecture,
+    ocp_conversion,
+    custom_conversion,
+    fp8_mma,
+    fp4_conversion,
+    int8_mma,
+):
+    features = libtriton.metax.get_low_precision_target_features(capability)
+    assert features["architecture"] == architecture
+    assert features["ocp_fp8_conversion"] == ocp_conversion
+    assert features["custom_fp8_conversion"] == custom_conversion
+    assert features["fp8_mma"] == fp8_mma
+    assert features["fp4_conversion"] == fp4_conversion
+    assert features["signed_int8_mma"] == int8_mma
+
+
+def test_unknown_metax_capability_fails_closed_for_fp8():
+    backend = _get_metax_backend_for_capability(89)
+    options = backend.parse_options({})
+    assert options.supported_fp8_dtypes == ()
+    assert not options.supports_batched_dot_scaled
+    with pytest.raises(ValueError, match="not supported on MetaX capability 89"):
+        backend.parse_options({"supported_fp8_dtypes": ("fp8e4nv",)})
+    with pytest.raises(
+        ValueError,
+        match="batched dot_scaled is not supported on MetaX capability 89",
+    ):
+        backend.parse_options({"supports_batched_dot_scaled": True})
+
+
 @pytest.mark.parametrize("dtype_name", [case[0] for case in _FP8_FORMATS])
 def test_c550_fp8_dot_uses_software_upcast_and_fp16_mma(dtype_name):
     compiled = _compile_c550(dtype_name)
@@ -139,12 +194,9 @@ def test_c550_fp8_dot_uses_software_upcast_and_fp16_mma(dtype_name):
 
 @pytest.mark.parametrize("dtype_name,hardware_intrinsic", _FP8_DOWNCAST_CASES)
 def test_fp8_conversion_selector_is_target_local(dtype_name, hardware_intrinsic):
-    native = _compile_downcast(dtype_name, 89)
     c550 = _compile_downcast(dtype_name, 80)
 
-    assert hardware_intrinsic in native.asm["llir"]
     assert hardware_intrinsic not in c550.asm["llir"]
-    assert native.asm["mcfatbin"]
     assert c550.asm["mcfatbin"]
 
 

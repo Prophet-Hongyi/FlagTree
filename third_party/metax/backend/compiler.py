@@ -135,7 +135,7 @@ class MACAOptions:
     ptx_version: int = None
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
     enable_fp_fusion: bool = True
-    supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15", "fp8e4nv")
+    supported_fp8_dtypes: Tuple[str, ...] = ()
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
     supports_batched_dot_scaled: bool = False
     default_dot_input_precision: str = "tf32"
@@ -208,8 +208,43 @@ class MACABackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
-        args.update({k: opts[k] for k in MACAOptions.__dataclass_fields__.keys() if k in opts})
-        args["max_num_imprecise_acc_default"] = 2**30 if self.capability == 90 else 0
+        args.update({
+            k: opts[k]
+            for k in MACAOptions.__dataclass_fields__.keys()
+            if k in opts and opts[k] is not None
+        })
+        capability = self._parse_arch(args["arch"])
+        target_features = metax.get_low_precision_target_features(capability)
+        if "supported_fp8_dtypes" not in args:
+            args["supported_fp8_dtypes"] = tuple(
+                target_features["supported_fp8_dtypes"]
+            )
+        requested_fp8_dtypes = args["supported_fp8_dtypes"]
+        if isinstance(requested_fp8_dtypes, str):
+            raise TypeError("supported_fp8_dtypes must be a sequence of dtype names")
+        requested_fp8_dtypes = tuple(sorted(set(requested_fp8_dtypes)))
+        unsupported = set(requested_fp8_dtypes) - set(
+            target_features["supported_fp8_dtypes"]
+        )
+        if unsupported:
+            names = ", ".join(sorted(unsupported))
+            raise ValueError(
+                f"supported_fp8_dtypes dtype(s) {names} are not supported "
+                f"on MetaX capability {capability}"
+            )
+        args["supported_fp8_dtypes"] = requested_fp8_dtypes
+        if "supports_batched_dot_scaled" not in args:
+            args["supports_batched_dot_scaled"] = target_features[
+                "supports_batched_dot_scaled"
+            ]
+        elif args["supports_batched_dot_scaled"] and not target_features[
+            "supports_batched_dot_scaled"
+        ]:
+            raise ValueError(
+                "batched dot_scaled is not supported on MetaX capability "
+                f"{capability}"
+            )
+        args["max_num_imprecise_acc_default"] = 2**30 if capability == 90 else 0
         return MACAOptions(**args)
 
     def pack_metadata(self, metadata):

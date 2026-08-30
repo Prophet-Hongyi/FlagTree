@@ -1,3 +1,4 @@
+#include "TritonMETAXGPUCommon/TargetFeatures.h"
 #include "TritonMETAXGPUToLLVM/Passes.h"
 #include "TritonMETAXGPUTransforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/MACADialect.h"
@@ -66,6 +67,29 @@ PLUGIN_EXPORT void init_triton_metax_passes_ttgpuir(py::module &&m) {
 }
 
 PLUGIN_EXPORT void init_triton_metax(py::module &&m) {
+  m.def("get_low_precision_target_features", [](int32_t capability) {
+    mlir::triton::metax::TargetFeatures features(capability);
+    py::dict result;
+    result["architecture"] = features.getArchitectureName();
+    result["ocp_fp8_conversion"] =
+        mlir::triton::metax::stringifyLowPrecisionMode(
+            features.getOcpFp8ConversionMode());
+    result["custom_fp8_conversion"] =
+        mlir::triton::metax::stringifyLowPrecisionMode(
+            features.getCustomFp8ConversionMode());
+    result["fp8_mma"] = mlir::triton::metax::stringifyLowPrecisionMode(
+        features.getFp8MmaMode());
+    result["fp4_conversion"] = mlir::triton::metax::stringifyLowPrecisionMode(
+        features.getFp4ConversionMode());
+    result["signed_int8_mma"] = mlir::triton::metax::stringifyLowPrecisionMode(
+        features.getSignedInt8MmaMode());
+    result["supported_fp8_dtypes"] =
+        features.isC550() ? py::make_tuple("fp8e4b15", "fp8e4nv", "fp8e5")
+                          : py::tuple();
+    result["supports_batched_dot_scaled"] = false;
+    return result;
+  });
+
   auto passes = m.def_submodule("passes");
   init_triton_metax_passes_ttgpuir(passes.def_submodule("ttgpuir"));
 

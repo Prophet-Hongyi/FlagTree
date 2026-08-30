@@ -2,6 +2,7 @@
  * 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights
  * Reserved.
  */
+#include "TritonMETAXGPUCommon/TargetFeatures.h"
 #include "TritonMETAXGPUTransforms/MACACommon.h"
 #include "TritonMETAXGPUTransforms/Passes.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -149,8 +150,7 @@ static bool isLegalMACAMmaShape(int m, int n, int k, Type elementTy,
 // backend-local Fp4ToFpOp lowering decodes them to BF16 before BlockedToMMA
 // selects the existing BF16 MMA path.  Keep this fallback scoped to C550 so it
 // cannot shadow a native path on a future MetaX target.
-class DecomposeC550E2M1DotScaled final
-    : public ttg::DecomposeScaledBlocked {
+class DecomposeC550E2M1DotScaled final : public ttg::DecomposeScaledBlocked {
   int computeCapability;
 
 public:
@@ -161,10 +161,11 @@ public:
 
   LogicalResult matchAndRewrite(tt::DotScaledOp op,
                                 PatternRewriter &rewriter) const override {
-    if (computeCapability != 80 ||
+    triton::metax::TargetFeatures targetFeatures(computeCapability);
+    if (!targetFeatures.supportsSoftwareFp4DotScaled() ||
         op.getAElemType() != tt::ScaleDotElemType::E2M1 ||
-        op.getBElemType() != tt::ScaleDotElemType::E2M1 ||
-        !op.getLhsKPack() || !op.getRhsKPack())
+        op.getBElemType() != tt::ScaleDotElemType::E2M1 || !op.getLhsKPack() ||
+        !op.getRhsKPack())
       return failure();
     return DecomposeScaledBlocked::matchAndRewrite(op, rewriter);
   }
@@ -177,14 +178,14 @@ public:
 // parameters depend on the effective MMA operand type.
 static void legalizeSoftwareFp8DotOperands(ModuleOp mod,
                                            int computeCapability) {
-  if (computeCapability < 80 || computeCapability >= 86)
+  triton::metax::TargetFeatures targetFeatures(computeCapability);
+  if (!targetFeatures.supportsSoftwareFp8Dot())
     return;
 
   mod.walk([](triton::DotOp dotOp) {
     auto aType = cast<RankedTensorType>(dotOp.getA().getType());
     auto bType = cast<RankedTensorType>(dotOp.getB().getType());
-    if (!isOcpFp8(aType.getElementType()) ||
-        !isOcpFp8(bType.getElementType()))
+    if (!isOcpFp8(aType.getElementType()) || !isOcpFp8(bType.getElementType()))
       return;
 
     OpBuilder builder(dotOp);
@@ -223,6 +224,19 @@ public:
     if (computeCapability < 70)
       return failure();
     auto dotOp = cast<triton::DotOp>(op);
+    triton::metax::TargetFeatures targetFeatures(computeCapability);
+    auto aElementType =
+        cast<RankedTensorType>(dotOp.getA().getType()).getElementType();
+    auto bElementType =
+        cast<RankedTensorType>(dotOp.getB().getType()).getElementType();
+    bool usesFp8 = isOcpFp8(aElementType) || isOcpFp8(bElementType);
+    bool usesSignedInt8 =
+        aElementType.isInteger(8) || bElementType.isInteger(8);
+    if ((usesFp8 && targetFeatures.getFp8MmaMode() ==
+                        triton::metax::LowPrecisionMode::Unsupported) ||
+        (usesSignedInt8 && targetFeatures.getSignedInt8MmaMode() !=
+                               triton::metax::LowPrecisionMode::Native))
+      return failure();
     // TODO: Check data-types and SM compatibility
     auto oldRetType = cast<RankedTensorType>(dotOp.getResult().getType());
     if (!oldRetType.getEncoding() ||
