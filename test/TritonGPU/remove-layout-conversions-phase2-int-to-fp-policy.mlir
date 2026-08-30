@@ -29,7 +29,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #dst = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-int-to-fp-vector-width-mask" = 20 : i32, "ttg.rlc-preserve-int-to-fp-contiguity" = 1 : i32, ttg.target = "musa:31", "ttg.threads-per-warp" = 32 : i32} {
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-int-to-fp-vector-width-mask" = 20 : i32, "ttg.rlc-preserve-int-to-fp-contiguity" = 1 : i32, "ttg.rlc-product-launch-count" = 1 : i32, "ttg.rlc-profitability-max-external-use-edges" = 0 : i64, "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op" = 1 : i64, "ttg.rlc-profitability-phase3-saved-cost-multiplier" = 2 : i64, "ttg.rlc-profitability-policy-enabled" = 1 : i32, ttg.target = "musa:31", "ttg.threads-per-warp" = 32 : i32} {
   // Both layouts own two elements per thread, so MUSA can keep the original
   // conversion width explicitly while the whole producer chain retags.
   // VECTORIZED-LABEL: tt.func @int_to_fp_retag_vector_width_preserved
@@ -114,5 +114,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc
   }
 }
 
-// TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=int-to-fp-vector-width
-// TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=int-to-fp-contiguity-boundary
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=int-to-fp-vector-width
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=accept reason=committed{{.*}}online_external_use_edges=0
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=int-to-fp-contiguity-boundary

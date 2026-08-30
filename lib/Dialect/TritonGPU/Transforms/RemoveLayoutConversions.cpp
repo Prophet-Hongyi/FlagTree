@@ -2821,9 +2821,12 @@ bool LayoutPropagation::solveSmallComponents() {
   };
 
   // Complete the function-level online feature snapshot with proposal-local
-  // topology. An edge is external when its user does not define any value in
-  // the proposal. This is intentionally an IR/use-def property, not a kernel
-  // identity or a final-codegen measurement.
+  // topology. An edge is external when the user crosses the proposal boundary
+  // and therefore needs a compensating layout bridge. A terminal store is not
+  // such an edge when all of its tensor operands already have, or are proposed
+  // to have, the same effective encoding: it consumes the retagged values
+  // directly and defines no tensor that can fan out. This is intentionally an
+  // IR/use-def property, not a kernel identity or a final-codegen measurement.
   auto collectProposalProfitabilityFeatures =
       [&](const Proposal &proposal, int removedConverts, int64_t beforeCost,
           int64_t afterCost) {
@@ -2834,18 +2837,34 @@ bool LayoutPropagation::solveSmallComponents() {
             0, beforeCost >= 0 && afterCost >= 0 ? beforeCost - afterCost : 0);
         features.loopResident = proposalHasLoopResidentValue(proposal);
         features.externalUseEdges = 0;
-        for (auto &it : proposal) {
-          for (OpOperand &use : it.first.getUses()) {
-            bool internal = false;
-            for (Value result : use.getOwner()->getResults()) {
-              if (proposal.find(result) != proposal.end()) {
-                internal = true;
-                break;
-              }
-            }
-            if (!internal)
-              ++features.externalUseEdges;
+        auto isInternalUse = [&](OpOperand &use) {
+          Operation *user = use.getOwner();
+          for (Value result : user->getResults())
+            if (proposal.find(result) != proposal.end())
+              return true;
+
+          if (!isa<StoreOp>(user))
+            return false;
+          auto useIt = proposal.find(use.get());
+          if (useIt == proposal.end())
+            return false;
+          Attribute targetEncoding = useIt->second;
+          for (Value operand : user->getOperands()) {
+            if (!isa<RankedTensorType>(operand.getType()))
+              continue;
+            auto operandIt = proposal.find(operand);
+            Attribute effectiveEncoding =
+                operandIt == proposal.end() ? getTensorEncoding(operand)
+                                            : operandIt->second;
+            if (effectiveEncoding != targetEncoding)
+              return false;
           }
+          return true;
+        };
+        for (auto &it : proposal) {
+          for (OpOperand &use : it.first.getUses())
+            if (!isInternalUse(use))
+              ++features.externalUseEdges;
         }
         return features;
       };
