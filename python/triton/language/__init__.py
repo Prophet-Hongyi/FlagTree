@@ -54,7 +54,8 @@ from .standard import (
     zeros,
     zeros_like,
 )
-from .low_precision import decode_fp4, decode_fp8, dequantize, encode_fp4, encode_fp8, pack_int4, quantize, unpack_int4
+from .low_precision import (decode_fp4, decode_fp8, dequantize, dequantize_fp4, encode_fp4, encode_fp8, pack_int4,
+                            quantize, quantize_fp4, unpack_int4)
 from .core import (
     PropagateNan,
     TRITON_MAX_TENSOR_NUMEL,
@@ -210,6 +211,7 @@ __all__ = [
     "decode_fp4",
     "decode_fp8",
     "dequantize",
+    "dequantize_fp4",
     "debug_barrier",
     "device_assert",
     "device_print",
@@ -272,6 +274,7 @@ __all__ = [
     "pointer_type",
     "program_id",
     "quantize",
+    "quantize_fp4",
     "rand",
     "rand4x",
     "randint",
