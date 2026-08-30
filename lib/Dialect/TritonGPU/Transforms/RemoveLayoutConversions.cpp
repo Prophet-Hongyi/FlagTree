@@ -623,6 +623,13 @@ static StringRef applyRlcProfitabilityPolicy(
   features.adjustedSavedCostPerTensorOp = score;
   if (score < policy.profitabilityMinAdjustedSavedCostPerTensorOp)
     return "profitability-score-below-threshold";
+  // A locally profitable proposal can still be compile-time churn when the
+  // surrounding reduction or scan pipeline later canonicalizes it away.  The
+  // online selector cannot prove that such a rewrite survives to emitted IR,
+  // so keep these contexts fail-closed until a backend qualifies them with a
+  // stronger survival feature.
+  if (features.reduceScanOps > 0)
+    return "profitability-reduction-or-scan-context";
   return {};
 }
 
