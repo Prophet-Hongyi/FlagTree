@@ -1309,6 +1309,11 @@ bool LayoutPropagation::addProposalValue(Proposal &proposal, Value target,
   return true;
 }
 
+// Defined next to getContigAlongMemoryOrder. Producer-closure collection is
+// earlier in the file, so keep the declaration here with the proposal helpers.
+static bool requiresIntToFpContiguityBoundary(Value value,
+                                              Attribute candidateEncoding);
+
 Attribute LayoutPropagation::getProposalEncoding(const Proposal &proposal,
                                                  Value value) const {
   if (auto it = proposal.find(value); it != proposal.end())
@@ -1353,6 +1358,24 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
   // and terminates loop-carried cycles (iter arg -> yield -> iter arg).
   if (auto it = proposal.find(target); it != proposal.end())
     return it->second == encoding;
+
+  // A backend may observe different rounding when an inexact integer-to-float
+  // conversion changes its per-thread contiguous width. Treat that result as a
+  // proposal boundary instead of rejecting the entire downstream component:
+  // rewrite will materialize a convert at the boundary, preserving the risky
+  // conversion's layout while still allowing independently profitable mask or
+  // writeback tails to be retagged. Integer domains that fit exactly in the
+  // destination significand (for example i1 -> f32) are layout-independent and
+  // do not need this boundary.
+  Operation *targetDefOp = target.getDefiningOp();
+  if (targetDefOp &&
+      RlcBackendPolicy::fromOperation(targetDefOp)
+          .preserveIntToFpContiguity &&
+      requiresIntToFpContiguityBoundary(target, encoding)) {
+    traceRlcDecision("2", "preserve", "int-to-fp-contiguity-boundary",
+                     targetDefOp);
+    return true;
+  }
   if (!addProposalValue(proposal, target, encoding))
     return false;
 
@@ -2540,6 +2563,41 @@ static unsigned getContigAlongMemoryOrder(RankedTensorType type) {
   return dim < contigPerThread.size() ? contigPerThread[dim] : 1;
 }
 
+// True when every integer value admitted by the source type has an exact
+// representation in the destination floating-point type. In that case scalar
+// and vector lowering cannot differ by rounding, so changing layout width is
+// safe even on backends that otherwise request the int-to-fp guard.
+static bool isExactlyRepresentableIntToFp(Operation *op) {
+  if (!op || !isa<arith::SIToFPOp, arith::UIToFPOp>(op) ||
+      op->getNumOperands() != 1 || op->getNumResults() != 1)
+    return false;
+  auto srcType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+  auto dstType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!srcType || !dstType)
+    return false;
+  auto intType = dyn_cast<IntegerType>(srcType.getElementType());
+  auto floatType = dyn_cast<FloatType>(dstType.getElementType());
+  if (!intType || !floatType)
+    return false;
+  return intType.getWidth() <= floatType.getFPMantissaWidth();
+}
+
+static bool requiresIntToFpContiguityBoundary(
+    Value value, Attribute candidateEncoding) {
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp || !isa<arith::SIToFPOp, arith::UIToFPOp>(defOp) ||
+      isExactlyRepresentableIntToFp(defOp))
+    return false;
+  auto currentType = dyn_cast<RankedTensorType>(value.getType());
+  if (!currentType || !candidateEncoding ||
+      currentType.getEncoding() == candidateEncoding)
+    return false;
+  RankedTensorType candidateType =
+      currentType.cloneWithEncoding(candidateEncoding);
+  return getContigAlongMemoryOrder(currentType) !=
+         getContigAlongMemoryOrder(candidateType);
+}
+
 // A writeback retag (ptr/value/mask onto the value's layout) is profitable only
 // when the layout still writes along the same fastest memory dimension with a
 // reasonable per-thread width; otherwise it trades a convert for a worse global
@@ -2744,22 +2802,13 @@ bool LayoutPropagation::solveSmallComponents() {
       };
 
   // MUSA device evidence shows that changing a Philox chain from
-  // sizePerThread=1 to sizePerThread=2 changes LLVM lowering from vector to
-  // scalar sitofp and can move one FP16 result by one ULP. This is not a legal
-  // layout-only change for deterministic RNG. Backends can request that Phase
-  // 2 preserve the contiguous width of integer-to-float results while leaving
-  // all other proposal kinds and the portable default unchanged.
+  // sizePerThread=1 to sizePerThread=2 can change LLVM lowering and move one
+  // FP16 result by one ULP. Producer closures isolate those inexact int-to-fp
+  // results as boundaries. Keep this final guard for proposal kinds that add
+  // values directly rather than through collectProducerClosure.
   auto proposalChangesIntToFpContiguity = [](const Proposal &proposal) {
     for (auto &it : proposal) {
-      Operation *defOp = it.first.getDefiningOp();
-      if (!defOp || !isa<arith::SIToFPOp, arith::UIToFPOp>(defOp))
-        continue;
-      auto currentType = dyn_cast<RankedTensorType>(it.first.getType());
-      if (!currentType || currentType.getEncoding() == it.second)
-        continue;
-      RankedTensorType candidateType = currentType.cloneWithEncoding(it.second);
-      if (getContigAlongMemoryOrder(currentType) !=
-          getContigAlongMemoryOrder(candidateType))
+      if (requiresIntToFpContiguityBoundary(it.first, it.second))
         return true;
     }
     return false;
