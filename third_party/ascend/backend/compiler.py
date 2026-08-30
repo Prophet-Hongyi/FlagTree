@@ -1071,7 +1071,7 @@ class AscendBackend(BaseBackend):
             # Target capabilities, rather than user options, own dtype
             # admission. This prevents unsupported FP8 types from surviving
             # until a late BiShengIR failure on A2/A3 and unknown targets.
-            target_features = get_low_precision_target_features(self.target.arch)
+            target_features = get_low_precision_target_features(args["arch"])
             args["supported_fp8_dtypes"] = target_features.supported_fp8_dtypes
             options = NPUOptions(**args)
         else:
