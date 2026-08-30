@@ -54,7 +54,7 @@ from .standard import (
     zeros,
     zeros_like,
 )
-from .low_precision import decode_fp8, dequantize, encode_fp8, pack_int4, quantize, unpack_int4
+from .low_precision import decode_fp4, decode_fp8, dequantize, encode_fp4, encode_fp8, pack_int4, quantize, unpack_int4
 from .core import (
     PropagateNan,
     TRITON_MAX_TENSOR_NUMEL,
@@ -207,6 +207,7 @@ __all__ = [
     "cos",
     "cumprod",
     "cumsum",
+    "decode_fp4",
     "decode_fp8",
     "dequantize",
     "debug_barrier",
@@ -219,6 +220,7 @@ __all__ = [
     "erf",
     "exp",
     "exp2",
+    "encode_fp4",
     "encode_fp8",
     "expand_dims",
     "extra",
