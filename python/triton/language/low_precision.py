@@ -496,18 +496,26 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
 
 
 @jit
-def _encode_fp4_e2m1_value(input):
+def _fp4_e2m1_sign_bit(input):
     # Read the sign from the original storage before widening. Some targets
     # canonicalize a FP16/BF16 NaN while converting it to FP32, which may lose
     # the source sign even though this storage codec has deterministic signed
     # saturation semantics.
     if input.dtype.is_fp32():
         source_bits = input.to(core.uint32, bitcast=True)
-        sign = ((source_bits >> 31) << 3).to(core.uint8)
-        source = input
+        return ((source_bits >> 31) << 3).to(core.uint8)
     else:
         source_bits16 = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
-        sign = ((source_bits16 & 0x8000) >> 12).to(core.uint8)
+        return ((source_bits16 & 0x8000) >> 12).to(core.uint8)
+
+
+@jit
+def _encode_fp4_e2m1_value(input):
+    sign = _fp4_e2m1_sign_bit(input)
+    if input.dtype.is_fp32():
+        source = input
+        source_bits = input.to(core.uint32, bitcast=True)
+    else:
         source = input.to(core.float32)
         source_bits = source.to(core.uint32, bitcast=True)
     absolute_bits = source_bits & 0x7FFFFFFF
@@ -621,7 +629,13 @@ def quantize_fp4(
     _validate_quantization_scale(scale)
     normalized_low = low.to(core.float32) / scale
     normalized_high = high.to(core.float32) / scale
-    return encode_fp4(normalized_low, normalized_high, format=format, rounding=rounding, overflow=overflow)
+    packed = encode_fp4(normalized_low, normalized_high, format=format, rounding=rounding, overflow=overflow)
+    # Positive scaling cannot change a value's sign, but vendor scalar divide
+    # lowerings may canonicalize -0 to +0. Restore both sign bits from the
+    # original carrier instead of trusting the normalized intermediate.
+    low_sign = _fp4_e2m1_sign_bit(low)
+    high_sign = _fp4_e2m1_sign_bit(high)
+    return ((packed & 0x77) | low_sign | (high_sign << 4)).to(core.uint8)
 
 
 @jit
