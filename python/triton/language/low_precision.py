@@ -596,6 +596,66 @@ def decode_fp4(input, format: core.constexpr = "e2m1", dtype: core.constexpr = c
 
 
 @jit
+def quantize_fp4(
+    low,
+    high,
+    scale,
+    format: core.constexpr = "e2m1",
+    rounding: core.constexpr = "rtne",
+    overflow: core.constexpr = "satfinite",
+):
+    """Apply an explicit scale and pack two logical FP4 values.
+
+    ``scale`` follows normal Triton broadcasting and must be finite and
+    positive. The caller chooses its granularity and supplies one scale for
+    each ``low``/``high`` pair. This primitive does not derive a block scale,
+    reshape a logical axis, or choose an odd-tail policy.
+    """
+
+    core.static_assert(low.shape == high.shape, "quantize_fp4 low and high must have the same shape")
+    core.static_assert(low.dtype == high.dtype, "quantize_fp4 low and high must have the same dtype")
+    core.static_assert(
+        low.dtype.is_fp16() or low.dtype.is_bf16() or low.dtype.is_fp32(),
+        "quantize_fp4 inputs must be tl.float16, tl.bfloat16, or tl.float32",
+    )
+    _validate_quantization_scale(scale)
+    normalized_low = low.to(core.float32) / scale
+    normalized_high = high.to(core.float32) / scale
+    return encode_fp4(normalized_low, normalized_high, format=format, rounding=rounding, overflow=overflow)
+
+
+@jit
+def dequantize_fp4(
+    packed,
+    scale,
+    format: core.constexpr = "e2m1",
+    dtype: core.constexpr = core.float32,
+):
+    """Decode low-first FP4 storage and apply an explicit scale.
+
+    The returned ``(low, high)`` tensors keep the packed tensor's shape. Scale
+    derivation, logical-axis interleaving, and odd-tail handling remain caller
+    policy rather than implicit storage behavior.
+    """
+
+    core.static_assert(packed.dtype.is_uint8(), "dequantize_fp4 input must be tl.uint8 storage")
+    core.static_assert(
+        dtype.is_fp16() or dtype.is_bf16() or dtype.is_fp32(),
+        "dequantize_fp4 dtype must be tl.float16, tl.bfloat16, or tl.float32",
+    )
+    _validate_quantization_scale(scale)
+    low, high = decode_fp4(packed, format=format, dtype=dtype)
+    scaled_low = (low.to(core.float32) * scale).to(dtype)
+    scaled_high = (high.to(core.float32) * scale).to(dtype)
+    # Multiplication by a positive scale should preserve signed zero, but some
+    # vendor LLVM pipelines canonicalize the result to +0. Keep the decoded
+    # zero payload explicitly so storage round-trips remain deterministic.
+    output_low = core.where(low == 0.0, low, scaled_low)
+    output_high = core.where(high == 0.0, high, scaled_high)
+    return output_low, output_high
+
+
+@jit
 def pack_int4(low, high, signed: core.constexpr = True):
     """Pack two logical INT4 or UINT4 values into each UINT8 element.
 
