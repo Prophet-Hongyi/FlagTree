@@ -29,12 +29,16 @@ from low_precision_reference import (
     E4M3FNUZ,
     E5M2,
     E5M2FNUZ,
+    decode_fp4_e2m1,
     decode_fp8,
     dequantize_affine,
+    encode_fp4_e2m1_rtne,
     encode_fp8_rtne,
     encode_fp8_rtz,
+    pack_fp4_e2m1,
     pack_nibbles,
     quantize_affine,
+    unpack_fp4_e2m1,
     unpack_nibbles,
 )
 
@@ -199,6 +203,53 @@ def test_encode_fp8_rtz_nan_and_signed_zero(fmt):
     assert encode_fp8_rtz(-0.0, fmt) == 0x80
     assert encode_fp8_rtz(math.nan, fmt) == fmt.canonical_nan_code
     assert encode_fp8_rtz(math.copysign(math.nan, -1.0), fmt) == (0x80 | fmt.canonical_nan_code)
+
+
+def test_e2m1_all_encodings_roundtrip_and_preserve_signed_zero():
+    for code in range(16):
+        value = decode_fp4_e2m1(code)
+        assert encode_fp4_e2m1_rtne(value) == code
+    assert math.copysign(1.0, decode_fp4_e2m1(0x0)) == 1.0
+    assert math.copysign(1.0, decode_fp4_e2m1(0x8)) == -1.0
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0.25, 0x0),
+        (0.75, 0x2),
+        (1.25, 0x2),
+        (1.75, 0x4),
+        (2.5, 0x4),
+        (3.5, 0x6),
+        (5.0, 0x6),
+    ],
+)
+def test_e2m1_rtne_midpoints_select_even_mantissa(value, expected):
+    assert encode_fp4_e2m1_rtne(value) == expected
+    assert encode_fp4_e2m1_rtne(-value) == (expected | 0x8)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (math.inf, 0x7),
+        (-math.inf, 0xF),
+        (math.nan, 0x7),
+        (math.copysign(math.nan, -1.0), 0xF),
+        (7.0, 0x7),
+        (-7.0, 0xF),
+    ],
+)
+def test_e2m1_nonfinite_and_overflow_saturate(value, expected):
+    assert encode_fp4_e2m1_rtne(value) == expected
+
+
+def test_e2m1_pair_pack_is_low_nibble_first():
+    assert pack_fp4_e2m1(0.5, -6.0) == 0xF1
+    low, high = unpack_fp4_e2m1(0xF1)
+    assert low == 0.5
+    assert high == -6.0
 
 
 @pytest.mark.parametrize(
