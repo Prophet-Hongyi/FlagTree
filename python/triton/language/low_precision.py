@@ -496,6 +496,81 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
 
 
 @jit
+def _fp8_storage_sign_bit(input):
+    if input.dtype.is_fp32():
+        source_bits = input.to(core.int32, bitcast=True)
+        return (((source_bits >> 31) & 1) << 7).to(core.uint8)
+    else:
+        source_bits = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
+        return ((source_bits & 0x8000) >> 8).to(core.uint8)
+
+
+@jit
+def quantize_fp8(
+    input,
+    scale,
+    format: core.constexpr = "e4m3fn",
+    rounding: core.constexpr = "rtne",
+    overflow: core.constexpr = "satfinite",
+):
+    """Apply an explicit scale and encode one-byte FP8 storage.
+
+    The return type is always ``tl.uint8``. ``scale`` follows normal Triton
+    broadcasting and must be finite and positive. The caller chooses the
+    scale granularity and owns any amax reduction, block layout, padding, or
+    scale storage policy. This primitive deliberately does not create a native
+    FP8 tensor or imply native FP8 arithmetic support.
+    """
+
+    core.static_assert(
+        input.dtype.is_fp16() or input.dtype.is_bf16() or input.dtype.is_fp32(),
+        "quantize_fp8 input must be tl.float16, tl.bfloat16, or tl.float32",
+    )
+    _validate_quantization_scale(scale)
+    normalized = input.to(core.float32) / scale
+    encoded = encode_fp8(normalized, format=format, rounding=rounding, overflow=overflow)
+
+    # Positive scaling cannot change the source sign, but some vendor divide
+    # lowerings canonicalize -0 or a NaN to a positive value. Restore the sign
+    # for OCP storage. FNUZ retains its sole 0x80 NaN and unsigned zero while
+    # finite nonzero values keep the original sign.
+    sign = _fp8_storage_sign_bit(input)
+    if format == "e4m3fnuz" or format == "e5m2fnuz":
+        is_zero_or_nan = (encoded == 0) | (encoded == 0x80)
+        signed = ((encoded & 0x7F) | sign).to(core.uint8)
+        return core.where(is_zero_or_nan, encoded, signed).to(core.uint8)
+    return ((encoded & 0x7F) | sign).to(core.uint8)
+
+
+@jit
+def dequantize_fp8(
+    packed,
+    scale,
+    format: core.constexpr = "e4m3fn",
+    dtype: core.constexpr = core.float32,
+):
+    """Decode one-byte FP8 storage and apply an explicit scale.
+
+    The output has the same shape as ``packed``. Scale derivation, logical
+    axis layout, and block-tail handling remain caller policy. The operation
+    reuses the software storage codec and therefore does not require or claim
+    a backend-native FP8 scalar type or conversion instruction.
+    """
+
+    core.static_assert(packed.dtype.is_uint8(), "dequantize_fp8 input must be tl.uint8 storage")
+    core.static_assert(
+        dtype.is_fp16() or dtype.is_bf16() or dtype.is_fp32(),
+        "dequantize_fp8 dtype must be tl.float16, tl.bfloat16, or tl.float32",
+    )
+    _validate_quantization_scale(scale)
+    decoded = decode_fp8(packed, format=format, dtype=dtype)
+    scaled = (decoded.to(core.float32) * scale).to(dtype)
+    # Preserve the decoded signed-zero payload even when a vendor multiply
+    # canonicalizes it. FNUZ decode already represents its only zero as +0.
+    return core.where(decoded == 0.0, decoded, scaled)
+
+
+@jit
 def _fp4_e2m1_sign_bit(input):
     # Read the sign from the original storage before widening. Some targets
     # canonicalize a FP16/BF16 NaN while converting it to FP32, which may lose
