@@ -150,7 +150,9 @@ struct RlcProfitabilityFeatures {
   int64_t compareOps = 0;
   int64_t arithmeticOps = 0;
   int64_t mathOps = 0;
+  int64_t computeOps = 0;
   bool lowDensityGlobalWritebackMathEligible = false;
+  bool lowDensityOutputHeavyComputeEligible = false;
   bool loopResident = false;
 };
 
@@ -218,9 +220,13 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
        << " online_compare_ops=" << features->compareOps
        << " online_arithmetic_ops=" << features->arithmeticOps
        << " online_math_ops=" << features->mathOps
+       << " online_compute_ops=" << features->computeOps
        << " online_low_density_global_writeback_math_eligible="
        << static_cast<int>(
-              features->lowDensityGlobalWritebackMathEligible);
+              features->lowDensityGlobalWritebackMathEligible)
+       << " online_low_density_output_heavy_compute_eligible="
+       << static_cast<int>(
+              features->lowDensityOutputHeavyComputeEligible);
   }
   os << '\n';
 }
@@ -484,6 +490,7 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-profitability-max-external-use-edges
 //   ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values
 //   ttg.rlc-profitability-low-density-global-writeback-min-math-ops
+//   ttg.rlc-profitability-low-density-output-heavy-min-compute-ops
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -524,6 +531,7 @@ struct RlcBackendPolicy {
   int64_t profitabilityMaxExternalUseEdges = -1;
   int64_t profitabilityMinRemovedConvertDensityPer1024ProposalValues = 0;
   int64_t profitabilityLowDensityGlobalWritebackMinMathOps = 0;
+  int64_t profitabilityLowDensityOutputHeavyMinComputeOps = 0;
 
   bool hasCompleteProfitabilityConfiguration() const {
     return profitabilityMinAdjustedSavedCostPerTensorOp > 0 &&
@@ -593,6 +601,9 @@ struct RlcBackendPolicy {
     overridePositive(
         "ttg.rlc-profitability-low-density-global-writeback-min-math-ops",
         policy.profitabilityLowDensityGlobalWritebackMinMathOps);
+    overridePositive(
+        "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops",
+        policy.profitabilityLowDensityOutputHeavyMinComputeOps);
     return policy;
   }
 };
@@ -668,10 +679,21 @@ static StringRef applyRlcProfitabilityPolicy(
       features.localLoadOps == 0 && features.localStoreOps == 0 &&
       features.atomicOps == 0 && features.reduceScanOps == 0 &&
       features.dotOps == 0 && features.externalUseEdges == 0;
+  features.lowDensityOutputHeavyComputeEligible =
+      policy.profitabilityLowDensityOutputHeavyMinComputeOps > 0 &&
+      features.computeOps >=
+          policy.profitabilityLowDensityOutputHeavyMinComputeOps &&
+      features.globalStoreOps > features.globalLoadOps &&
+      features.removedConverts >= features.globalStoreOps &&
+      features.removedConverts >= features.externalUseEdges &&
+      features.localLoadOps == 0 && features.localStoreOps == 0 &&
+      features.atomicOps == 0 && features.reduceScanOps == 0 &&
+      features.dotOps == 0;
   if (policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues > 0 &&
       features.removedConvertDensityPer1024ProposalValues <
           policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues &&
-      !features.lowDensityGlobalWritebackMathEligible)
+      !features.lowDensityGlobalWritebackMathEligible &&
+      !features.lowDensityOutputHeavyComputeEligible)
     return "profitability-removed-convert-density-below-threshold";
   // A locally profitable proposal can still be compile-time churn when the
   // surrounding reduction or scan pipeline later canonicalizes it away.  The
@@ -716,10 +738,14 @@ collectFunctionProfitabilityFeatures(FuncOp funcOp) {
     if (opName == "arith.cmpi" || opName == "arith.cmpf")
       ++features.compareOps;
     else if (opName.starts_with("arith.") &&
-             opName != "arith.constant")
+             opName != "arith.constant") {
       ++features.arithmeticOps;
-    if (opName.starts_with("math."))
+      ++features.computeOps;
+    }
+    if (opName.starts_with("math.")) {
       ++features.mathOps;
+      ++features.computeOps;
+    }
   });
   return features;
 }

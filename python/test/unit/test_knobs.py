@@ -223,6 +223,8 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.metax.rlc_profitability_phase3_saved_cost_multiplier == 0
     assert fresh_knobs.metax.rlc_profitability_max_external_use_edges == 0
     assert fresh_knobs.metax.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 0
+    assert fresh_knobs.metax.rlc_profitability_low_density_global_writeback_min_math_ops == 0
+    assert fresh_knobs.metax.rlc_profitability_low_density_output_heavy_min_compute_ops == 0
 
     monkeypatch.setenv("FLAGTREE_METAX_RLC_ENHANCE", "1")
     monkeypatch.setenv("FLAGTREE_METAX_RLC_PHASE_MASK", "5")
@@ -232,6 +234,8 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
     monkeypatch.setenv("FLAGTREE_METAX_RLC_PHASE3_SAVED_COST_MULTIPLIER", "3")
     monkeypatch.setenv("FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", "2")
     monkeypatch.setenv("FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", "128")
+    monkeypatch.setenv("FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", "8")
+    monkeypatch.setenv("FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", "128")
     assert fresh_knobs.metax.rlc_enhance
     assert fresh_knobs.metax.rlc_phase_mask == 5
     assert fresh_knobs.metax.rlc_profitability_policy
@@ -240,6 +244,8 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.metax.rlc_profitability_phase3_saved_cost_multiplier == 3
     assert fresh_knobs.metax.rlc_profitability_max_external_use_edges == 2
     assert fresh_knobs.metax.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 128
+    assert fresh_knobs.metax.rlc_profitability_low_density_global_writeback_min_math_ops == 8
+    assert fresh_knobs.metax.rlc_profitability_low_density_output_heavy_min_compute_ops == 128
 
     fresh_knobs.metax.rlc_enhance = False
     fresh_knobs.metax.rlc_phase_mask = 9

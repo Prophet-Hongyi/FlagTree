@@ -112,14 +112,14 @@ def get_lld_version():
         return 0
 
 
-def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int]:
+def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int, int]:
     """Return the live MetaX selector identity only at owned decision points."""
     metax_knob = knobs.metax
     owns_decision_point = int(metax_knob.rlc_phase_mask) & 0b1100
     enabled = bool(metax_knob.rlc_enhance and owns_decision_point and
                    getattr(metax_knob, "rlc_profitability_policy", False))
     if not enabled:
-        return (0, 0, 0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0, 0, 0)
     return (
         1,
         int(getattr(metax_knob, "rlc_product_launch_count", 0) or 0),
@@ -148,6 +148,11 @@ def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int
             "rlc_profitability_low_density_global_writeback_min_math_ops",
             0,
         ) or 0),
+        int(getattr(
+            metax_knob,
+            "rlc_profitability_low_density_output_heavy_min_compute_ops",
+            0,
+        ) or 0),
     )
 
 
@@ -158,7 +163,8 @@ def _apply_metax_rlc_policy(mod) -> None:
     builder = ir.builder(mod.context)
     (enabled, launch_count, min_score, phase3_multiplier, max_external_uses,
      min_removed_convert_density,
-     low_density_global_writeback_min_math_ops) = _effective_profitability_policy()
+     low_density_global_writeback_min_math_ops,
+     low_density_output_heavy_min_compute_ops) = _effective_profitability_policy()
     if not enabled:
         return
     mod.set_attr("ttg.rlc-profitability-policy-enabled",
@@ -186,6 +192,11 @@ def _apply_metax_rlc_policy(mod) -> None:
         mod.set_attr(
             "ttg.rlc-profitability-low-density-global-writeback-min-math-ops",
             builder.get_int32_attr(low_density_global_writeback_min_math_ops),
+        )
+    if low_density_output_heavy_min_compute_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops",
+            builder.get_int32_attr(low_density_output_heavy_min_compute_ops),
         )
 
 
