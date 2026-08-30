@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+from low_precision_reference import E4M3FNUZ, E5M2FNUZ, decode_fp8, encode_fp8_rtne
+
 
 BLOCK_M = 32
 BLOCK_N = 32
@@ -58,14 +60,28 @@ def _fp8_software_storage_matmul_kernel(
 
 def _format_config(format_name):
     if format_name == "e4m3fn":
-        return torch.float8_e4m3fn, 448.0
+        return torch.float8_e4m3fn, 448.0, None
     if format_name == "e5m2":
-        return torch.float8_e5m2, 57344.0
+        return torch.float8_e5m2, 57344.0, None
+    if format_name == "e4m3fnuz":
+        return None, 240.0, E4M3FNUZ
+    if format_name == "e5m2fnuz":
+        return None, 57344.0, E5M2FNUZ
     raise AssertionError(f"unhandled FP8 format: {format_name}")
 
 
-def _encode_fp8_storage(values, torch_fp8_dtype, max_finite):
+def _encode_fp8_storage(values, torch_fp8_dtype, max_finite, reference_format):
+    if reference_format is not None:
+        encoded = [encode_fp8_rtne(value, reference_format) for value in values.flatten().tolist()]
+        return torch.tensor(encoded, dtype=torch.uint8).reshape(values.shape)
     return values.clamp(-max_finite, max_finite).to(torch_fp8_dtype).view(torch.uint8)
+
+
+def _decode_fp8_storage(values, torch_fp8_dtype, reference_format):
+    if reference_format is not None:
+        decoded = [decode_fp8(value, reference_format) for value in values.flatten().tolist()]
+        return torch.tensor(decoded, dtype=torch.float32).reshape(values.shape)
+    return values.view(torch_fp8_dtype).to(torch.float32)
 
 
 def _make_inputs():
@@ -87,12 +103,12 @@ def _make_inputs():
     return lhs, rhs, lhs_scale, rhs_scale, output_scale
 
 
-@pytest.mark.parametrize("format_name", ["e4m3fn", "e5m2"])
+@pytest.mark.parametrize("format_name", ["e4m3fn", "e4m3fnuz", "e5m2", "e5m2fnuz"])
 def test_fp8_software_storage_input_output_matmul(device, format_name):
-    torch_fp8_dtype, max_finite = _format_config(format_name)
+    torch_fp8_dtype, max_finite, reference_format = _format_config(format_name)
     lhs, rhs, lhs_scale, rhs_scale, output_scale = _make_inputs()
-    lhs_encoded = _encode_fp8_storage(lhs, torch_fp8_dtype, max_finite)
-    rhs_encoded = _encode_fp8_storage(rhs, torch_fp8_dtype, max_finite)
+    lhs_encoded = _encode_fp8_storage(lhs, torch_fp8_dtype, max_finite, reference_format)
+    rhs_encoded = _encode_fp8_storage(rhs, torch_fp8_dtype, max_finite, reference_format)
     output_float = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.float32, device=device)
     output_storage = torch.empty((BLOCK_M, BLOCK_N), dtype=torch.uint8, device=device)
 
@@ -111,8 +127,8 @@ def test_fp8_software_storage_input_output_matmul(device, format_name):
         FORMAT=format_name,
     )
 
-    lhs_decoded = lhs_encoded.view(torch_fp8_dtype).to(torch.float32)
-    rhs_decoded = rhs_encoded.view(torch_fp8_dtype).to(torch.float32)
+    lhs_decoded = _decode_fp8_storage(lhs_encoded, torch_fp8_dtype, reference_format)
+    rhs_decoded = _decode_fp8_storage(rhs_encoded, torch_fp8_dtype, reference_format)
     expected = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float32)
     for group in range(GROUPS):
         expected += (
@@ -122,7 +138,7 @@ def test_fp8_software_storage_input_output_matmul(device, format_name):
         )
     expected_float = expected / output_scale[:, None]
     actual_float = output_float.cpu()
-    expected_encoded = _encode_fp8_storage(actual_float, torch_fp8_dtype, max_finite)
+    expected_encoded = _encode_fp8_storage(actual_float, torch_fp8_dtype, max_finite, reference_format)
 
     torch.testing.assert_close(actual_float, expected_float, rtol=0, atol=1e-6)
     torch.testing.assert_close(output_storage.cpu(), expected_encoded, rtol=0, atol=0)
@@ -130,6 +146,8 @@ def test_fp8_software_storage_input_output_matmul(device, format_name):
     assert torch.unique(expected_encoded).numel() > 8
     assert program.asm["ttir"].count("tt.dot") == GROUPS
     assert "f8E4M3FN" not in program.asm["ttir"]
+    assert "f8E4M3FNUZ" not in program.asm["ttir"]
     assert "f8E5M2" not in program.asm["ttir"]
+    assert "f8E5M2FNUZ" not in program.asm["ttir"]
     binary_keys = ("hgbin", "mubin", "mcfatbin", "hsaco", "cubin", "npubin")
     assert any(key in program.asm and len(program.asm[key]) > 0 for key in binary_keys)
