@@ -75,6 +75,17 @@ E4M3FNUZ = Float8Format(
     unsigned_zero=True,
 )
 
+E5M2FNUZ = Float8Format(
+    name="e5m2fnuz",
+    exponent_bits=5,
+    mantissa_bits=2,
+    exponent_bias=16,
+    finite_only=True,
+    max_finite_code=0x7F,
+    canonical_nan_code=0x80,
+    unsigned_zero=True,
+)
+
 
 def _validate_byte(value: int) -> int:
     value = int(value)

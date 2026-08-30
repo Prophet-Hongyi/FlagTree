@@ -161,11 +161,11 @@ def encode_fp8(
     not a native FP8 tensor, so backends can implement storage and software
     dequantization without claiming native FP8 arithmetic.
 
-    Supported formats are OCP E4M3FN/E5M2 and AMD E4M3FNUZ. All use
+    Supported formats are OCP E4M3FN/E5M2 and AMD E4M3FNUZ/E5M2FNUZ. All use
     round-to-nearest-even, saturating finite overflow, and FP16, BF16, or FP32
-    input. E4M3FNUZ has one unsigned zero and maps NaN or infinity to its sole
-    NaN encoding, ``0x80``. Unsupported combinations fail at compile time
-    instead of silently changing numeric semantics.
+    input. The FNUZ formats have one unsigned zero and map NaN or infinity to
+    their sole NaN encoding, ``0x80``. Unsupported combinations fail at compile
+    time instead of silently changing numeric semantics.
     """
 
     core.static_assert(
@@ -173,11 +173,17 @@ def encode_fp8(
         "encode_fp8 input must be tl.float16, tl.bfloat16, or tl.float32",
     )
     core.static_assert(
-        format == "e4m3fn" or format == "e4m3fnuz" or format == "e5m2",
-        "encode_fp8 format must be 'e4m3fn', 'e4m3fnuz', or 'e5m2'",
+        format == "e4m3fn" or format == "e4m3fnuz" or format == "e5m2" or format == "e5m2fnuz",
+        "encode_fp8 format must be 'e4m3fn', 'e4m3fnuz', 'e5m2', or 'e5m2fnuz'",
     )
     core.static_assert(rounding == "rtne", "encode_fp8 rounding must be 'rtne'")
     core.static_assert(overflow == "satfinite", "encode_fp8 overflow must be 'satfinite'")
+
+    # AMD's software FP16 -> E5M2FNUZ conversion first extends to FP32. The
+    # extension is exact for both FP16 and BF16, and avoids inventing a second
+    # 16-bit subnormal-rounding implementation that upstream does not use.
+    if format == "e5m2fnuz":
+        input = input.to(core.float32)
 
     if input.dtype.is_fp32():
         bits = input.to(core.int32, bitcast=True)
@@ -242,6 +248,32 @@ def encode_fp8(
                 else:
                     below_halfway = absolute < halfway_points[i]
                 encoded = core.where(below_halfway, i, encoded)
+        elif format == "e5m2fnuz":
+            # Port AMD's generic E5M2FNUZ RTNE conversion. The exponent bias
+            # is 16, all exponent patterns are finite, 0x80 is the sole NaN,
+            # and finite overflow saturates at 0x7f (57344).
+            rounding_absolute = core.where(is_nan_or_inf, 0x7F800000, absolute)
+            rounding_bias = ((rounding_absolute & 0x00200000) >> 21) + 0x000FFFFF
+            # The sign bit was removed above, so 0x7fe00000 is equivalent to
+            # AMD's unsigned 0xffe00000 mask without forcing vendor frontends
+            # to materialize an unsigned 32-bit constant.
+            rounded = (rounding_absolute + rounding_bias) & 0x7FE00000
+            rounded = core.maximum(rounded, 0x38000000)
+            encoded = (rounded - 0x37800000) >> 21
+            encoded = core.where(absolute > 0x47600000, 0x7F, encoded)
+
+            halfway_points: core.constexpr = (
+                0x36800000,
+                0x37400000,
+                0x37A00000,
+                0x37E00000,
+            )
+            for i in core.static_range(3, -1, -1):
+                if i % 2 == 0:
+                    below_halfway = absolute <= halfway_points[i]
+                else:
+                    below_halfway = absolute < halfway_points[i]
+                encoded = core.where(below_halfway, i, encoded)
         else:
             # Port AMD's direct FP32 -> OCP E5M2 software path. Mapping the
             # exponent and subnormal bins before reducing the 23-bit mantissa
@@ -277,7 +309,7 @@ def encode_fp8(
             )
             encoded = rounded >> 21
 
-        if format == "e4m3fnuz":
+        if format == "e4m3fnuz" or format == "e5m2fnuz":
             encoded = core.where(is_nan_or_inf, 0x80, encoded.to(core.int32)).to(core.uint8)
             is_zero = (encoded == 0) & (is_nan_or_inf == 0)
             encoded = (encoded | sign).to(core.uint8)
@@ -382,14 +414,14 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
     """Decode one-byte FP8 storage into FP16, BF16, or FP32 values.
 
     ``input`` must be ``tl.uint8`` produced by :func:`encode_fp8` or an
-    equivalent E4M3FN, E4M3FNUZ, or E5M2 storage source. No native FP8 IR type
-    is introduced.
+    equivalent E4M3FN, E4M3FNUZ, E5M2, or E5M2FNUZ storage source. No native
+    FP8 IR type is introduced.
     """
 
     core.static_assert(input.dtype.is_uint8(), "decode_fp8 input must be tl.uint8 storage")
     core.static_assert(
-        format == "e4m3fn" or format == "e4m3fnuz" or format == "e5m2",
-        "decode_fp8 format must be 'e4m3fn', 'e4m3fnuz', or 'e5m2'",
+        format == "e4m3fn" or format == "e4m3fnuz" or format == "e5m2" or format == "e5m2fnuz",
+        "decode_fp8 format must be 'e4m3fn', 'e4m3fnuz', 'e5m2', or 'e5m2fnuz'",
     )
     core.static_assert(
         dtype.is_fp16() or dtype.is_bf16() or dtype.is_fp32(),
@@ -436,6 +468,23 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
         for i in core.static_range(8):
             fp16_bits = core.where(absolute == i, denormals_and_zero[i], fp16_bits)
         fp16_bits |= sign
+        fp16_bits = core.where(values_i32 == 0x80, 0x7E00, fp16_bits)
+    elif format == "e5m2fnuz":
+        # Port AMD's software E5M2FNUZ -> FP16 conversion. Normal encodings
+        # decrement the exponent to account for the 16 -> 15 bias change;
+        # exponent-zero and exponent-one values need separate subnormal paths.
+        source_bits = values_i32 << 8
+        exponent = source_bits & 0x7C00
+        mantissa = source_bits & 0x0300
+        sign = source_bits & 0x8000
+
+        shifted_mantissa = mantissa >> 1
+        exponent_zero_bits = sign | shifted_mantissa
+        debiased_exponent = core.maximum(exponent, 0x0400) - 0x0400
+        normal_bits = sign | mantissa | debiased_exponent
+        exponent_one_bits = sign | shifted_mantissa | 0x0200
+        fp16_bits = core.where(exponent == 0, exponent_zero_bits, normal_bits)
+        fp16_bits = core.where(exponent == 0x0400, exponent_one_bits, fp16_bits)
         fp16_bits = core.where(values_i32 == 0x80, 0x7E00, fp16_bits)
     else:
         # E5M2 is a high-byte projection of FP16: sign and exponent widths are
