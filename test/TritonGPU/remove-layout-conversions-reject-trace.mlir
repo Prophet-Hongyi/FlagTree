@@ -28,4 +28,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=no-proposal reason=reduce-tail
 // TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=no-proposal reason=loop-tail
 // TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=reject reason=weak-one-shot-proposal
+// TRACE-SAME: online_launch_count=unknown
+// TRACE-SAME: online_proposal_values={{[1-9][0-9]*}}
+// TRACE-SAME: online_removed_converts=1
+// TRACE-SAME: online_saved_cost={{[0-9]+}}
+// TRACE-SAME: online_external_use_edges={{[0-9]+}}
+// TRACE-SAME: online_loop_resident=0
+// TRACE-SAME: online_tensor_ops={{[1-9][0-9]*}}
+// TRACE-SAME: online_global_store_ops=1
+// TRACE-SAME: online_math_ops=1
 // QUIET-NOT: FLAGTREE_RLC_TRACE

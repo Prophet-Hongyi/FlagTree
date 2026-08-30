@@ -126,12 +126,38 @@ static bool isRlcRejectTraceEnabled() {
          setting.equals_insensitive("on");
 }
 
+// Features that are available at the RLC decision point. Final ISA/resource
+// counters and device timings intentionally do not belong here: they may
+// calibrate backend weights offline, but production selection must not depend
+// on compiling both alternatives or on a kernel/shape allowlist.
+struct RlcProfitabilityFeatures {
+  int64_t productLaunchCount = -1;
+  int64_t proposalValues = -1;
+  int64_t removedConverts = -1;
+  int64_t estimatedSavedCost = -1;
+  int64_t externalUseEdges = -1;
+  int64_t tensorOps = 0;
+  int64_t globalLoadOps = 0;
+  int64_t globalStoreOps = 0;
+  int64_t localLoadOps = 0;
+  int64_t localStoreOps = 0;
+  int64_t atomicOps = 0;
+  int64_t reduceScanOps = 0;
+  int64_t dotOps = 0;
+  int64_t compareOps = 0;
+  int64_t arithmeticOps = 0;
+  int64_t mathOps = 0;
+  bool loopResident = false;
+};
+
 static void traceRlcDecision(StringRef phase, StringRef outcome,
                              StringRef reason, Operation *op = nullptr,
                              int64_t proposalSize = -1,
                              int64_t removedConverts = -1,
                              int64_t beforeCost = -1,
-                             int64_t afterCost = -1) {
+                             int64_t afterCost = -1,
+                             const RlcProfitabilityFeatures *features =
+                                 nullptr) {
   if (!isRlcRejectTraceEnabled())
     return;
   llvm::raw_ostream &os = llvm::errs();
@@ -162,6 +188,29 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
     os << " before_cost=" << beforeCost;
   if (afterCost >= 0)
     os << " after_cost=" << afterCost;
+  if (features) {
+    os << " online_launch_count=";
+    if (features->productLaunchCount > 0)
+      os << features->productLaunchCount;
+    else
+      os << "unknown";
+    os << " online_proposal_values=" << features->proposalValues
+       << " online_removed_converts=" << features->removedConverts
+       << " online_saved_cost=" << features->estimatedSavedCost
+       << " online_external_use_edges=" << features->externalUseEdges
+       << " online_loop_resident=" << static_cast<int>(features->loopResident)
+       << " online_tensor_ops=" << features->tensorOps
+       << " online_global_load_ops=" << features->globalLoadOps
+       << " online_global_store_ops=" << features->globalStoreOps
+       << " online_local_load_ops=" << features->localLoadOps
+       << " online_local_store_ops=" << features->localStoreOps
+       << " online_atomic_ops=" << features->atomicOps
+       << " online_reduce_scan_ops=" << features->reduceScanOps
+       << " online_dot_ops=" << features->dotOps
+       << " online_compare_ops=" << features->compareOps
+       << " online_arithmetic_ops=" << features->arithmeticOps
+       << " online_math_ops=" << features->mathOps;
+  }
   os << '\n';
 }
 #endif // __FLAGTREE_RLC_ENHANCE__
@@ -473,6 +522,54 @@ struct RlcBackendPolicy {
     return policy;
   }
 };
+
+#ifdef __FLAGTREE_RLC_ENHANCE__
+static RlcProfitabilityFeatures
+collectFunctionProfitabilityFeatures(FuncOp funcOp) {
+  RlcProfitabilityFeatures features;
+  if (ModuleOp module = funcOp->getParentOfType<ModuleOp>()) {
+    if (auto attr = module->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-product-launch-count"))
+      if (attr.getInt() > 0)
+        features.productLaunchCount = attr.getInt();
+  }
+
+  funcOp.walk([&](Operation *op) {
+    StringRef opName = op->getName().getStringRef();
+    bool hasTensorPayload = false;
+    for (Type type : op->getOperandTypes())
+      hasTensorPayload |= isa<RankedTensorType>(type);
+    for (Type type : op->getResultTypes())
+      hasTensorPayload |= isa<RankedTensorType>(type);
+    if (hasTensorPayload && !isa<ConvertLayoutOp>(op))
+      ++features.tensorOps;
+
+    if (isa<LoadOp>(op))
+      ++features.globalLoadOps;
+    if (isa<StoreOp>(op))
+      ++features.globalStoreOps;
+    if (isa<LocalLoadOp>(op))
+      ++features.localLoadOps;
+    if (isa<LocalStoreOp>(op))
+      ++features.localStoreOps;
+    if (isa<AtomicRMWOp, AtomicCASOp>(op))
+      ++features.atomicOps;
+    if (isa<ReduceOp, ScanOp>(op))
+      ++features.reduceScanOps;
+    if (isa<DotOp>(op) || opName == "tt.dot_scaled")
+      ++features.dotOps;
+
+    if (opName == "arith.cmpi" || opName == "arith.cmpf")
+      ++features.compareOps;
+    else if (opName.starts_with("arith.") &&
+             opName != "arith.constant")
+      ++features.arithmeticOps;
+    if (opName.starts_with("math."))
+      ++features.mathOps;
+  });
+  return features;
+}
+#endif // __FLAGTREE_RLC_ENHANCE__
 
 #if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 static bool touchesTleRemotePointerPath(Value value, DenseSet<Value> &visited) {
@@ -2491,6 +2588,8 @@ bool LayoutPropagation::solveSmallComponents() {
   const bool memoryMovementOnly = !functionHasComputeAnchors(funcOp);
   const RlcBackendPolicy backendPolicy =
       RlcBackendPolicy::fromOperation(funcOp);
+  const RlcProfitabilityFeatures functionProfitabilityFeatures =
+      collectFunctionProfitabilityFeatures(funcOp);
 
   bool changed = false;
   // A proposal value adjacent to a tt.join/tt.split radix step (a radix
@@ -2523,6 +2622,36 @@ bool LayoutPropagation::solveSmallComponents() {
     return false;
   };
 
+  // Complete the function-level online feature snapshot with proposal-local
+  // topology. An edge is external when its user does not define any value in
+  // the proposal. This is intentionally an IR/use-def property, not a kernel
+  // identity or a final-codegen measurement.
+  auto collectProposalProfitabilityFeatures =
+      [&](const Proposal &proposal, int removedConverts, int64_t beforeCost,
+          int64_t afterCost) {
+        RlcProfitabilityFeatures features = functionProfitabilityFeatures;
+        features.proposalValues = static_cast<int64_t>(proposal.size());
+        features.removedConverts = removedConverts;
+        features.estimatedSavedCost = std::max<int64_t>(
+            0, beforeCost >= 0 && afterCost >= 0 ? beforeCost - afterCost : 0);
+        features.loopResident = proposalHasLoopResidentValue(proposal);
+        features.externalUseEdges = 0;
+        for (auto &it : proposal) {
+          for (OpOperand &use : it.first.getUses()) {
+            bool internal = false;
+            for (Value result : use.getOwner()->getResults()) {
+              if (proposal.find(result) != proposal.end()) {
+                internal = true;
+                break;
+              }
+            }
+            if (!internal)
+              ++features.externalUseEdges;
+          }
+        }
+        return features;
+      };
+
   // MUSA device evidence shows that changing a Philox chain from
   // sizePerThread=1 to sizePerThread=2 changes LLVM lowering from vector to
   // scalar sitofp and can move one FP16 result by one ULP. This is not a legal
@@ -2549,12 +2678,23 @@ bool LayoutPropagation::solveSmallComponents() {
                                 bool rejectReachableReductionOrScan = true,
                                 bool restrictWeakStoreProposals = false) {
     int removedConverts = -1;
+    int64_t beforeCost = -1;
+    int64_t afterCost = -1;
+    bool costIsLower = false;
+    bool hasProfitabilityFeatures = false;
+    RlcProfitabilityFeatures profitabilityFeatures;
     auto traceProposal = [&](StringRef outcome, StringRef reason,
-                             int64_t beforeCost = -1,
-                             int64_t afterCost = -1) {
+                             int64_t tracedBeforeCost = -1,
+                             int64_t tracedAfterCost = -1) {
+      if (tracedBeforeCost < 0)
+        tracedBeforeCost = beforeCost;
+      if (tracedAfterCost < 0)
+        tracedAfterCost = afterCost;
       traceRlcDecision("2", outcome, reason, funcOp.getOperation(),
                        static_cast<int64_t>(proposal.size()), removedConverts,
-                       beforeCost, afterCost);
+                       tracedBeforeCost, tracedAfterCost,
+                       hasProfitabilityFeatures ? &profitabilityFeatures
+                                                : nullptr);
     };
     auto reject = [&](StringRef reason, int64_t beforeCost = -1,
                       int64_t afterCost = -1) {
@@ -2576,6 +2716,11 @@ bool LayoutPropagation::solveSmallComponents() {
     removedConverts = countConvertsRemovedByProposal(proposal);
     if (removedConverts == 0)
       return reject("no-convert-removed");
+    costIsLower =
+        shouldAcceptProposal(proposal, &beforeCost, &afterCost);
+    profitabilityFeatures = collectProposalProfitabilityFeatures(
+        proposal, removedConverts, beforeCost, afterCost);
+    hasProfitabilityFeatures = true;
     // A "weak" proposal removes a single one-shot convert outside any loop; its
     // layout ripple can cost more than it saves, so only loop-resident or
     // multi-convert components are admitted.
@@ -2613,10 +2758,7 @@ bool LayoutPropagation::solveSmallComponents() {
         proposalHasRankChangingLayoutBridge(proposal) &&
         proposalTouchesReductionOrScan(proposal))
       return reject("rank-changing-reduction-bridge");
-    int64_t beforeCost = -1;
-    int64_t afterCost = -1;
-    if (requireBenefit &&
-        !shouldAcceptProposal(proposal, &beforeCost, &afterCost))
+    if (requireBenefit && !costIsLower)
       return reject("cost-not-lower", beforeCost, afterCost);
     bool committed = commitProposal(proposal);
     traceProposal(committed ? "accept" : "reject",
