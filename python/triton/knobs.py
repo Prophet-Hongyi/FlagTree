@@ -743,8 +743,12 @@ class musa_knobs(base_knobs):
         "FLAGTREE_MUSA_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 1800)
     rlc_profitability_phase3_saved_cost_multiplier: env_int = env_int(
         "FLAGTREE_MUSA_RLC_PHASE3_SAVED_COST_MULTIPLIER", 2)
+    # S5000 dropout calibration needs the Philox mask's two terminal branches
+    # (value and mask writeback) to remain eligible.  The selector and RLC
+    # master switch are both still default-off, and callers can override this
+    # calibrated budget back to zero for strict screening.
     rlc_profitability_max_external_use_edges: env_int = env_int(
-        "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", 0)
+        "FLAGTREE_MUSA_RLC_MAX_EXTERNAL_USE_EDGES", 8)
 
 
 # flagtree ppu

@@ -185,7 +185,7 @@ def test_musa_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.musa.rlc_product_launch_count == 0
     assert fresh_knobs.musa.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1800
     assert fresh_knobs.musa.rlc_profitability_phase3_saved_cost_multiplier == 2
-    assert fresh_knobs.musa.rlc_profitability_max_external_use_edges == 0
+    assert fresh_knobs.musa.rlc_profitability_max_external_use_edges == 8
 
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_ENHANCE", "1")
     monkeypatch.setenv("FLAGTREE_MUSA_RLC_PHASE_MASK", "5")
