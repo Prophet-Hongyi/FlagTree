@@ -125,6 +125,14 @@ def _effective_preserve_int_to_fp_contiguity() -> bool:
     return bool(getattr(musa, "rlc_preserve_int_to_fp_contiguity", True))
 
 
+def _effective_preserve_fp_to_fp_contiguity() -> bool:
+    """Return the Phase 2 fp-to-fp guard only while its owner can run."""
+    musa = knobs.musa
+    if not musa.rlc_enhance or not (int(musa.rlc_phase_mask) & 0b0100):
+        return False
+    return bool(getattr(musa, "rlc_preserve_fp_to_fp_contiguity", True))
+
+
 def _effective_profitability_policy() -> tuple[int, int, int, int, int]:
     """Return the cache/IR identity for the opt-in online selector."""
     musa = knobs.musa
@@ -170,6 +178,11 @@ def _apply_musa_rlc_policy(mod) -> None:
         # unadvertised width as a hard boundary.
         mod.set_attr("ttg.rlc-int-to-fp-vector-width-mask",
                      builder.get_int32_attr((1 << 2) | (1 << 4)))
+    if _effective_preserve_fp_to_fp_contiguity():
+        mod.set_attr("ttg.rlc-preserve-fp-to-fp-contiguity",
+                     builder.get_int32_attr(1))
+        mod.set_attr("ttg.rlc-fp-to-fp-vector-width-mask",
+                     builder.get_int32_attr((1 << 2) | (1 << 4)))
     (profitability_enabled, launch_count, min_score, phase3_multiplier,
      max_external_uses) = _effective_profitability_policy()
     if profitability_enabled:
@@ -209,6 +222,7 @@ def _rlc_policy_signature() -> str:
         str(int(getattr(musa, "rlc_inter_warp_reduce_cost", 0) or 0)),
         str(_effective_atomic_writeback_ratio()),
         str(int(_effective_preserve_int_to_fp_contiguity())),
+        str(int(_effective_preserve_fp_to_fp_contiguity())),
         *(str(value) for value in profitability_policy),
     ])
 

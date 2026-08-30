@@ -1,0 +1,59 @@
+// RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=5" | FileCheck %s --check-prefixes=VECTORIZED,UNSUPPORTED
+// RUN: env FLAGTREE_RLC_TRACE_REJECTS=1 triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=5" 2>&1 | FileCheck %s --check-prefix=TRACE
+
+#src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#dst = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-fp-to-fp-vector-width-mask" = 20 : i32, "ttg.rlc-preserve-fp-to-fp-contiguity" = 1 : i32, "ttg.rlc-product-launch-count" = 1 : i32, "ttg.rlc-profitability-max-external-use-edges" = 8 : i64, "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op" = 1 : i64, "ttg.rlc-profitability-phase3-saved-cost-multiplier" = 2 : i64, "ttg.rlc-profitability-policy-enabled" = 1 : i32, ttg.target = "musa:31", "ttg.threads-per-warp" = 32 : i32} {
+  // Both layouts own two elements per thread. The marker asks the MUSA
+  // lowering to preserve the incumbent vector f32 -> f16 truncation while RLC
+  // retags the closed producer chain and removes the convert.
+  // VECTORIZED-LABEL: tt.func @fp_to_fp_vector_width_preserved
+  // VECTORIZED: arith.truncf
+  // VECTORIZED-SAME: {"ttg.rlc-preserve-fp-to-fp-vector-width" = 2 : i32}
+  // VECTORIZED-NOT: ttg.convert_layout
+  // VECTORIZED: tt.store
+  tt.func @fp_to_fp_vector_width_preserved(%input: !tt.ptr<f32>, %output: tensor<256x!tt.ptr<f16>, #dst>, %stride: i32) {
+    %index = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #src>
+    %stride_splat = tt.splat %stride : i32 -> tensor<256xi32, #src>
+    %offset = arith.muli %index, %stride_splat : tensor<256xi32, #src>
+    %input_splat = tt.splat %input : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #src>
+    %input_ptrs = tt.addptr %input_splat, %offset : tensor<256x!tt.ptr<f32>, #src>, tensor<256xi32, #src>
+    %loaded = tt.load %input_ptrs : tensor<256x!tt.ptr<f32>, #src>
+    %value = arith.truncf %loaded : tensor<256xf32, #src> to tensor<256xf16, #src>
+    %converted = ttg.convert_layout %value : tensor<256xf16, #src> -> tensor<256xf16, #dst>
+    tt.store %output, %converted : tensor<256x!tt.ptr<f16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#dst = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-fp-to-fp-vector-width-mask" = 20 : i32, "ttg.rlc-preserve-fp-to-fp-contiguity" = 1 : i32, ttg.target = "musa:31", "ttg.threads-per-warp" = 32 : i32} {
+  // The old layout owns one element per thread while the proposed layout owns
+  // two. The backend has no contract for changing that width, so the convert
+  // remains a hard boundary.
+  // UNSUPPORTED-LABEL: tt.func @fp_to_fp_unsupported_width_stays_guarded
+  // UNSUPPORTED: arith.truncf {{.*}} : tensor<128xf32, #blocked1> to tensor<128xf16, #blocked1>
+  // UNSUPPORTED: ttg.convert_layout
+  // UNSUPPORTED: tt.store
+  tt.func @fp_to_fp_unsupported_width_stays_guarded(%input: !tt.ptr<f32>, %output: tensor<128x!tt.ptr<f16>, #dst>, %stride: i32) {
+    %index = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #src>
+    %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #src>
+    %offset = arith.muli %index, %stride_splat : tensor<128xi32, #src>
+    %input_splat = tt.splat %input : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #src>
+    %input_ptrs = tt.addptr %input_splat, %offset : tensor<128x!tt.ptr<f32>, #src>, tensor<128xi32, #src>
+    %loaded = tt.load %input_ptrs : tensor<128x!tt.ptr<f32>, #src>
+    %value = arith.truncf %loaded : tensor<128xf32, #src> to tensor<128xf16, #src>
+    %converted = ttg.convert_layout %value : tensor<128xf16, #src> -> tensor<128xf16, #dst>
+    tt.store %output, %converted : tensor<128x!tt.ptr<f16>, #dst>
+    tt.return
+  }
+}
+
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=fp-to-fp-vector-width
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=accept reason=committed{{.*}}online_external_use_edges=0
+// TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=fp-to-fp-contiguity-boundary

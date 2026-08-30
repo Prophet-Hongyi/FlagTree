@@ -469,6 +469,8 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-allow-atomic-writeback-order-change
 //   ttg.rlc-preserve-int-to-fp-contiguity
 //   ttg.rlc-int-to-fp-vector-width-mask
+//   ttg.rlc-preserve-fp-to-fp-contiguity
+//   ttg.rlc-fp-to-fp-vector-width-mask
 //   ttg.rlc-profitability-policy-enabled
 //   ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op
 //   ttg.rlc-profitability-phase3-saved-cost-multiplier
@@ -497,6 +499,11 @@ struct RlcBackendPolicy {
   // Bit `1 << width` advertises an explicitly implemented backend lowering for
   // that integer-to-float vector width. Zero is fail-closed.
   int64_t intToFpVectorWidthMask = 0;
+  // Floating-point narrowing can also select different backend instructions at
+  // scalar and vector widths. Keep this independent from integer-to-float so a
+  // backend qualifies each conversion family separately.
+  bool preserveFpToFpContiguity = false;
+  int64_t fpToFpVectorWidthMask = 0;
   // The online selector is deliberately opt-in and fail-closed. The backend
   // must provide every threshold together with an explicit product launch
   // count and target. Keeping the defaults incomplete preserves the incumbent
@@ -550,6 +557,11 @@ struct RlcBackendPolicy {
       policy.preserveIntToFpContiguity = attr.getInt() > 0;
     overridePositive("ttg.rlc-int-to-fp-vector-width-mask",
                      policy.intToFpVectorWidthMask);
+    if (auto attr = module->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-preserve-fp-to-fp-contiguity"))
+      policy.preserveFpToFpContiguity = attr.getInt() > 0;
+    overridePositive("ttg.rlc-fp-to-fp-vector-width-mask",
+                     policy.fpToFpVectorWidthMask);
     if (auto attr = module->getAttrOfType<IntegerAttr>(
             "ttg.rlc-profitability-policy-enabled"))
       policy.profitabilityPolicyEnabled = attr.getInt() > 0;
@@ -1328,6 +1340,10 @@ static bool requiresIntToFpContiguityBoundary(Value value,
                                                Attribute candidateEncoding);
 static unsigned getPreservedIntToFpVectorWidth(Value value,
                                                 Attribute candidateEncoding);
+static bool requiresFpToFpContiguityBoundary(Value value,
+                                              Attribute candidateEncoding);
+static unsigned getPreservedFpToFpVectorWidth(Value value,
+                                               Attribute candidateEncoding);
 
 Attribute LayoutPropagation::getProposalEncoding(const Proposal &proposal,
                                                  Value value) const {
@@ -1392,6 +1408,19 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
                        targetDefOp);
     } else {
       traceRlcDecision("2", "preserve", "int-to-fp-contiguity-boundary",
+                       targetDefOp);
+      return true;
+    }
+  }
+  if (targetDefOp &&
+      RlcBackendPolicy::fromOperation(targetDefOp)
+          .preserveFpToFpContiguity &&
+      requiresFpToFpContiguityBoundary(target, encoding)) {
+    if (getPreservedFpToFpVectorWidth(target, encoding) != 0) {
+      traceRlcDecision("2", "preserve", "fp-to-fp-vector-width",
+                       targetDefOp);
+    } else {
+      traceRlcDecision("2", "preserve", "fp-to-fp-contiguity-boundary",
                        targetDefOp);
       return true;
     }
@@ -2142,14 +2171,23 @@ bool LayoutPropagation::commitProposal(const Proposal &proposal) {
   for (auto &it : proposal) {
     changed |= addSmallComponentEncoding(it.first, it.second);
     Operation *defOp = it.first.getDefiningOp();
-    if (!defOp || !RlcBackendPolicy::fromOperation(defOp)
-                       .preserveIntToFpContiguity)
+    if (!defOp)
       continue;
-    unsigned width = getPreservedIntToFpVectorWidth(it.first, it.second);
-    if (width != 0)
-      defOp->setAttr("ttg.rlc-preserve-int-to-fp-vector-width",
-                     IntegerAttr::get(IntegerType::get(defOp->getContext(), 32),
-                                      width));
+    RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(defOp);
+    if (policy.preserveIntToFpContiguity) {
+      unsigned width = getPreservedIntToFpVectorWidth(it.first, it.second);
+      if (width != 0)
+        defOp->setAttr(
+            "ttg.rlc-preserve-int-to-fp-vector-width",
+            IntegerAttr::get(IntegerType::get(defOp->getContext(), 32), width));
+    }
+    if (policy.preserveFpToFpContiguity) {
+      unsigned width = getPreservedFpToFpVectorWidth(it.first, it.second);
+      if (width != 0)
+        defOp->setAttr(
+            "ttg.rlc-preserve-fp-to-fp-vector-width",
+            IntegerAttr::get(IntegerType::get(defOp->getContext(), 32), width));
+    }
   }
   return changed;
 }
@@ -2654,6 +2692,46 @@ static unsigned getPreservedIntToFpVectorWidth(
   return oldElems;
 }
 
+static bool requiresFpToFpContiguityBoundary(
+    Value value, Attribute candidateEncoding) {
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp || !isa<arith::TruncFOp>(defOp) ||
+      defOp->getNumOperands() != 1 || defOp->getNumResults() != 1)
+    return false;
+  auto srcType = dyn_cast<RankedTensorType>(defOp->getOperand(0).getType());
+  auto dstType = dyn_cast<RankedTensorType>(value.getType());
+  if (!srcType || !dstType || !srcType.getElementType().isF32() ||
+      !dstType.getElementType().isF16() || !candidateEncoding ||
+      dstType.getEncoding() == candidateEncoding)
+    return false;
+  RankedTensorType candidateType =
+      dstType.cloneWithEncoding(candidateEncoding);
+  return getContigAlongMemoryOrder(dstType) !=
+         getContigAlongMemoryOrder(candidateType);
+}
+
+// Preserve only the f32 -> f16 pair/quad paths qualified on MUSA. Extending
+// this to other floating-point pairs requires separate lowering and device
+// evidence because their scalar/vector rounding contracts may differ.
+static unsigned getPreservedFpToFpVectorWidth(
+    Value value, Attribute candidateEncoding) {
+  if (!requiresFpToFpContiguityBoundary(value, candidateEncoding))
+    return 0;
+  Operation *defOp = value.getDefiningOp();
+  auto dstType = dyn_cast<RankedTensorType>(value.getType());
+  if (!dstType)
+    return 0;
+  auto candidateType = dstType.cloneWithEncoding(candidateEncoding);
+  unsigned oldElems = getTotalElemsPerThread(dstType);
+  unsigned newElems = getTotalElemsPerThread(candidateType);
+  if (oldElems != newElems || (oldElems != 2 && oldElems != 4))
+    return 0;
+  RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(defOp);
+  if ((policy.fpToFpVectorWidthMask & (int64_t{1} << oldElems)) == 0)
+    return 0;
+  return oldElems;
+}
+
 // A writeback retag (ptr/value/mask onto the value's layout) is profitable only
 // when the layout still writes along the same fastest memory dimension with a
 // reasonable per-thread width; otherwise it trades a convert for a worse global
@@ -2890,6 +2968,15 @@ bool LayoutPropagation::solveSmallComponents() {
     }
     return false;
   };
+  auto proposalChangesUnsupportedFpToFpContiguity =
+      [](const Proposal &proposal) {
+    for (auto &it : proposal) {
+      if (requiresFpToFpContiguityBoundary(it.first, it.second) &&
+          getPreservedFpToFpVectorWidth(it.first, it.second) == 0)
+        return true;
+    }
+    return false;
+  };
 
   auto commitIfProfitable = [&](Proposal &proposal, bool requireBenefit,
                                 bool rejectReachableReductionOrScan = true,
@@ -2923,6 +3010,9 @@ bool LayoutPropagation::solveSmallComponents() {
     if (backendPolicy.preserveIntToFpContiguity &&
         proposalChangesUnsupportedIntToFpContiguity(proposal))
       return reject("int-to-fp-contiguity-change");
+    if (backendPolicy.preserveFpToFpContiguity &&
+        proposalChangesUnsupportedFpToFpContiguity(proposal))
+      return reject("fp-to-fp-contiguity-change");
 #if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     // Skip any component on a TLE cluster remote-address chain; retagging it
     // corrupts the remote access (see valueOnTleRemotePointerPath).

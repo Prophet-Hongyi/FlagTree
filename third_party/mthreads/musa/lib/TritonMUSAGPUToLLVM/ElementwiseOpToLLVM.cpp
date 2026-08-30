@@ -891,6 +891,28 @@ struct TruncFOpConversion
     TritonLLVMOpBuilder b(loc, rewriter);
     auto inElemTy = getElementType(op.getIn());
     auto outElemTy = getElementType(op.getOut());
+    if (auto widthAttr = op->getAttrOfType<IntegerAttr>(
+            "ttg.rlc-preserve-fp-to-fp-vector-width")) {
+      int64_t width = widthAttr.getInt();
+      if ((width != 2 && width != 4) || !inElemTy.isF32() ||
+          !outElemTy.isF16() || operands.size() < width)
+        return {};
+      Type logicalOutTy = this->getTypeConverter()->convertType(outElemTy);
+      Type inputVectorType =
+          vec_ty(this->getTypeConverter()->convertType(inElemTy), width);
+      Type outputVectorType = vec_ty(logicalOutTy, width);
+      Value inputVector = b.undef(inputVectorType);
+      for (int64_t i = 0; i < width; ++i)
+        inputVector = b.insert_element(inputVectorType, inputVector,
+                                       operands[i][0], b.i32_val(i));
+      Value outputVector = LLVM::FPTruncOp::create(
+          rewriter, loc, outputVectorType, inputVector);
+      SmallVector<Value> outputs;
+      for (int64_t i = 0; i < width; ++i)
+        outputs.push_back(
+            b.extract_element(logicalOutTy, outputVector, b.i32_val(i)));
+      return outputs;
+    }
     Type packedOutTy = getConvertedElementType(op.getType(), typeConverter);
     Value src = operands[0][0];
     if (isa<FloatType>(inElemTy)) {

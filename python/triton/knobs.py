@@ -732,6 +732,10 @@ class musa_knobs(base_knobs):
     # rounding boundary. Phase 2 must not change that per-thread vector width.
     rlc_preserve_int_to_fp_contiguity: env_bool = env_bool(
         "FLAGTREE_MUSA_RLC_PRESERVE_INT_TO_FP_CONTIGUITY", True)
+    # MUSA scalar and vector f32 -> f16 truncation also take distinct lowering
+    # paths. Preserve the incumbent pair/quad width when Phase 2 retags it.
+    rlc_preserve_fp_to_fp_contiguity: env_bool = env_bool(
+        "FLAGTREE_MUSA_RLC_PRESERVE_FP_TO_FP_CONTIGUITY", True)
     # S5000 profitability selector. The master switch remains default-off;
     # when enabled, a caller must still provide the product launch count.
     # Missing/zero launch count is intentionally fail-closed in the C++ pass.

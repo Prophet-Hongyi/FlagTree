@@ -187,6 +187,62 @@ def test_backend_hash_ignores_int_to_fp_policy_without_phase2():
                 os.environ[key] = value
 
 
+def test_backend_hash_tracks_fp_to_fp_contiguity_policy():
+    keys = (
+        "FLAGTREE_MUSA_RLC_ENHANCE",
+        "FLAGTREE_MUSA_RLC_PHASE_MASK",
+        "FLAGTREE_MUSA_RLC_PRESERVE_FP_TO_FP_CONTIGUITY",
+    )
+    previous = {key: os.environ.get(key) for key in keys}
+    backend = _backend()
+    try:
+        _set_rlc(True, 5)
+        key = "FLAGTREE_MUSA_RLC_PRESERVE_FP_TO_FP_CONTIGUITY"
+        os.environ[key] = "1"
+        guarded = backend.hash()
+        guarded_options = backend.parse_options({})
+        os.environ[key] = "0"
+        unguarded = backend.hash()
+        unguarded_options = backend.parse_options({})
+        assert guarded != unguarded, (guarded, unguarded)
+        assert guarded_options.rlc_policy != unguarded_options.rlc_policy
+        assert guarded_options.hash() != unguarded_options.hash()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_backend_hash_ignores_fp_to_fp_policy_without_phase2():
+    keys = (
+        "FLAGTREE_MUSA_RLC_ENHANCE",
+        "FLAGTREE_MUSA_RLC_PHASE_MASK",
+        "FLAGTREE_MUSA_RLC_PRESERVE_FP_TO_FP_CONTIGUITY",
+    )
+    previous = {key: os.environ.get(key) for key in keys}
+    backend = _backend()
+    try:
+        _set_rlc(True, 3)
+        key = "FLAGTREE_MUSA_RLC_PRESERVE_FP_TO_FP_CONTIGUITY"
+        os.environ[key] = "1"
+        guarded = backend.hash()
+        guarded_options = backend.parse_options({})
+        os.environ[key] = "0"
+        unguarded = backend.hash()
+        unguarded_options = backend.parse_options({})
+        assert guarded == unguarded, (guarded, unguarded)
+        assert guarded_options.rlc_policy == unguarded_options.rlc_policy
+        assert guarded_options.hash() == unguarded_options.hash()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_backend_hash_tracks_profitability_policy_contract():
     keys = (
         "FLAGTREE_MUSA_RLC_ENHANCE",
@@ -312,6 +368,10 @@ def test_profitability_policy_module_attrs_are_explicit_and_fail_closed(monkeypa
         musa_compiler._apply_musa_rlc_policy(single_launch)
         assert single_launch.attrs[
             "ttg.rlc-int-to-fp-vector-width-mask"] == 20
+        assert single_launch.attrs[
+            "ttg.rlc-preserve-fp-to-fp-contiguity"] == 1
+        assert single_launch.attrs[
+            "ttg.rlc-fp-to-fp-vector-width-mask"] == 20
         assert single_launch.attrs["ttg.rlc-profitability-policy-enabled"] == 1
         assert single_launch.attrs["ttg.rlc-product-launch-count"] == 1
         assert single_launch.attrs[
