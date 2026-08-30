@@ -496,6 +496,106 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
 
 
 @jit
+def _encode_fp4_e2m1_value(input):
+    # Read the sign from the original storage before widening. Some targets
+    # canonicalize a FP16/BF16 NaN while converting it to FP32, which may lose
+    # the source sign even though this storage codec has deterministic signed
+    # saturation semantics.
+    if input.dtype.is_fp32():
+        source_bits = input.to(core.uint32, bitcast=True)
+        sign = ((source_bits >> 31) << 3).to(core.uint8)
+        source = input
+    else:
+        source_bits16 = input.to(core.int16, bitcast=True).to(core.int32) & 0xFFFF
+        sign = ((source_bits16 & 0x8000) >> 12).to(core.uint8)
+        source = input.to(core.float32)
+        source_bits = source.to(core.uint32, bitcast=True)
+    absolute_bits = source_bits & 0x7FFFFFFF
+    absolute = absolute_bits.to(core.float32, bitcast=True)
+
+    # E2M1 positive magnitudes are 0, .5, 1, 1.5, 2, 3, 4, and 6.
+    # The strict/inclusive midpoint comparisons select the encoding whose
+    # retained mantissa bit is zero at an exact RTNE tie.
+    magnitude = core.where(absolute > 0.25, 1, 0)
+    magnitude = core.where(absolute >= 0.75, 2, magnitude)
+    magnitude = core.where(absolute > 1.25, 3, magnitude)
+    magnitude = core.where(absolute >= 1.75, 4, magnitude)
+    magnitude = core.where(absolute > 2.5, 5, magnitude)
+    magnitude = core.where(absolute >= 3.5, 6, magnitude)
+    magnitude = core.where(absolute > 5.0, 7, magnitude)
+    magnitude = core.where(absolute_bits >= 0x7F800000, 7, magnitude)
+    return (magnitude.to(core.uint8) | sign).to(core.uint8)
+
+
+@jit
+def encode_fp4(
+    low,
+    high,
+    format: core.constexpr = "e2m1",
+    rounding: core.constexpr = "rtne",
+    overflow: core.constexpr = "satfinite",
+):
+    """Encode and pack two logical FP4 values into one UINT8 element.
+
+    Version 1 supports OCP E2M1. ``low`` occupies bits 0-3 and ``high``
+    occupies bits 4-7. Inputs must have the same shape and floating-point
+    dtype. E2M1 has signed zero and no NaN or infinity encodings; non-finite
+    inputs and finite overflow saturate to ``+/-6``. Scaling stays explicit in
+    the caller and is not hidden in this storage primitive.
+    """
+
+    core.static_assert(low.shape == high.shape, "encode_fp4 low and high must have the same shape")
+    core.static_assert(low.dtype == high.dtype, "encode_fp4 low and high must have the same dtype")
+    core.static_assert(
+        low.dtype.is_fp16() or low.dtype.is_bf16() or low.dtype.is_fp32(),
+        "encode_fp4 inputs must be tl.float16, tl.bfloat16, or tl.float32",
+    )
+    core.static_assert(format == "e2m1", "encode_fp4 format must be 'e2m1'")
+    core.static_assert(rounding == "rtne", "encode_fp4 rounding must be 'rtne'")
+    core.static_assert(overflow == "satfinite", "encode_fp4 overflow must be 'satfinite'")
+
+    low_nibble = _encode_fp4_e2m1_value(low)
+    high_nibble = _encode_fp4_e2m1_value(high)
+    return (low_nibble | (high_nibble << 4)).to(core.uint8)
+
+
+@jit
+def _decode_fp4_e2m1_value(input, dtype: core.constexpr):
+    value = input.to(core.uint32)
+    exponent = (value >> 1) & 0x3
+    mantissa = value & 0x1
+    nonzero = (exponent | mantissa) != 0
+
+    fp32_exponent = core.where(exponent == 0, 126, exponent + 126)
+    fp32_mantissa = core.where(exponent == 0, 0, mantissa << 22)
+    magnitude_bits = core.where(nonzero, (fp32_exponent << 23) | fp32_mantissa, 0)
+    sign_bits = (value & 0x8) << 28
+    fp32_bits = (magnitude_bits | sign_bits).to(core.uint32)
+    return fp32_bits.to(core.float32, bitcast=True).to(dtype)
+
+
+@jit
+def decode_fp4(input, format: core.constexpr = "e2m1", dtype: core.constexpr = core.float16):
+    """Decode low-first packed E2M1 storage into two floating tensors.
+
+    The returned ``(low, high)`` tensors have the same shape as ``input``.
+    Reshaping or interleaving them into a logical element axis is deliberately
+    left to the caller so odd-tail and layout policy remain explicit.
+    """
+
+    core.static_assert(input.dtype.is_uint8(), "decode_fp4 input must be tl.uint8 storage")
+    core.static_assert(format == "e2m1", "decode_fp4 format must be 'e2m1'")
+    core.static_assert(
+        dtype.is_fp16() or dtype.is_bf16() or dtype.is_fp32(),
+        "decode_fp4 dtype must be tl.float16, tl.bfloat16, or tl.float32",
+    )
+
+    low = _decode_fp4_e2m1_value(input & 0xF, dtype)
+    high = _decode_fp4_e2m1_value((input >> 4) & 0xF, dtype)
+    return low, high
+
+
+@jit
 def pack_int4(low, high, signed: core.constexpr = True):
     """Pack two logical INT4 or UINT4 values into each UINT8 element.
 
