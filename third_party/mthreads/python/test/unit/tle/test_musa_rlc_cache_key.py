@@ -297,6 +297,8 @@ def test_profitability_policy_module_attrs_are_explicit_and_fail_closed(monkeypa
 
         single_launch = FakeModule()
         musa_compiler._apply_musa_rlc_policy(single_launch)
+        assert single_launch.attrs[
+            "ttg.rlc-int-to-fp-vector-width-mask"] == 20
         assert single_launch.attrs["ttg.rlc-profitability-policy-enabled"] == 1
         assert single_launch.attrs["ttg.rlc-product-launch-count"] == 1
         assert single_launch.attrs[

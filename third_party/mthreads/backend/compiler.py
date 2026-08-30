@@ -164,7 +164,12 @@ def _apply_musa_rlc_policy(mod) -> None:
             mod.set_attr(name, builder.get_int32_attr(int(value)))
     if _effective_preserve_int_to_fp_contiguity():
         mod.set_attr("ttg.rlc-preserve-int-to-fp-contiguity",
-                     builder.get_int32_attr(1))
+                      builder.get_int32_attr(1))
+        # The MUSA LLVM lowering explicitly preserves these pair/quad widths
+        # when RLC retags an inexact i32 -> f32 chain. Common RLC treats every
+        # unadvertised width as a hard boundary.
+        mod.set_attr("ttg.rlc-int-to-fp-vector-width-mask",
+                     builder.get_int32_attr((1 << 2) | (1 << 4)))
     (profitability_enabled, launch_count, min_score, phase3_multiplier,
      max_external_uses) = _effective_profitability_policy()
     if profitability_enabled:
