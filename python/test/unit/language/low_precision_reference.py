@@ -86,6 +86,8 @@ E5M2FNUZ = Float8Format(
     unsigned_zero=True,
 )
 
+E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
 
 def _validate_byte(value: int) -> int:
     value = int(value)
@@ -219,6 +221,56 @@ def encode_fp8_rtz(value: float, fmt: Float8Format) -> int:
     if fmt.unsigned_zero and code == 0:
         return 0
     return sign | code
+
+
+def decode_fp4_e2m1(value: int) -> float:
+    """Decode one logical E2M1 nibble."""
+
+    value = int(value)
+    if not 0 <= value <= 0xF:
+        raise ValueError(f"expected a 4-bit value, got {value}")
+    sign = -1.0 if value & 0x8 else 1.0
+    return math.copysign(E2M1_MAGNITUDES[value & 0x7], sign)
+
+
+def encode_fp4_e2m1_rtne(value: float) -> int:
+    """Encode E2M1 with RTNE and saturating finite overflow."""
+
+    value = float(value)
+    sign = 0x8 if math.copysign(1.0, value) < 0 else 0
+    magnitude = abs(value)
+    if not math.isfinite(magnitude) or magnitude >= E2M1_MAGNITUDES[-1]:
+        return sign | 0x7
+
+    upper = bisect_left(E2M1_MAGNITUDES, magnitude)
+    if E2M1_MAGNITUDES[upper] == magnitude:
+        code = upper
+    elif upper == 0:
+        code = 0
+    else:
+        lower = upper - 1
+        lower_distance = magnitude - E2M1_MAGNITUDES[lower]
+        upper_distance = E2M1_MAGNITUDES[upper] - magnitude
+        if lower_distance < upper_distance:
+            code = lower
+        elif upper_distance < lower_distance:
+            code = upper
+        else:
+            code = lower if lower % 2 == 0 else upper
+    return sign | code
+
+
+def pack_fp4_e2m1(low: float, high: float) -> int:
+    """Encode and pack two E2M1 values low-nibble first."""
+
+    return encode_fp4_e2m1_rtne(low) | (encode_fp4_e2m1_rtne(high) << 4)
+
+
+def unpack_fp4_e2m1(value: int) -> tuple[float, float]:
+    """Decode one packed E2M1 byte into its low and high values."""
+
+    value = _validate_byte(value)
+    return decode_fp4_e2m1(value & 0xF), decode_fp4_e2m1(value >> 4)
 
 
 def _encode_nibble(value: int, signed: bool) -> int:
