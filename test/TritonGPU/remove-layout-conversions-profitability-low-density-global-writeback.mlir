@@ -10,12 +10,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc
   // ESCAPE-LABEL: tt.func @math_writeback_escapes_density_gate
   // ESCAPE-NOT: ttg.convert_layout
   // ESCAPE: tt.store
-  tt.func @math_writeback_escapes_density_gate(%output: tensor<256x!tt.ptr<f32>, #dst>) {
+  tt.func @math_writeback_escapes_density_gate(%output: tensor<256x!tt.ptr<f16>, #dst>) {
     %index = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #src>
     %input = arith.sitofp %index : tensor<256xi32, #src> to tensor<256xf32, #src>
     %value = math.sin %input : tensor<256xf32, #src>
-    %converted = ttg.convert_layout %value : tensor<256xf32, #src> -> tensor<256xf32, #dst>
-    tt.store %output, %converted : tensor<256x!tt.ptr<f32>, #dst>
+    %narrow = arith.truncf %value : tensor<256xf32, #src> to tensor<256xf16, #src>
+    %converted = ttg.convert_layout %narrow : tensor<256xf16, #src> -> tensor<256xf16, #dst>
+    tt.store %output, %converted : tensor<256x!tt.ptr<f16>, #dst>
     tt.return
   }
 }
@@ -27,17 +28,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-product-launch-count" = 1 : i32, "ttg.rlc-profitability-low-density-global-writeback-min-math-ops" = 1 : i64, "ttg.rlc-profitability-max-external-use-edges" = 0 : i64, "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op" = 1 : i64, "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values" = 1025 : i64, "ttg.rlc-profitability-phase3-saved-cost-multiplier" = 2 : i64, "ttg.rlc-profitability-policy-enabled" = 1 : i32, ttg.target = "musa:31", "ttg.threads-per-warp" = 32 : i32} {
   // A pure writeback is not sufficient by itself. With no qualifying math
-  // work, the same low-density topology remains fail-closed.
+  // work, the policy trace remains fail-closed. Generic canonicalization may
+  // still remove this tiny synthetic conversion after the selector rejects;
+  // the trace below, not final convert count, owns the policy assertion.
   // STRICT-LABEL: tt.func @arithmetic_writeback_keeps_density_gate
-  // STRICT: ttg.convert_layout
+  // STRICT: arith.addf
+  // STRICT: arith.truncf
   // STRICT: tt.store
-  tt.func @arithmetic_writeback_keeps_density_gate(%output: tensor<256x!tt.ptr<f32>, #dst>) {
+  tt.func @arithmetic_writeback_keeps_density_gate(%output: tensor<256x!tt.ptr<f16>, #dst>) {
     %index = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #src>
     %input = arith.sitofp %index : tensor<256xi32, #src> to tensor<256xf32, #src>
     %one = arith.constant dense<1.0> : tensor<256xf32, #src>
     %value = arith.addf %input, %one : tensor<256xf32, #src>
-    %converted = ttg.convert_layout %value : tensor<256xf32, #src> -> tensor<256xf32, #dst>
-    tt.store %output, %converted : tensor<256x!tt.ptr<f32>, #dst>
+    %narrow = arith.truncf %value : tensor<256xf32, #src> to tensor<256xf16, #src>
+    %converted = ttg.convert_layout %narrow : tensor<256xf16, #src> -> tensor<256xf16, #dst>
+    tt.store %output, %converted : tensor<256x!tt.ptr<f16>, #dst>
     tt.return
   }
 }
