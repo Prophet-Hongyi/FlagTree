@@ -155,16 +155,17 @@ def encode_fp8(
     rounding: core.constexpr = "rtne",
     overflow: core.constexpr = "satfinite",
 ):
-    """Encode FP16 values into one-byte FP8 storage.
+    """Encode floating-point values into one-byte FP8 storage.
 
     The return type is always ``tl.uint8``. It is a physical storage carrier,
     not a native FP8 tensor, so backends can implement storage and software
     dequantization without claiming native FP8 arithmetic.
 
-    Supported formats are OCP E4M3FN and E5M2. Both use
+    Supported formats are OCP E4M3FN/E5M2 and AMD E4M3FNUZ. All use
     round-to-nearest-even, saturating finite overflow, and FP16, BF16, or FP32
-    input. Unsupported combinations fail at compile time instead of silently
-    changing numeric semantics.
+    input. E4M3FNUZ has one unsigned zero and maps NaN or infinity to its sole
+    NaN encoding, ``0x80``. Unsupported combinations fail at compile time
+    instead of silently changing numeric semantics.
     """
 
     core.static_assert(
@@ -172,8 +173,8 @@ def encode_fp8(
         "encode_fp8 input must be tl.float16, tl.bfloat16, or tl.float32",
     )
     core.static_assert(
-        format == "e4m3fn" or format == "e5m2",
-        "encode_fp8 format must be 'e4m3fn' or 'e5m2'",
+        format == "e4m3fn" or format == "e4m3fnuz" or format == "e5m2",
+        "encode_fp8 format must be 'e4m3fn', 'e4m3fnuz', or 'e5m2'",
     )
     core.static_assert(rounding == "rtne", "encode_fp8 rounding must be 'rtne'")
     core.static_assert(overflow == "satfinite", "encode_fp8 overflow must be 'satfinite'")
@@ -185,6 +186,7 @@ def encode_fp8(
         exponent = (absolute >> 23) & 0xFF
         mantissa = absolute & 0x007FFFFF
         is_nan = (exponent == 0xFF) & (mantissa != 0)
+        is_nan_or_inf = exponent == 0xFF
 
         if format == "e4m3fn":
             # AMD's generic software conversion reduces the FP32 mantissa from
@@ -206,6 +208,33 @@ def encode_fp8(
                 0x3C300000,
                 0x3C500000,
                 0x3C700000,
+            )
+            for i in core.static_range(7, -1, -1):
+                if i % 2 == 0:
+                    below_halfway = absolute <= halfway_points[i]
+                else:
+                    below_halfway = absolute < halfway_points[i]
+                encoded = core.where(below_halfway, i, encoded)
+        elif format == "e4m3fnuz":
+            # Port AMD's generic E4M3FNUZ RTNE conversion. FNUZ increases the
+            # exponent bias from 7 to 8, reserves 0x80 as its sole NaN, and
+            # has only one zero. Finite overflow saturates at 0x7f (240).
+            rounding_absolute = core.where(is_nan_or_inf, 0x7F800000, absolute)
+            rounding_bias = ((rounding_absolute & 0x00100000) >> 20) + 0x0007FFFF
+            rounded = (rounding_absolute + rounding_bias) & 0x7FF00000
+            rounded = core.maximum(rounded, 0x3C000000)
+            encoded = (rounded - 0x3B800000) >> 20
+            encoded = core.where(absolute > 0x43700000, 0x7F, encoded)
+
+            halfway_points: core.constexpr = (
+                0x3A000000,
+                0x3AC00000,
+                0x3B200000,
+                0x3B600000,
+                0x3B900000,
+                0x3BB00000,
+                0x3BD00000,
+                0x3BF00000,
             )
             for i in core.static_range(7, -1, -1):
                 if i % 2 == 0:
@@ -248,8 +277,14 @@ def encode_fp8(
             )
             encoded = rounded >> 21
 
-        encoded = core.where(is_nan, 0x7F, encoded).to(core.uint8)
-        return (encoded | sign).to(core.uint8)
+        if format == "e4m3fnuz":
+            encoded = core.where(is_nan_or_inf, 0x80, encoded.to(core.int32)).to(core.uint8)
+            is_zero = (encoded == 0) & (is_nan_or_inf == 0)
+            encoded = (encoded | sign).to(core.uint8)
+            return core.where(is_zero, 0, encoded).to(core.uint8)
+        else:
+            encoded = core.where(is_nan, 0x7F, encoded).to(core.uint8)
+            return (encoded | sign).to(core.uint8)
 
     else:
         # Preserve NaN and sign information from the original source. BF16
@@ -262,9 +297,15 @@ def encode_fp8(
         sign = ((source_bits & 0x8000) >> 8).to(core.uint8)
         if input.dtype.is_bf16():
             is_nan = ((source_absolute & 0x7F80) == 0x7F80) & ((source_absolute & 0x007F) != 0)
+            # The top 128 absolute BF16 encodings are exactly NaN/Inf. Adding
+            # 0x80 makes only that interval cross bit 15. Keep this as an
+            # integer bit instead of a comparison: some vendor LLVM pipelines
+            # otherwise replace the test with an unreliable BF16 comparison.
+            fnuz_special_bit = ((source_absolute + 0x0080) >> 15) & 1
             input = input.to(core.float16)
         else:
             is_nan = ((source_absolute & 0x7C00) == 0x7C00) & ((source_absolute & 0x03FF) != 0)
+            fnuz_special_bit = ((source_absolute + 0x0400) >> 15) & 1
 
         # Use a non-negative int32 carrier. Some backends cannot lower unsigned
         # 32-bit arithmetic without promoting it to an unsupported uint64 cast.
@@ -294,6 +335,29 @@ def encode_fp8(
                 else:
                     below_halfway = absolute < halfway_points[i]
                 encoded = core.where(below_halfway, i, encoded)
+        elif format == "e4m3fnuz":
+            rounding_bias = ((absolute & 0x0080) >> 7) + 0x003F
+            encoded = (absolute + rounding_bias) & 0xFF80
+            encoded = core.maximum(encoded, 0x2000)
+            encoded = ((encoded - 0x1C00) >> 7).to(core.uint8)
+            encoded = core.where(absolute > 0x5B80, 0x7F, encoded)
+
+            halfway_points: core.constexpr = (
+                0x1000,
+                0x1600,
+                0x1900,
+                0x1B00,
+                0x1C80,
+                0x1D80,
+                0x1E80,
+                0x1F80,
+            )
+            for i in core.static_range(7, -1, -1):
+                if i % 2 == 0:
+                    below_halfway = absolute <= halfway_points[i]
+                else:
+                    below_halfway = absolute < halfway_points[i]
+                encoded = core.where(below_halfway, i, encoded)
         else:
             # E5M2 and FP16 share the same five-bit exponent. Round the FP16
             # mantissa from ten bits to two, clamp overflow and infinities to
@@ -303,8 +367,14 @@ def encode_fp8(
             encoded = core.where(absolute >= 0x7B80, 0x7B00, encoded)
             encoded = (encoded >> 8).to(core.uint8)
 
-        encoded = core.where(is_nan, 0x7F, encoded)
-        return (encoded | sign).to(core.uint8)
+        if format == "e4m3fnuz":
+            encoded_i32 = encoded.to(core.int32)
+            encoded = (encoded_i32 * (1 - fnuz_special_bit) + 0x80 * fnuz_special_bit).to(core.uint8)
+            sign = core.where(encoded == 0, 0, sign).to(core.uint8)
+            return (encoded | sign).to(core.uint8)
+        else:
+            encoded = core.where(is_nan, 0x7F, encoded)
+            return (encoded | sign).to(core.uint8)
 
 
 @jit
@@ -312,14 +382,14 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
     """Decode one-byte FP8 storage into FP16, BF16, or FP32 values.
 
     ``input`` must be ``tl.uint8`` produced by :func:`encode_fp8` or an
-    equivalent E4M3FN or E5M2 storage source. No native FP8 IR type is
-    introduced.
+    equivalent E4M3FN, E4M3FNUZ, or E5M2 storage source. No native FP8 IR type
+    is introduced.
     """
 
     core.static_assert(input.dtype.is_uint8(), "decode_fp8 input must be tl.uint8 storage")
     core.static_assert(
-        format == "e4m3fn" or format == "e5m2",
-        "decode_fp8 format must be 'e4m3fn' or 'e5m2'",
+        format == "e4m3fn" or format == "e4m3fnuz" or format == "e5m2",
+        "decode_fp8 format must be 'e4m3fn', 'e4m3fnuz', or 'e5m2'",
     )
     core.static_assert(
         dtype.is_fp16() or dtype.is_bf16() or dtype.is_fp32(),
@@ -347,6 +417,26 @@ def decode_fp8(input, format: core.constexpr = "e4m3fn", dtype: core.constexpr =
         for i in core.static_range(8):
             fp16_bits = core.where(absolute == i, denormals_and_zero[i], fp16_bits)
         fp16_bits |= sign
+    elif format == "e4m3fnuz":
+        absolute = values_i32 & 0x7F
+        sign = (values_i32 & 0x80) << 8
+        fp16_bits = ((values_i32 << 8) & 0x7FFF) >> 1
+        fp16_bits += 0x1C00
+
+        denormals_and_zero: core.constexpr = (
+            0x0000,
+            0x1400,
+            0x1800,
+            0x1A00,
+            0x1C00,
+            0x1D00,
+            0x1E00,
+            0x1F00,
+        )
+        for i in core.static_range(8):
+            fp16_bits = core.where(absolute == i, denormals_and_zero[i], fp16_bits)
+        fp16_bits |= sign
+        fp16_bits = core.where(values_i32 == 0x80, 0x7E00, fp16_bits)
     else:
         # E5M2 is a high-byte projection of FP16: sign and exponent widths are
         # identical and the two stored mantissa bits occupy FP16 bits 9-8.
