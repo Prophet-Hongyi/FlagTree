@@ -59,6 +59,7 @@ from triton.backends.ascend.utils import (
     get_cann_version_file_hash,
 )
 from triton.backends.ascend.driver import (NPUUtils)
+from triton.backends.ascend.target_features import get_low_precision_target_features
 from triton.backends.compiler import (
     BaseBackend,
     GPUTarget,
@@ -895,7 +896,9 @@ class NPUOptions:
     enable_fp_fusion: bool = True
     allow_fp8e4nv: bool = False
     auto_tile_and_bind_subblock: bool = True
-    supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15", "fp8e4nv", "fp8e4b8", "fp8e5b16")
+    # Populated from the exact target in AscendBackend.parse_options. Direct
+    # construction stays fail closed instead of advertising a global default.
+    supported_fp8_dtypes: Tuple[str, ...] = ()
     deprecated_fp8_dtypes: Tuple[str] = ()
     vf_merge_level: int = 1
     default_dot_input_precision: str = "ieee"
@@ -1065,6 +1068,11 @@ class AscendBackend(BaseBackend):
         if self.target.backend == "npu":
             args = {k: opts[k] for k in NPUOptions.__dataclass_fields__.keys() if k in opts}
             args.setdefault("arch", self.target.arch)
+            # Target capabilities, rather than user options, own dtype
+            # admission. This prevents unsupported FP8 types from surviving
+            # until a late BiShengIR failure on A2/A3 and unknown targets.
+            target_features = get_low_precision_target_features(self.target.arch)
+            args["supported_fp8_dtypes"] = target_features.supported_fp8_dtypes
             options = NPUOptions(**args)
         else:
             raise NotImplementedError(f"Backend '{self.target.backend}' is not supported. "
