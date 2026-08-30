@@ -1605,15 +1605,19 @@ class TritonSemantic(Generic[TensorTy]):
         if lhs_scale is not None:
             scale_factor = 16 if lhs_scale.dtype.is_fp8e4nv() else 32
             lhs_scale_shape = lhs_scale.type.shape
-            assert lhs_scale_shape == [
+            lhs_scale_expected = (f"[..., {M}, {K // scale_factor}]" if len(lhs_scale_shape) > 2 else
+                                  f"[{M}, {K // scale_factor}]")
+            assert lhs_scale_shape[-2:] == [
                 M, K // scale_factor
-            ], f"lhs_scale must be a tensor of shape [{M}, {K // scale_factor}]. Got {lhs_scale_shape}"
+            ], f"lhs_scale must be a tensor of shape {lhs_scale_expected}. Got {lhs_scale_shape}"
         if rhs_scale is not None:
             scale_factor = 16 if rhs_scale.dtype.is_fp8e4nv() else 32
             rhs_scale_shape = rhs_scale.type.shape
-            assert rhs_scale_shape == [
+            rhs_scale_expected = (f"[..., {N}, {K // scale_factor}]" if len(rhs_scale_shape) > 2 else
+                                  f"[{N}, {K // scale_factor}]")
+            assert rhs_scale_shape[-2:] == [
                 N, K // scale_factor
-            ], f"rhs_scale must be a tensor of shape [{N}, {K // scale_factor}]. Got {rhs_scale_shape}"
+            ], f"rhs_scale must be a tensor of shape {rhs_scale_expected}. Got {rhs_scale_shape}"
 
     def dot_scaled(self, lhs: TensorTy, lhs_scale: TensorTy, lhs_format: str, rhs: TensorTy,
                    rhs_scale: Optional[TensorTy], rhs_format: str, acc: TensorTy | None, fast_math: bool,
@@ -1623,6 +1627,10 @@ class TritonSemantic(Generic[TensorTy]):
         lhs_rank = len(lhs.shape)
         rhs_rank = len(rhs.shape)
         assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
+        if lhs_rank == 3:
+            # Rank-3 lowering support varies by backend, so unspecified targets fail closed.
+            assert getattr(self.builder.options, "supports_batched_dot_scaled", False), (
+                "batched dot_scaled is not supported by this backend")
         lhs_format: str = lhs_format.value
         rhs_format: str = rhs_format.value
         lhs_format_enum = self._str_to_fp_type(lhs_format)
