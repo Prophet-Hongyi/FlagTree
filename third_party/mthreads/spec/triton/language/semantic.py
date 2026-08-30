@@ -1646,6 +1646,10 @@ class TritonSemantic(Generic[TensorTy]):
         lhs_rank = len(lhs.shape)
         rhs_rank = len(rhs.shape)
         assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
+        if lhs_rank == 3:
+            # Rank-3 lowering support varies by backend, so unspecified targets fail closed.
+            assert getattr(self.builder.options, "supports_batched_dot_scaled", False), (
+                "batched dot_scaled is not supported by this backend")
         lhs_format: str = lhs_format.value
         rhs_format: str = rhs_format.value
         lhs_format_enum = self._str_to_fp_type(lhs_format)
