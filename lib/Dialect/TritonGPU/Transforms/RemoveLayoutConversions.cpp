@@ -153,6 +153,7 @@ struct RlcProfitabilityFeatures {
   int64_t computeOps = 0;
   bool lowDensityGlobalWritebackMathEligible = false;
   bool lowDensityOutputHeavyComputeEligible = false;
+  bool lowDensityZeroLoadArithmeticEligible = false;
   bool loopResident = false;
 };
 
@@ -226,7 +227,10 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
               features->lowDensityGlobalWritebackMathEligible)
        << " online_low_density_output_heavy_compute_eligible="
        << static_cast<int>(
-              features->lowDensityOutputHeavyComputeEligible);
+              features->lowDensityOutputHeavyComputeEligible)
+       << " online_low_density_zero_load_arithmetic_eligible="
+       << static_cast<int>(
+              features->lowDensityZeroLoadArithmeticEligible);
   }
   os << '\n';
 }
@@ -491,6 +495,7 @@ constexpr unsigned kMaxRematSliceSize = 256;
 //   ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values
 //   ttg.rlc-profitability-low-density-global-writeback-min-math-ops
 //   ttg.rlc-profitability-low-density-output-heavy-min-compute-ops
+//   ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops
 //
 // Values must be positive integers; absent or invalid values keep the
 // conservative defaults below.
@@ -532,6 +537,7 @@ struct RlcBackendPolicy {
   int64_t profitabilityMinRemovedConvertDensityPer1024ProposalValues = 0;
   int64_t profitabilityLowDensityGlobalWritebackMinMathOps = 0;
   int64_t profitabilityLowDensityOutputHeavyMinComputeOps = 0;
+  int64_t profitabilityLowDensityZeroLoadMinArithmeticOps = 0;
 
   bool hasCompleteProfitabilityConfiguration() const {
     return profitabilityMinAdjustedSavedCostPerTensorOp > 0 &&
@@ -604,6 +610,9 @@ struct RlcBackendPolicy {
     overridePositive(
         "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops",
         policy.profitabilityLowDensityOutputHeavyMinComputeOps);
+    overridePositive(
+        "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops",
+        policy.profitabilityLowDensityZeroLoadMinArithmeticOps);
     return policy;
   }
 };
@@ -689,11 +698,28 @@ static StringRef applyRlcProfitabilityPolicy(
       features.localLoadOps == 0 && features.localStoreOps == 0 &&
       features.atomicOps == 0 && features.reduceScanOps == 0 &&
       features.dotOps == 0;
+  // Zero-input arithmetic writeback networks are a distinct low-density
+  // regime: their tensor payload is synthesized from scalar launch state, so
+  // convert removal does not duplicate global reads.  Keep the escape
+  // backend-thresholded and require the absence of math-dialect work; this
+  // separates integer/bit-manipulation-heavy generators from nearby affine
+  // post-processing networks without consulting a kernel or shape identity.
+  features.lowDensityZeroLoadArithmeticEligible =
+      policy.profitabilityLowDensityZeroLoadMinArithmeticOps > 0 &&
+      features.arithmeticOps >=
+          policy.profitabilityLowDensityZeroLoadMinArithmeticOps &&
+      features.mathOps == 0 && features.globalLoadOps == 0 &&
+      features.globalStoreOps > 0 &&
+      features.removedConverts >= features.globalStoreOps &&
+      features.localLoadOps == 0 && features.localStoreOps == 0 &&
+      features.atomicOps == 0 && features.reduceScanOps == 0 &&
+      features.dotOps == 0 && features.externalUseEdges == 0;
   if (policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues > 0 &&
       features.removedConvertDensityPer1024ProposalValues <
           policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues &&
       !features.lowDensityGlobalWritebackMathEligible &&
-      !features.lowDensityOutputHeavyComputeEligible)
+      !features.lowDensityOutputHeavyComputeEligible &&
+      !features.lowDensityZeroLoadArithmeticEligible)
     return "profitability-removed-convert-density-below-threshold";
   // A locally profitable proposal can still be compile-time churn when the
   // surrounding reduction or scan pipeline later canonicalizes it away.  The

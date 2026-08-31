@@ -113,6 +113,7 @@ def test_signature_tracks_profitability_contract_only_when_enabled():
         "FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
         "FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS",
         "FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS",
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS",
     )
     previous = {key: os.environ.get(key) for key in keys}
     try:
@@ -125,8 +126,9 @@ def test_signature_tracks_profitability_contract_only_when_enabled():
         os.environ["FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
         os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
         os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
+        os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
         baseline = _rlc_policy_signature()
-        os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "129"
+        os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "101"
         retuned = _rlc_policy_signature()
         assert baseline != retuned
 
@@ -160,6 +162,7 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
         "FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
         "FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS",
         "FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS",
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS",
     )
     previous = {key: os.environ.get(key) for key in keys}
 
@@ -188,6 +191,7 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
         os.environ["FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
         os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
         os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
+        os.environ["FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
         complete = FakeModule()
         _apply_metax_rlc_policy(complete)
         assert complete.attrs == {
@@ -199,6 +203,7 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
             "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values": 128,
             "ttg.rlc-profitability-low-density-global-writeback-min-math-ops": 8,
             "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops": 128,
+            "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops": 100,
         }
 
         os.environ["FLAGTREE_METAX_RLC_PRODUCT_LAUNCH_COUNT"] = "0"

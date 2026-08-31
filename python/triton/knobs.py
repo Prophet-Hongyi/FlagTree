@@ -713,6 +713,10 @@ class metax_knobs(base_knobs):
     # Zero keeps this common density escape disabled and fail-closed.
     rlc_profitability_low_density_output_heavy_min_compute_ops: env_int = env_int(
         "FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", 0)
+    # Optional MetaX threshold for zero-global-load, no-math arithmetic
+    # writeback networks. Zero disables this common density escape.
+    rlc_profitability_low_density_zero_load_min_arithmetic_ops: env_int = env_int(
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", 0)
 
 
 # flagtree mthreads
