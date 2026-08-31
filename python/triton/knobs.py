@@ -695,28 +695,31 @@ class metax_knobs(base_knobs):
     # contract before the common selector can commit a proposal.
     rlc_profitability_policy: env_bool = env_bool(
         "FLAGTREE_METAX_RLC_PROFITABILITY_POLICY", False)
+    # Calibrated MC550 parameters are inert until both opt-in booleans above
+    # are enabled. Keeping the switches false preserves production behavior
+    # while making the qualified backend contract reproducible.
     rlc_product_launch_count: env_int = env_int(
-        "FLAGTREE_METAX_RLC_PRODUCT_LAUNCH_COUNT", 0)
+        "FLAGTREE_METAX_RLC_PRODUCT_LAUNCH_COUNT", 1)
     rlc_profitability_min_adjusted_saved_cost_per_tensor_op: env_int = env_int(
-        "FLAGTREE_METAX_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 0)
+        "FLAGTREE_METAX_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 1)
     rlc_profitability_phase3_saved_cost_multiplier: env_int = env_int(
-        "FLAGTREE_METAX_RLC_PHASE3_SAVED_COST_MULTIPLIER", 0)
+        "FLAGTREE_METAX_RLC_PHASE3_SAVED_COST_MULTIPLIER", 1)
     rlc_profitability_max_external_use_edges: env_int = env_int(
-        "FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", 0)
+        "FLAGTREE_METAX_RLC_MAX_EXTERNAL_USE_EDGES", 64)
     rlc_profitability_min_removed_convert_density_per_1024_proposal_values: env_int = env_int(
-        "FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 0)
+        "FLAGTREE_METAX_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 128)
     # Optional MetaX escape hatch for low-density, pure global-writeback math
     # networks. Zero keeps the common density gate strict and fail-closed.
     rlc_profitability_low_density_global_writeback_min_math_ops: env_int = env_int(
-        "FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", 0)
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", 8)
     # Optional MetaX threshold for low-density output-heavy compute networks.
     # Zero keeps this common density escape disabled and fail-closed.
     rlc_profitability_low_density_output_heavy_min_compute_ops: env_int = env_int(
-        "FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", 0)
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", 128)
     # Optional MetaX threshold for zero-global-load, no-math arithmetic
     # writeback networks. Zero disables this common density escape.
     rlc_profitability_low_density_zero_load_min_arithmetic_ops: env_int = env_int(
-        "FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", 0)
+        "FLAGTREE_METAX_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", 100)
 
 
 # flagtree mthreads
