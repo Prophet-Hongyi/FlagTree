@@ -35,24 +35,121 @@ def is_in_thread_transpose_enabled(arch):
     return (arch == "gfx942") if knobs.hcu.use_in_thread_transpose is None else knobs.hcu.use_in_thread_transpose
 
 
+def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int, int, int]:
+    """Return the live HCU selector identity only at owned decision points."""
+    hcu_knob = knobs.hcu
+    owns_decision_point = int(hcu_knob.rlc_phase_mask) & 0b1100
+    enabled = bool(hcu_knob.rlc_enhance and owns_decision_point and
+                   getattr(hcu_knob, "rlc_profitability_policy", False))
+    if not enabled:
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+    return (
+        1,
+        int(getattr(hcu_knob, "rlc_product_launch_count", 0) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_min_adjusted_saved_cost_per_tensor_op",
+            0,
+        ) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_phase3_saved_cost_multiplier",
+            0,
+        ) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_max_external_use_edges",
+            0,
+        ) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_min_removed_convert_density_per_1024_proposal_values",
+            0,
+        ) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_low_density_global_writeback_min_math_ops",
+            0,
+        ) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_low_density_output_heavy_min_compute_ops",
+            0,
+        ) or 0),
+        int(getattr(
+            hcu_knob,
+            "rlc_profitability_low_density_zero_load_min_arithmetic_ops",
+            0,
+        ) or 0),
+    )
+
+
 def _rlc_policy_signature() -> str:
     """Live RLC identity for disk and in-memory compile keys.
 
     Must be read on every compile. Do not cache this string across
     FLAGTREE_HCU_RLC_* environment changes in the same process.
     """
-    return (f"{int(bool(knobs.hcu.rlc_enhance))}-{int(knobs.hcu.rlc_phase_mask)}-"
-            f"{int(bool(knobs.hcu.rlc_allow_atomic_writeback_order_change))}-"
-            f"{int(bool(knobs.hcu.gfx936_f16_pair_materialize))}-"
-            f"{int(bool(knobs.hcu.gfx936_f32_box_muller_pair_materialize))}")
+    fields = (
+        int(bool(knobs.hcu.rlc_enhance)),
+        int(knobs.hcu.rlc_phase_mask),
+        int(bool(knobs.hcu.rlc_allow_atomic_writeback_order_change)),
+        int(bool(knobs.hcu.gfx936_f16_pair_materialize)),
+        int(bool(knobs.hcu.gfx936_f32_box_muller_pair_materialize)),
+        *_effective_profitability_policy(),
+    )
+    return "-".join(str(value) for value in fields)
 
 
 def _apply_hcu_rlc_policy(mod) -> None:
-    """Attach only explicitly enabled HCU policy relaxations to fresh TTGIR."""
+    """Attach explicitly enabled HCU policy controls to fresh TTGIR."""
+    builder = ir.builder(mod.context)
     if knobs.hcu.rlc_allow_atomic_writeback_order_change:
         mod.set_attr(
             "ttg.rlc-allow-atomic-writeback-order-change",
-            ir.builder(mod.context).get_int32_attr(1),
+            builder.get_int32_attr(1),
+        )
+    (enabled, launch_count, min_score, phase3_multiplier, max_external_uses,
+     min_removed_convert_density,
+     low_density_global_writeback_min_math_ops,
+     low_density_output_heavy_min_compute_ops,
+     low_density_zero_load_min_arithmetic_ops) = _effective_profitability_policy()
+    if not enabled:
+        return
+    mod.set_attr("ttg.rlc-profitability-policy-enabled",
+                 builder.get_int32_attr(1))
+    if launch_count > 0:
+        mod.set_attr("ttg.rlc-product-launch-count",
+                     builder.get_int32_attr(launch_count))
+    if min_score > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op",
+            builder.get_int32_attr(min_score),
+        )
+    if phase3_multiplier > 0:
+        mod.set_attr("ttg.rlc-profitability-phase3-saved-cost-multiplier",
+                     builder.get_int32_attr(phase3_multiplier))
+    mod.set_attr("ttg.rlc-profitability-max-external-use-edges",
+                 builder.get_int32_attr(max_external_uses))
+    if min_removed_convert_density > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values",
+            builder.get_int32_attr(min_removed_convert_density),
+        )
+    if low_density_global_writeback_min_math_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-global-writeback-min-math-ops",
+            builder.get_int32_attr(low_density_global_writeback_min_math_ops),
+        )
+    if low_density_output_heavy_min_compute_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops",
+            builder.get_int32_attr(low_density_output_heavy_min_compute_ops),
+        )
+    if low_density_zero_load_min_arithmetic_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops",
+            builder.get_int32_attr(low_density_zero_load_min_arithmetic_ops),
         )
 
 

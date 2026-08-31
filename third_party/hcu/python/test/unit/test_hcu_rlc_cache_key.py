@@ -18,10 +18,20 @@ from triton.backends.compiler import GPUTarget
 compiler = pytest.importorskip("triton.backends.hcu.compiler_hcu")
 HIPBackend = compiler.HIPBackend
 _rlc_policy_signature = compiler._rlc_policy_signature
+_apply_hcu_rlc_policy = compiler._apply_hcu_rlc_policy
 _gfx936_codegen_signature = compiler._gfx936_codegen_signature
 _RLC_ENV_KEYS = (
     "FLAGTREE_HCU_RLC_ENHANCE",
     "FLAGTREE_HCU_RLC_PHASE_MASK",
+    "FLAGTREE_HCU_RLC_PROFITABILITY_POLICY",
+    "FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT",
+    "FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
+    "FLAGTREE_HCU_RLC_PHASE3_SAVED_COST_MULTIPLIER",
+    "FLAGTREE_HCU_RLC_MAX_EXTERNAL_USE_EDGES",
+    "FLAGTREE_HCU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
+    "FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS",
+    "FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS",
+    "FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS",
     "FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE",
     "FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE",
     "FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE",
@@ -48,6 +58,15 @@ def _set_rlc(
 ):
     os.environ["FLAGTREE_HCU_RLC_ENHANCE"] = "1" if enhance else "0"
     os.environ["FLAGTREE_HCU_RLC_PHASE_MASK"] = str(mask)
+    os.environ["FLAGTREE_HCU_RLC_PROFITABILITY_POLICY"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_MAX_EXTERNAL_USE_EDGES"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "0"
     os.environ["FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE"] = (
         "1" if allow_atomic_writeback_order_change else "0"
     )
@@ -219,6 +238,99 @@ def test_options_include_live_rlc_policy():
         assert on.hash() != pair_on.hash()
         assert pair_on.hash() != f32_pair_on.hash()
         assert f32_pair_on.hash() != bridge_on.hash()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_signature_tracks_profitability_contract_only_when_enabled():
+    previous = {k: os.environ.get(k) for k in _RLC_ENV_KEYS}
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_HCU_RLC_PROFITABILITY_POLICY"] = "1"
+        os.environ["FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1900"
+        os.environ["FLAGTREE_HCU_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "3"
+        os.environ["FLAGTREE_HCU_RLC_MAX_EXTERNAL_USE_EDGES"] = "2"
+        os.environ["FLAGTREE_HCU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
+        baseline = _rlc_policy_signature()
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "101"
+        assert baseline != _rlc_policy_signature()
+
+        os.environ["FLAGTREE_HCU_RLC_PROFITABILITY_POLICY"] = "0"
+        disabled = _rlc_policy_signature()
+        os.environ["FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "9000"
+        assert disabled == _rlc_policy_signature()
+
+        _set_rlc(True, 3)
+        os.environ["FLAGTREE_HCU_RLC_PROFITABILITY_POLICY"] = "1"
+        no_owner = _rlc_policy_signature()
+        os.environ["FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT"] = "7"
+        assert no_owner == _rlc_policy_signature()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
+    previous = {k: os.environ.get(k) for k in _RLC_ENV_KEYS}
+
+    class FakeBuilder:
+        @staticmethod
+        def get_int32_attr(value):
+            return value
+
+    class FakeModule:
+        context = object()
+
+        def __init__(self):
+            self.attrs = {}
+
+        def set_attr(self, name, value):
+            self.attrs[name] = value
+
+    monkeypatch.setattr(compiler.ir, "builder", lambda context: FakeBuilder())
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_HCU_RLC_PROFITABILITY_POLICY"] = "1"
+        os.environ["FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1900"
+        os.environ["FLAGTREE_HCU_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "3"
+        os.environ["FLAGTREE_HCU_RLC_MAX_EXTERNAL_USE_EDGES"] = "2"
+        os.environ["FLAGTREE_HCU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
+        complete = FakeModule()
+        _apply_hcu_rlc_policy(complete)
+        assert complete.attrs == {
+            "ttg.rlc-profitability-policy-enabled": 1,
+            "ttg.rlc-product-launch-count": 1,
+            "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op": 1900,
+            "ttg.rlc-profitability-phase3-saved-cost-multiplier": 3,
+            "ttg.rlc-profitability-max-external-use-edges": 2,
+            "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values": 128,
+            "ttg.rlc-profitability-low-density-global-writeback-min-math-ops": 8,
+            "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops": 128,
+            "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops": 100,
+        }
+
+        os.environ["FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT"] = "0"
+        os.environ["FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "0"
+        incomplete = FakeModule()
+        _apply_hcu_rlc_policy(incomplete)
+        assert incomplete.attrs["ttg.rlc-profitability-policy-enabled"] == 1
+        assert "ttg.rlc-product-launch-count" not in incomplete.attrs
+        assert "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op" not in incomplete.attrs
     finally:
         for key, value in previous.items():
             if value is None:

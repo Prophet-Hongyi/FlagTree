@@ -286,6 +286,15 @@ def test_metax_rlc_knobs(fresh_knobs, monkeypatch):
 def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
     assert not fresh_knobs.hcu.rlc_enhance
     assert fresh_knobs.hcu.rlc_phase_mask == 0xF
+    assert not fresh_knobs.hcu.rlc_profitability_policy
+    assert fresh_knobs.hcu.rlc_product_launch_count == 0
+    assert fresh_knobs.hcu.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 0
+    assert fresh_knobs.hcu.rlc_profitability_phase3_saved_cost_multiplier == 0
+    assert fresh_knobs.hcu.rlc_profitability_max_external_use_edges == 0
+    assert fresh_knobs.hcu.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 0
+    assert fresh_knobs.hcu.rlc_profitability_low_density_global_writeback_min_math_ops == 0
+    assert fresh_knobs.hcu.rlc_profitability_low_density_output_heavy_min_compute_ops == 0
+    assert fresh_knobs.hcu.rlc_profitability_low_density_zero_load_min_arithmetic_ops == 0
     assert not fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
     assert not fresh_knobs.hcu.gfx936_f16_pair_materialize
     assert not fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize
@@ -293,12 +302,30 @@ def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
 
     monkeypatch.setenv("FLAGTREE_HCU_RLC_ENHANCE", "1")
     monkeypatch.setenv("FLAGTREE_HCU_RLC_PHASE_MASK", "5")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_PROFITABILITY_POLICY", "1")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT", "1")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", "1900")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_PHASE3_SAVED_COST_MULTIPLIER", "3")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_MAX_EXTERNAL_USE_EDGES", "2")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", "128")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", "8")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", "128")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", "100")
     monkeypatch.setenv("FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE", "true")
     monkeypatch.setenv("FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE", "true")
     monkeypatch.setenv("FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE", "true")
     monkeypatch.setenv("FLAGTREE_HCU_GFX936_LLVM17_CONTRACT_BRIDGE", "true")
     assert fresh_knobs.hcu.rlc_enhance
     assert fresh_knobs.hcu.rlc_phase_mask == 5
+    assert fresh_knobs.hcu.rlc_profitability_policy
+    assert fresh_knobs.hcu.rlc_product_launch_count == 1
+    assert fresh_knobs.hcu.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1900
+    assert fresh_knobs.hcu.rlc_profitability_phase3_saved_cost_multiplier == 3
+    assert fresh_knobs.hcu.rlc_profitability_max_external_use_edges == 2
+    assert fresh_knobs.hcu.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 128
+    assert fresh_knobs.hcu.rlc_profitability_low_density_global_writeback_min_math_ops == 8
+    assert fresh_knobs.hcu.rlc_profitability_low_density_output_heavy_min_compute_ops == 128
+    assert fresh_knobs.hcu.rlc_profitability_low_density_zero_load_min_arithmetic_ops == 100
     assert fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
     assert fresh_knobs.hcu.gfx936_f16_pair_materialize
     assert fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize
