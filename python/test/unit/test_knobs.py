@@ -288,13 +288,13 @@ def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.hcu.rlc_phase_mask == 0xF
     assert not fresh_knobs.hcu.rlc_profitability_policy
     assert fresh_knobs.hcu.rlc_product_launch_count == 0
-    assert fresh_knobs.hcu.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 0
-    assert fresh_knobs.hcu.rlc_profitability_phase3_saved_cost_multiplier == 0
-    assert fresh_knobs.hcu.rlc_profitability_max_external_use_edges == 0
-    assert fresh_knobs.hcu.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 0
-    assert fresh_knobs.hcu.rlc_profitability_low_density_global_writeback_min_math_ops == 0
-    assert fresh_knobs.hcu.rlc_profitability_low_density_output_heavy_min_compute_ops == 0
-    assert fresh_knobs.hcu.rlc_profitability_low_density_zero_load_min_arithmetic_ops == 0
+    assert fresh_knobs.hcu.rlc_profitability_min_adjusted_saved_cost_per_tensor_op == 1
+    assert fresh_knobs.hcu.rlc_profitability_phase3_saved_cost_multiplier == 1
+    assert fresh_knobs.hcu.rlc_profitability_max_external_use_edges == 8
+    assert fresh_knobs.hcu.rlc_profitability_min_removed_convert_density_per_1024_proposal_values == 128
+    assert fresh_knobs.hcu.rlc_profitability_low_density_global_writeback_min_math_ops == 8
+    assert fresh_knobs.hcu.rlc_profitability_low_density_output_heavy_min_compute_ops == 128
+    assert fresh_knobs.hcu.rlc_profitability_low_density_zero_load_min_arithmetic_ops == 100
     assert not fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
     assert not fresh_knobs.hcu.gfx936_f16_pair_materialize
     assert not fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize
