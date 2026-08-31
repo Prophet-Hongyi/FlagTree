@@ -800,27 +800,31 @@ class ppu_knobs(base_knobs):
     # until backend-specific IR, correctness, and performance gates pass.
     rlc_enhance: env_bool = env_bool("FLAGTREE_PPU_RLC_ENHANCE", False)
     rlc_phase_mask: env_int = env_int("FLAGTREE_PPU_RLC_PHASE_MASK", 0xF)
-    # 810E profitability calibration is independent from MUSA and MetaX.
-    # Keep every threshold at zero until device evidence installs a backend
-    # policy; the common selector remains doubly gated by enhance + policy.
+    # 810E profitability calibration is independent from MUSA and MetaX. The
+    # thresholds below retain the strict-G public uniform_ topology while
+    # rejecting the measured-negative dropout topology through its external
+    # use boundary. They remain inert until both enhance + policy are enabled,
+    # and launch count stays online/workload-provided and fail-closed at zero.
     rlc_profitability_policy: env_bool = env_bool(
         "FLAGTREE_PPU_RLC_PROFITABILITY_POLICY", False)
     rlc_product_launch_count: env_int = env_int(
         "FLAGTREE_PPU_RLC_PRODUCT_LAUNCH_COUNT", 0)
     rlc_profitability_min_adjusted_saved_cost_per_tensor_op: env_int = env_int(
-        "FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 0)
+        "FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP", 1)
     rlc_profitability_phase3_saved_cost_multiplier: env_int = env_int(
-        "FLAGTREE_PPU_RLC_PHASE3_SAVED_COST_MULTIPLIER", 0)
+        "FLAGTREE_PPU_RLC_PHASE3_SAVED_COST_MULTIPLIER", 1)
+    # Zero is a calibrated strict boundary on PPU: proposals with any external
+    # use edge are rejected, rather than treating zero as an unset threshold.
     rlc_profitability_max_external_use_edges: env_int = env_int(
         "FLAGTREE_PPU_RLC_MAX_EXTERNAL_USE_EDGES", 0)
     rlc_profitability_min_removed_convert_density_per_1024_proposal_values: env_int = env_int(
-        "FLAGTREE_PPU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 0)
+        "FLAGTREE_PPU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES", 128)
     rlc_profitability_low_density_global_writeback_min_math_ops: env_int = env_int(
-        "FLAGTREE_PPU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", 0)
+        "FLAGTREE_PPU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", 8)
     rlc_profitability_low_density_output_heavy_min_compute_ops: env_int = env_int(
-        "FLAGTREE_PPU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", 0)
+        "FLAGTREE_PPU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", 128)
     rlc_profitability_low_density_zero_load_min_arithmetic_ops: env_int = env_int(
-        "FLAGTREE_PPU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", 0)
+        "FLAGTREE_PPU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", 100)
 
 
 class proton_knobs(base_knobs):
