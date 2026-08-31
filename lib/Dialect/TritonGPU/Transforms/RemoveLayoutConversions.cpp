@@ -155,6 +155,7 @@ struct RlcProfitabilityFeatures {
   bool lowDensityGlobalWritebackMathEligible = false;
   bool lowDensityOutputHeavyComputeEligible = false;
   bool lowDensityZeroLoadArithmeticEligible = false;
+  bool lowDensityLoopResidentHighSavingsEligible = false;
   bool loopResident = false;
 };
 
@@ -233,7 +234,10 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
               features->lowDensityOutputHeavyComputeEligible)
        << " online_low_density_zero_load_arithmetic_eligible="
        << static_cast<int>(
-              features->lowDensityZeroLoadArithmeticEligible);
+              features->lowDensityZeroLoadArithmeticEligible)
+       << " online_low_density_loop_resident_high_savings_eligible="
+       << static_cast<int>(
+              features->lowDensityLoopResidentHighSavingsEligible);
   }
   os << '\n';
 }
@@ -541,6 +545,7 @@ struct RlcBackendPolicy {
   int64_t profitabilityLowDensityGlobalWritebackMinMathOps = 0;
   int64_t profitabilityLowDensityOutputHeavyMinComputeOps = 0;
   int64_t profitabilityLowDensityZeroLoadMinArithmeticOps = 0;
+  int64_t profitabilityLowDensityLoopResidentMinSavedCost = 0;
 
   bool hasCompleteProfitabilityConfiguration() const {
     return profitabilityMinAdjustedSavedCostPerTensorOp > 0 &&
@@ -616,6 +621,9 @@ struct RlcBackendPolicy {
     overridePositive(
         "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops",
         policy.profitabilityLowDensityZeroLoadMinArithmeticOps);
+    overridePositive(
+        "ttg.rlc-profitability-low-density-loop-resident-min-saved-cost",
+        policy.profitabilityLowDensityLoopResidentMinSavedCost);
     return policy;
   }
 };
@@ -720,12 +728,25 @@ static StringRef applyRlcProfitabilityPolicy(
       features.atomicOps == 0 &&
       !features.proposalTouchesReductionOrScan &&
       features.dotOps == 0 && features.externalUseEdges == 0;
+  // Loop-carried proposals can amortize a large conversion payload even when
+  // only one conversion is removed from a broad proposal. Keep this escape
+  // backend-thresholded and topology-only: it is disabled at zero and never
+  // consults kernel names or tensor shapes.
+  features.lowDensityLoopResidentHighSavingsEligible =
+      policy.profitabilityLowDensityLoopResidentMinSavedCost > 0 &&
+      features.loopResident &&
+      features.estimatedSavedCost >=
+          policy.profitabilityLowDensityLoopResidentMinSavedCost &&
+      features.globalStoreOps > 0 && features.localLoadOps == 0 &&
+      features.localStoreOps == 0 && features.atomicOps == 0 &&
+      !features.proposalTouchesReductionOrScan && features.dotOps == 0;
   if (policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues > 0 &&
       features.removedConvertDensityPer1024ProposalValues <
           policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues &&
       !features.lowDensityGlobalWritebackMathEligible &&
       !features.lowDensityOutputHeavyComputeEligible &&
-      !features.lowDensityZeroLoadArithmeticEligible)
+      !features.lowDensityZeroLoadArithmeticEligible &&
+      !features.lowDensityLoopResidentHighSavingsEligible)
     return "profitability-removed-convert-density-below-threshold";
   // A locally profitable proposal can still be compile-time churn when the
   // proposal itself reaches a reduction or scan pipeline that later

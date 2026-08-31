@@ -32,6 +32,7 @@ _RLC_ENV_KEYS = (
     "FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS",
     "FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS",
     "FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS",
+    "FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST",
     "FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE",
     "FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE",
     "FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE",
@@ -67,6 +68,7 @@ def _set_rlc(
     os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "0"
     os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "0"
     os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "0"
+    os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST"] = "0"
     os.environ["FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE"] = (
         "1" if allow_atomic_writeback_order_change else "0"
     )
@@ -259,8 +261,9 @@ def test_signature_tracks_profitability_contract_only_when_enabled():
         os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
         os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
         os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST"] = "4194304"
         baseline = _rlc_policy_signature()
-        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "101"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST"] = "4194305"
         assert baseline != _rlc_policy_signature()
 
         os.environ["FLAGTREE_HCU_RLC_PROFITABILITY_POLICY"] = "0"
@@ -289,6 +292,10 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
         def get_int32_attr(value):
             return value
 
+        @staticmethod
+        def get_int64_attr(value):
+            return value
+
     class FakeModule:
         context = object()
 
@@ -310,6 +317,7 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
         os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
         os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
         os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
+        os.environ["FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST"] = "4194304"
         complete = FakeModule()
         _apply_hcu_rlc_policy(complete)
         assert complete.attrs == {
@@ -322,6 +330,7 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
             "ttg.rlc-profitability-low-density-global-writeback-min-math-ops": 8,
             "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops": 128,
             "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops": 100,
+            "ttg.rlc-profitability-low-density-loop-resident-min-saved-cost": 4194304,
         }
 
         os.environ["FLAGTREE_HCU_RLC_PRODUCT_LAUNCH_COUNT"] = "0"

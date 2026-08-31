@@ -295,6 +295,7 @@ def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.hcu.rlc_profitability_low_density_global_writeback_min_math_ops == 8
     assert fresh_knobs.hcu.rlc_profitability_low_density_output_heavy_min_compute_ops == 128
     assert fresh_knobs.hcu.rlc_profitability_low_density_zero_load_min_arithmetic_ops == 100
+    assert fresh_knobs.hcu.rlc_profitability_low_density_loop_resident_min_saved_cost == 4194304
     assert not fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
     assert not fresh_knobs.hcu.gfx936_f16_pair_materialize
     assert not fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize
@@ -311,6 +312,7 @@ def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
     monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS", "8")
     monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", "128")
     monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", "100")
+    monkeypatch.setenv("FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST", "4194305")
     monkeypatch.setenv("FLAGTREE_HCU_RLC_ALLOW_ATOMIC_WRITEBACK_ORDER_CHANGE", "true")
     monkeypatch.setenv("FLAGTREE_HCU_GFX936_F16_PAIR_MATERIALIZE", "true")
     monkeypatch.setenv("FLAGTREE_HCU_GFX936_F32_BOX_MULLER_PAIR_MATERIALIZE", "true")
@@ -326,6 +328,7 @@ def test_hcu_rlc_knobs(fresh_knobs, monkeypatch):
     assert fresh_knobs.hcu.rlc_profitability_low_density_global_writeback_min_math_ops == 8
     assert fresh_knobs.hcu.rlc_profitability_low_density_output_heavy_min_compute_ops == 128
     assert fresh_knobs.hcu.rlc_profitability_low_density_zero_load_min_arithmetic_ops == 100
+    assert fresh_knobs.hcu.rlc_profitability_low_density_loop_resident_min_saved_cost == 4194305
     assert fresh_knobs.hcu.rlc_allow_atomic_writeback_order_change
     assert fresh_knobs.hcu.gfx936_f16_pair_materialize
     assert fresh_knobs.hcu.gfx936_f32_box_muller_pair_materialize

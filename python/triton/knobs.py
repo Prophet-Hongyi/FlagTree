@@ -662,6 +662,11 @@ class hcu_knobs(base_knobs):
         "FLAGTREE_HCU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS", 128)
     rlc_profitability_low_density_zero_load_min_arithmetic_ops: env_int = env_int(
         "FLAGTREE_HCU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS", 100)
+    # Calibrated on the BW1000 batch_norm training cell. The value is a common
+    # online byte-cost floor, not a kernel/shape allowlist, and is inert while
+    # either RLC enhancement or the profitability policy remains disabled.
+    rlc_profitability_low_density_loop_resident_min_saved_cost: env_int = env_int(
+        "FLAGTREE_HCU_RLC_LOW_DENSITY_LOOP_RESIDENT_MIN_SAVED_COST", 4194304)
     # HCU MFMA can distribute atomic elements along a different fastest logical
     # dimension than the blocked address layout. This opt-in allows Phase 3 to
     # rematerialize only atomic ptr/mask chains in the MFMA layout; ordinary

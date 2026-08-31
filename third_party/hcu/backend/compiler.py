@@ -27,14 +27,14 @@ def is_in_thread_transpose_enabled(arch):
     return (arch == "gfx942") if knobs.hcu.use_in_thread_transpose is None else knobs.hcu.use_in_thread_transpose
 
 
-def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int, int, int]:
+def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int, int, int, int]:
     """Return the live HCU selector identity only at owned decision points."""
     hcu_knob = knobs.hcu
     owns_decision_point = int(hcu_knob.rlc_phase_mask) & 0b1100
     enabled = bool(hcu_knob.rlc_enhance and owns_decision_point and
                    getattr(hcu_knob, "rlc_profitability_policy", False))
     if not enabled:
-        return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     return (
         1,
         int(getattr(hcu_knob, "rlc_product_launch_count", 0) or 0),
@@ -45,6 +45,7 @@ def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int
         int(getattr(hcu_knob, "rlc_profitability_low_density_global_writeback_min_math_ops", 0) or 0),
         int(getattr(hcu_knob, "rlc_profitability_low_density_output_heavy_min_compute_ops", 0) or 0),
         int(getattr(hcu_knob, "rlc_profitability_low_density_zero_load_min_arithmetic_ops", 0) or 0),
+        int(getattr(hcu_knob, "rlc_profitability_low_density_loop_resident_min_saved_cost", 0) or 0),
     )
 
 
@@ -75,7 +76,8 @@ def _apply_hcu_rlc_policy(mod) -> None:
      min_removed_convert_density,
      low_density_global_writeback_min_math_ops,
      low_density_output_heavy_min_compute_ops,
-     low_density_zero_load_min_arithmetic_ops) = _effective_profitability_policy()
+     low_density_zero_load_min_arithmetic_ops,
+     low_density_loop_resident_min_saved_cost) = _effective_profitability_policy()
     if not enabled:
         return
     mod.set_attr("ttg.rlc-profitability-policy-enabled", builder.get_int32_attr(1))
@@ -101,6 +103,9 @@ def _apply_hcu_rlc_policy(mod) -> None:
     if low_density_zero_load_min_arithmetic_ops > 0:
         mod.set_attr("ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops",
                      builder.get_int32_attr(low_density_zero_load_min_arithmetic_ops))
+    if low_density_loop_resident_min_saved_cost > 0:
+        mod.set_attr("ttg.rlc-profitability-low-density-loop-resident-min-saved-cost",
+                     builder.get_int64_attr(low_density_loop_resident_min_saved_cost))
 
 
 @dataclass(frozen=True)
