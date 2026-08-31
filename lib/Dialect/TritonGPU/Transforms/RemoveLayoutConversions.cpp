@@ -151,6 +151,7 @@ struct RlcProfitabilityFeatures {
   int64_t arithmeticOps = 0;
   int64_t mathOps = 0;
   int64_t computeOps = 0;
+  bool proposalTouchesReductionOrScan = false;
   bool lowDensityGlobalWritebackMathEligible = false;
   bool lowDensityOutputHeavyComputeEligible = false;
   bool lowDensityZeroLoadArithmeticEligible = false;
@@ -217,6 +218,8 @@ static void traceRlcDecision(StringRef phase, StringRef outcome,
        << " online_local_store_ops=" << features->localStoreOps
        << " online_atomic_ops=" << features->atomicOps
        << " online_reduce_scan_ops=" << features->reduceScanOps
+       << " online_proposal_touches_reduction_or_scan="
+       << static_cast<int>(features->proposalTouchesReductionOrScan)
        << " online_dot_ops=" << features->dotOps
        << " online_compare_ops=" << features->compareOps
        << " online_arithmetic_ops=" << features->arithmeticOps
@@ -686,7 +689,8 @@ static StringRef applyRlcProfitabilityPolicy(
       features.globalLoadOps == 0 && features.globalStoreOps > 0 &&
       features.removedConverts >= features.globalStoreOps &&
       features.localLoadOps == 0 && features.localStoreOps == 0 &&
-      features.atomicOps == 0 && features.reduceScanOps == 0 &&
+      features.atomicOps == 0 &&
+      !features.proposalTouchesReductionOrScan &&
       features.dotOps == 0 && features.externalUseEdges == 0;
   features.lowDensityOutputHeavyComputeEligible =
       policy.profitabilityLowDensityOutputHeavyMinComputeOps > 0 &&
@@ -696,7 +700,8 @@ static StringRef applyRlcProfitabilityPolicy(
       features.removedConverts >= features.globalStoreOps &&
       features.removedConverts >= features.externalUseEdges &&
       features.localLoadOps == 0 && features.localStoreOps == 0 &&
-      features.atomicOps == 0 && features.reduceScanOps == 0 &&
+      features.atomicOps == 0 &&
+      !features.proposalTouchesReductionOrScan &&
       features.dotOps == 0;
   // Zero-input arithmetic writeback networks are a distinct low-density
   // regime: their tensor payload is synthesized from scalar launch state, so
@@ -712,7 +717,8 @@ static StringRef applyRlcProfitabilityPolicy(
       features.globalStoreOps > 0 &&
       features.removedConverts >= features.globalStoreOps &&
       features.localLoadOps == 0 && features.localStoreOps == 0 &&
-      features.atomicOps == 0 && features.reduceScanOps == 0 &&
+      features.atomicOps == 0 &&
+      !features.proposalTouchesReductionOrScan &&
       features.dotOps == 0 && features.externalUseEdges == 0;
   if (policy.profitabilityMinRemovedConvertDensityPer1024ProposalValues > 0 &&
       features.removedConvertDensityPer1024ProposalValues <
@@ -722,12 +728,13 @@ static StringRef applyRlcProfitabilityPolicy(
       !features.lowDensityZeroLoadArithmeticEligible)
     return "profitability-removed-convert-density-below-threshold";
   // A locally profitable proposal can still be compile-time churn when the
-  // surrounding reduction or scan pipeline later canonicalizes it away.  The
-  // online selector cannot prove that such a rewrite survives to emitted IR,
-  // so keep these contexts fail-closed until a backend qualifies them with a
-  // stronger survival feature.
-  if (features.reduceScanOps > 0)
-    return "profitability-reduction-or-scan-context";
+  // proposal itself reaches a reduction or scan pipeline that later
+  // canonicalizes it away. Keep that topology fail-closed. A reduction
+  // elsewhere in the function remains visible through reduceScanOps for
+  // diagnostics and offline calibration, but must not veto an independent,
+  // closed local tail.
+  if (features.proposalTouchesReductionOrScan)
+    return "profitability-proposal-reduction-or-scan";
   return {};
 }
 
@@ -3011,6 +3018,8 @@ bool LayoutPropagation::solveSmallComponents() {
         features.estimatedSavedCost = std::max<int64_t>(
             0, beforeCost >= 0 && afterCost >= 0 ? beforeCost - afterCost : 0);
         features.loopResident = proposalHasLoopResidentValue(proposal);
+        features.proposalTouchesReductionOrScan =
+            proposalTouchesReductionOrScan(proposal);
         features.externalUseEdges = 0;
         auto isInternalUse = [&](OpOperand &use) {
           Operation *user = use.getOwner();
@@ -5106,7 +5115,7 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
         return false;
       Operation *def = v.getDefiningOp();
       if (!def || def->getNumRegions() != 0 || isLayoutAnchor(def) ||
-          isa<LoadOp, LocalLoadOp, ReduceOp, ConvertLayoutOp>(def))
+          isa<LoadOp, LocalLoadOp, ReduceOp, ScanOp, ConvertLayoutOp>(def))
         return false;
     }
     return true;
@@ -5135,6 +5144,10 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   profitabilityFeatures.loopResident =
       writebackOp->getParentOfType<scf::ForOp>() ||
       writebackOp->getParentOfType<scf::WhileOp>();
+  // Phase 3 only retags the address/mask rematerialization slices. The checks
+  // above reject reductions and scans in those slices, so an unrelated
+  // reduction elsewhere in the function is diagnostic-only here too.
+  profitabilityFeatures.proposalTouchesReductionOrScan = false;
   profitabilityFeatures.externalUseEdges = 0;
   DenseSet<Operation *> rematerializedOps;
   for (Value value : ptrSlice)

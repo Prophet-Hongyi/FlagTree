@@ -6,14 +6,15 @@
 #reduce = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc-int-to-fp-vector-width-mask" = 20 : i32, "ttg.rlc-preserve-int-to-fp-contiguity" = 1 : i32, "ttg.rlc-product-launch-count" = 1 : i32, "ttg.rlc-profitability-max-external-use-edges" = 8 : i64, "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op" = 1 : i64, "ttg.rlc-profitability-phase3-saved-cost-multiplier" = 2 : i64, "ttg.rlc-profitability-policy-enabled" = 1 : i32, ttg.target = "musa:31", "ttg.threads-per-warp" = 32 : i32} {
-  // The writeback tail is locally profitable, but the unrelated reduction
-  // makes survival to emitted IR unproven. The online selector must preserve
-  // the conversion instead of recording a transient accepted proposal.
-  // CHECK-LABEL: tt.func @reduction_context_stays_fail_closed
+  // The writeback tail is closed and locally profitable. The reduction is in
+  // an independent use-def component, so it remains an offline calibration
+  // feature and must not veto this proposal.
+  // CHECK-LABEL: tt.func @unrelated_reduction_does_not_veto_closed_tail
+  // CHECK-NOT: ttg.convert_layout
   // CHECK: tt.reduce
-  // CHECK: ttg.convert_layout
-  // CHECK: tt.store
-  tt.func @reduction_context_stays_fail_closed(%input: !tt.ptr<i32>, %output: tensor<256x!tt.ptr<f32>, #dst>, %reduce_input: tensor<16x32xf32, #reduce>, %reduce_output: tensor<16x!tt.ptr<f32>, #ttg.slice<{dim = 1, parent = #reduce}>>, %stride: i32) {
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: tt.return
+  tt.func @unrelated_reduction_does_not_veto_closed_tail(%input: !tt.ptr<i32>, %output: tensor<256x!tt.ptr<f32>, #dst>, %reduce_input: tensor<16x32xf32, #reduce>, %reduce_output: tensor<16x!tt.ptr<f32>, #ttg.slice<{dim = 1, parent = #reduce}>>, %stride: i32) {
     %reduced = "tt.reduce"(%reduce_input) <{axis = 1 : i32}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %sum = arith.addf %lhs, %rhs : f32
@@ -33,5 +34,5 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc
   }
 }
 
-// TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=reject reason=profitability-reduction-or-scan-context
-// TRACE-SAME: online_reduce_scan_ops=1
+// TRACE: FLAGTREE_RLC_TRACE phase=2 outcome=accept reason=committed
+// TRACE-SAME: online_reduce_scan_ops=1 online_proposal_touches_reduction_or_scan=0
