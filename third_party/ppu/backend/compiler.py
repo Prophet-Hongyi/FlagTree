@@ -53,13 +53,117 @@ PPU_UNSUPPORTED_TLE_OPS = {
 }
 
 
+def _effective_profitability_policy() -> tuple[int, int, int, int, int, int, int, int, int]:
+    """Return the live PPU selector identity only at owned decision points."""
+    ppu_knob = knobs.ppu
+    owns_decision_point = int(ppu_knob.rlc_phase_mask) & 0b1100
+    enabled = bool(ppu_knob.rlc_enhance and owns_decision_point and
+                   getattr(ppu_knob, "rlc_profitability_policy", False))
+    if not enabled:
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+    return (
+        1,
+        int(getattr(ppu_knob, "rlc_product_launch_count", 0) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_min_adjusted_saved_cost_per_tensor_op",
+            0,
+        ) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_phase3_saved_cost_multiplier",
+            0,
+        ) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_max_external_use_edges",
+            0,
+        ) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_min_removed_convert_density_per_1024_proposal_values",
+            0,
+        ) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_low_density_global_writeback_min_math_ops",
+            0,
+        ) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_low_density_output_heavy_min_compute_ops",
+            0,
+        ) or 0),
+        int(getattr(
+            ppu_knob,
+            "rlc_profitability_low_density_zero_load_min_arithmetic_ops",
+            0,
+        ) or 0),
+    )
+
+
+def _apply_ppu_rlc_policy(mod) -> None:
+    """Attach a complete opt-in policy or leave the common pass fail-closed."""
+    if not knobs.ppu.rlc_enhance:
+        return
+    builder = ir.builder(mod.context)
+    (enabled, launch_count, min_score, phase3_multiplier, max_external_uses,
+     min_removed_convert_density,
+     low_density_global_writeback_min_math_ops,
+     low_density_output_heavy_min_compute_ops,
+     low_density_zero_load_min_arithmetic_ops) = _effective_profitability_policy()
+    if not enabled:
+        return
+    mod.set_attr("ttg.rlc-profitability-policy-enabled",
+                 builder.get_int32_attr(1))
+    if launch_count > 0:
+        mod.set_attr("ttg.rlc-product-launch-count",
+                     builder.get_int32_attr(launch_count))
+    if min_score > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op",
+            builder.get_int32_attr(min_score),
+        )
+    if phase3_multiplier > 0:
+        mod.set_attr("ttg.rlc-profitability-phase3-saved-cost-multiplier",
+                     builder.get_int32_attr(phase3_multiplier))
+    if max_external_uses >= 0:
+        mod.set_attr("ttg.rlc-profitability-max-external-use-edges",
+                     builder.get_int32_attr(max_external_uses))
+    if min_removed_convert_density > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values",
+            builder.get_int32_attr(min_removed_convert_density),
+        )
+    if low_density_global_writeback_min_math_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-global-writeback-min-math-ops",
+            builder.get_int32_attr(low_density_global_writeback_min_math_ops),
+        )
+    if low_density_output_heavy_min_compute_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops",
+            builder.get_int32_attr(low_density_output_heavy_min_compute_ops),
+        )
+    if low_density_zero_load_min_arithmetic_ops > 0:
+        mod.set_attr(
+            "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops",
+            builder.get_int32_attr(low_density_zero_load_min_arithmetic_ops),
+        )
+
+
 def _rlc_policy_signature() -> str:
     """Live RLC identity for disk and in-memory compile keys.
 
     Must be read on every compile. Do not cache this string across
     FLAGTREE_PPU_RLC_* environment changes in the same process.
     """
-    return f"{int(bool(knobs.ppu.rlc_enhance))}-{int(knobs.ppu.rlc_phase_mask)}"
+    fields = (
+        int(bool(knobs.ppu.rlc_enhance)),
+        int(knobs.ppu.rlc_phase_mask),
+        *_effective_profitability_policy(),
+    )
+    return "-".join(str(value) for value in fields)
 
 
 def reject_unsupported_tle(mod):
@@ -301,6 +405,7 @@ class PPUBackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
+        _apply_ppu_rlc_policy(mod)
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
@@ -374,6 +479,7 @@ class PPUBackend(BaseBackend):
 
     def gluon_to_ttgir(self, src, metadata, options, capability):
         mod = src
+        _apply_ppu_rlc_policy(mod)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 

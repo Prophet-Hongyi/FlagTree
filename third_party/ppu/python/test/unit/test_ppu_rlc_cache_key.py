@@ -19,7 +19,20 @@ from triton.runtime import jit
 compiler = pytest.importorskip("triton.backends.ppu.compiler")
 PPUBackend = compiler.PPUBackend
 _rlc_policy_signature = compiler._rlc_policy_signature
-_RLC_ENV_KEYS = ("FLAGTREE_PPU_RLC_ENHANCE", "FLAGTREE_PPU_RLC_PHASE_MASK")
+_apply_ppu_rlc_policy = compiler._apply_ppu_rlc_policy
+_RLC_ENV_KEYS = (
+    "FLAGTREE_PPU_RLC_ENHANCE",
+    "FLAGTREE_PPU_RLC_PHASE_MASK",
+    "FLAGTREE_PPU_RLC_PROFITABILITY_POLICY",
+    "FLAGTREE_PPU_RLC_PRODUCT_LAUNCH_COUNT",
+    "FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP",
+    "FLAGTREE_PPU_RLC_PHASE3_SAVED_COST_MULTIPLIER",
+    "FLAGTREE_PPU_RLC_MAX_EXTERNAL_USE_EDGES",
+    "FLAGTREE_PPU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES",
+    "FLAGTREE_PPU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS",
+    "FLAGTREE_PPU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS",
+    "FLAGTREE_PPU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS",
+)
 
 
 def _backend():
@@ -89,6 +102,91 @@ def test_options_include_live_rlc_policy():
         assert str(off) != str(on)
         assert off.hash() != on.hash()
         assert on.hash() != mask3.hash()
+    finally:
+        _restore(previous)
+
+
+def test_signature_tracks_profitability_contract_only_when_enabled():
+    previous = {key: os.environ.get(key) for key in _RLC_ENV_KEYS}
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_PPU_RLC_PROFITABILITY_POLICY"] = "1"
+        os.environ["FLAGTREE_PPU_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1900"
+        os.environ["FLAGTREE_PPU_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "3"
+        os.environ["FLAGTREE_PPU_RLC_MAX_EXTERNAL_USE_EDGES"] = "2"
+        os.environ["FLAGTREE_PPU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
+        baseline = _rlc_policy_signature()
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "101"
+        assert baseline != _rlc_policy_signature()
+
+        os.environ["FLAGTREE_PPU_RLC_PROFITABILITY_POLICY"] = "0"
+        disabled = _rlc_policy_signature()
+        os.environ["FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "9000"
+        assert disabled == _rlc_policy_signature()
+
+        os.environ["FLAGTREE_PPU_RLC_PROFITABILITY_POLICY"] = "1"
+        _set_rlc(True, 3)
+        no_owner = _rlc_policy_signature()
+        os.environ["FLAGTREE_PPU_RLC_PRODUCT_LAUNCH_COUNT"] = "7"
+        assert no_owner == _rlc_policy_signature()
+    finally:
+        _restore(previous)
+
+
+def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
+    previous = {key: os.environ.get(key) for key in _RLC_ENV_KEYS}
+
+    class FakeBuilder:
+        @staticmethod
+        def get_int32_attr(value):
+            return value
+
+    class FakeModule:
+        context = object()
+
+        def __init__(self):
+            self.attrs = {}
+
+        def set_attr(self, name, value):
+            self.attrs[name] = value
+
+    monkeypatch.setattr(compiler.ir, "builder", lambda context: FakeBuilder())
+    try:
+        _set_rlc(True, 13)
+        os.environ["FLAGTREE_PPU_RLC_PROFITABILITY_POLICY"] = "1"
+        os.environ["FLAGTREE_PPU_RLC_PRODUCT_LAUNCH_COUNT"] = "1"
+        os.environ["FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "1900"
+        os.environ["FLAGTREE_PPU_RLC_PHASE3_SAVED_COST_MULTIPLIER"] = "3"
+        os.environ["FLAGTREE_PPU_RLC_MAX_EXTERNAL_USE_EDGES"] = "2"
+        os.environ["FLAGTREE_PPU_RLC_MIN_REMOVED_CONVERT_DENSITY_PER_1024_PROPOSAL_VALUES"] = "128"
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_GLOBAL_WRITEBACK_MIN_MATH_OPS"] = "8"
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_OUTPUT_HEAVY_MIN_COMPUTE_OPS"] = "128"
+        os.environ["FLAGTREE_PPU_RLC_LOW_DENSITY_ZERO_LOAD_MIN_ARITHMETIC_OPS"] = "100"
+        complete = FakeModule()
+        _apply_ppu_rlc_policy(complete)
+        assert complete.attrs == {
+            "ttg.rlc-profitability-policy-enabled": 1,
+            "ttg.rlc-product-launch-count": 1,
+            "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op": 1900,
+            "ttg.rlc-profitability-phase3-saved-cost-multiplier": 3,
+            "ttg.rlc-profitability-max-external-use-edges": 2,
+            "ttg.rlc-profitability-min-removed-convert-density-per-1024-proposal-values": 128,
+            "ttg.rlc-profitability-low-density-global-writeback-min-math-ops": 8,
+            "ttg.rlc-profitability-low-density-output-heavy-min-compute-ops": 128,
+            "ttg.rlc-profitability-low-density-zero-load-min-arithmetic-ops": 100,
+        }
+
+        os.environ["FLAGTREE_PPU_RLC_PRODUCT_LAUNCH_COUNT"] = "0"
+        os.environ["FLAGTREE_PPU_RLC_MIN_ADJUSTED_SAVED_COST_PER_TENSOR_OP"] = "0"
+        incomplete = FakeModule()
+        _apply_ppu_rlc_policy(incomplete)
+        assert incomplete.attrs["ttg.rlc-profitability-policy-enabled"] == 1
+        assert "ttg.rlc-product-launch-count" not in incomplete.attrs
+        assert "ttg.rlc-profitability-min-adjusted-saved-cost-per-tensor-op" not in incomplete.attrs
     finally:
         _restore(previous)
 
