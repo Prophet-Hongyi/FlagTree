@@ -292,10 +292,6 @@ def test_profitability_module_attrs_are_explicit_and_fail_closed(monkeypatch):
         def get_int32_attr(value):
             return value
 
-        @staticmethod
-        def get_int64_attr(value):
-            return value
-
     class FakeModule:
         context = object()
 

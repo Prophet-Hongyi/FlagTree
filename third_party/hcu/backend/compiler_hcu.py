@@ -160,7 +160,7 @@ def _apply_hcu_rlc_policy(mod) -> None:
     if low_density_loop_resident_min_saved_cost > 0:
         mod.set_attr(
             "ttg.rlc-profitability-low-density-loop-resident-min-saved-cost",
-            builder.get_int64_attr(low_density_loop_resident_min_saved_cost),
+            builder.get_int32_attr(low_density_loop_resident_min_saved_cost),
         )
 
 
