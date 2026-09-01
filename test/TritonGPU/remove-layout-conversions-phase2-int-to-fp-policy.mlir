@@ -1,5 +1,8 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=5" | FileCheck %s --check-prefixes=UNGUARDED,VECTORIZED,UNSUPPORTED
 // RUN: env FLAGTREE_RLC_TRACE_REJECTS=1 triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=5" 2>&1 | FileCheck %s --check-prefix=TRACE
+// RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=8" | FileCheck %s --check-prefixes=UNGUARDED,VECTORIZED,UNSUPPORTED
+// RUN: env FLAGTREE_RLC_TRACE_REJECTS=1 triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=8" 2>&1 | FileCheck %s --check-prefix=TRACE3
+// RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="enable-rlc-enhance=true rlc-phase-mask=13" | FileCheck %s --check-prefixes=UNGUARDED,VECTORIZED,UNSUPPORTED
 
 #src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #dst = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -117,3 +120,5 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.rlc
 // TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=int-to-fp-vector-width
 // TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=accept reason=committed{{.*}}online_external_use_edges=0
 // TRACE-DAG: FLAGTREE_RLC_TRACE phase=2 outcome=preserve reason=int-to-fp-contiguity-boundary
+// TRACE3-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=preserve reason=int-to-fp-vector-width
+// TRACE3-DAG: FLAGTREE_RLC_TRACE phase=3 outcome=preserve reason=int-to-fp-contiguity-boundary

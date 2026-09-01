@@ -4856,11 +4856,73 @@ void LayoutRematerialization::backwardRematerialization(
     return;
   Value oldV = convertOp.getSrc();
   LDBG("check backward remat with source " << oldV << " encoding "
-                                           << targetType.getEncoding());
+                                            << targetType.getEncoding());
+#ifdef __FLAGTREE_RLC_ENHANCE__
+  // Backward rematerialization is a second route for retagging a producer
+  // chain. Keep the backend conversion-width contract consistent with the
+  // small-component solver: unsupported int/fp and fp/fp contiguity changes
+  // remain hard boundaries, while qualified widths are carried to lowering on
+  // the cloned conversion op.
+  RlcBackendPolicy backendPolicy = RlcBackendPolicy::fromOperation(convertOp);
+  DenseMap<Operation *, unsigned> preservedIntToFpVectorWidths;
+  DenseMap<Operation *, unsigned> preservedFpToFpVectorWidths;
+  auto collectPreservedConversionWidth = [&](Value value,
+                                             Attribute candidateEncoding) {
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      return true;
+    if (backendPolicy.preserveIntToFpContiguity &&
+        requiresIntToFpContiguityBoundary(value, candidateEncoding)) {
+      unsigned width =
+          getPreservedIntToFpVectorWidth(value, candidateEncoding);
+      if (width == 0) {
+        traceRlcDecision("3", "preserve", "int-to-fp-contiguity-boundary",
+                         defOp);
+        return false;
+      }
+      bool inserted =
+          preservedIntToFpVectorWidths.try_emplace(defOp, width).second;
+      if (inserted)
+        traceRlcDecision("3", "preserve", "int-to-fp-vector-width", defOp);
+    }
+    if (backendPolicy.preserveFpToFpContiguity &&
+        requiresFpToFpContiguityBoundary(value, candidateEncoding)) {
+      unsigned width =
+          getPreservedFpToFpVectorWidth(value, candidateEncoding);
+      if (width == 0) {
+        traceRlcDecision("3", "preserve", "fp-to-fp-contiguity-boundary",
+                         defOp);
+        return false;
+      }
+      bool inserted =
+          preservedFpToFpVectorWidths.try_emplace(defOp, width).second;
+      if (inserted)
+        traceRlcDecision("3", "preserve", "fp-to-fp-vector-width", defOp);
+    }
+    return true;
+  };
+  if (!collectPreservedConversionWidth(oldV, targetType.getEncoding()))
+    return;
+  auto annotatePreservedConversionWidth = [&]() {
+    for (auto [defOp, width] : preservedIntToFpVectorWidths)
+      defOp->setAttr(
+          "ttg.rlc-preserve-int-to-fp-vector-width",
+          IntegerAttr::get(IntegerType::get(defOp->getContext(), 32),
+                           width));
+    for (auto [defOp, width] : preservedFpToFpVectorWidths)
+      defOp->setAttr(
+          "ttg.rlc-preserve-fp-to-fp-vector-width",
+          IntegerAttr::get(IntegerType::get(defOp->getContext(), 32),
+                           width));
+  };
+#endif // __FLAGTREE_RLC_ENHANCE__
   // Check to see if there are existing remat'ed values for the pair of oldValue
   // and encoding. Make sure it dominates the current conversion.
   Value newV = getRematValue(oldV, targetType.getEncoding());
   if (newV && domInfo.properlyDominates(newV, convertOp)) {
+#ifdef __FLAGTREE_RLC_ENHANCE__
+    annotatePreservedConversionWidth();
+#endif // __FLAGTREE_RLC_ENHANCE__
     // Replace it with the remat'ed value.
     convertOp.replaceAllUsesWith(newV);
     opToDelete.insert(convertOp);
@@ -4893,6 +4955,17 @@ void LayoutRematerialization::backwardRematerialization(
     LDBG("  getRematerializableSlice failed");
     return;
   }
+#ifdef __FLAGTREE_RLC_ENHANCE__
+  // The convert source is not necessarily the sensitive conversion itself.
+  // Inspect every value retagged by the rematerialized slice so Phase 3 cannot
+  // bypass a conversion boundary through compare/mask/arithmetic tails.
+  for (Value value : slice) {
+    auto layoutIt = layout.find(value);
+    if (layoutIt != layout.end() &&
+        !collectPreservedConversionWidth(value, layoutIt->second))
+      return;
+  }
+#endif // __FLAGTREE_RLC_ENHANCE__
 
   // 2. Determine whether rematerialisation is beneficial.
 
@@ -4945,7 +5018,9 @@ void LayoutRematerialization::backwardRematerialization(
   // defaults retain the original NVIDIA assumptions (32 elements, 32-bit
   // shared-memory bank width, and 32 milli-SM-cycles per byte); other backends
   // can override them through the module-level RLC policy attributes.
+#ifndef __FLAGTREE_RLC_ENHANCE__
   RlcBackendPolicy backendPolicy = RlcBackendPolicy::fromOperation(convertOp);
+#endif // __FLAGTREE_RLC_ENHANCE__
   int64_t convertLayoutBytes =
       getByteCount(convertOp.getSrc(), backendPolicy.convertMinimumElements,
                    backendPolicy.convertMinimumElementBits);
@@ -5014,6 +5089,9 @@ void LayoutRematerialization::backwardRematerialization(
   });
 
   // 3. Rewrite the slice.
+#ifdef __FLAGTREE_RLC_ENHANCE__
+  annotatePreservedConversionWidth();
+#endif // __FLAGTREE_RLC_ENHANCE__
   rewriteSlice(slice, layout, convertOp);
 }
 
