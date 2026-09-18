@@ -110,17 +110,23 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                             createTritonGPUOptimizeDotOperands, bool);
   m.def(
       "add_remove_layout_conversions",
-      [](mlir::PassManager &pm, bool enhance) {
+      [](mlir::PassManager &pm, bool enhance, unsigned phaseMask) {
 #ifdef __FLAGTREE_RLC_ENHANCE__
         TritonGPURemoveLayoutConversionsOptions options;
         options.enableRlcEnhance = enhance;
+        options.enableCostBasedResolution = (phaseMask & 1u) != 0;
+        options.enableBackwardPropagation = (phaseMask & 2u) != 0;
+        options.enableSmallComponentSolving = (phaseMask & 4u) != 0;
+        options.enableStoreLayoutRematerialization = (phaseMask & 8u) != 0;
         pm.addPass(createTritonGPURemoveLayoutConversions(options));
 #else
         (void)enhance;
+        (void)phaseMask;
         pm.addPass(createTritonGPURemoveLayoutConversions());
 #endif
       },
-      py::arg("pm"), py::arg("enable_rlc_enhance") = false);
+      py::arg("pm"), py::arg("enable_rlc_enhance") = false,
+      py::arg("phase_mask") = 15u);
   ADD_PASS_WRAPPER_0("add_reduce_data_duplication",
                      createTritonGPUReduceDataDuplication);
   ADD_PASS_WRAPPER_0("add_allocate_warp_groups",

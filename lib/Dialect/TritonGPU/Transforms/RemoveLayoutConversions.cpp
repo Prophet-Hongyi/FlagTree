@@ -44,16 +44,16 @@
 #include "triton/Analysis/AxisInfo.h"
 #endif // __FLAGTREE_RLC_ENHANCE__
 #include "triton/Analysis/Utility.h"
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/TransformAttrs.h"
+#endif
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#endif // __TLE__
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 #include "tle/dialect/include/Transforms/EncodingRematerialization.h"
-#endif // __TLE__
+#endif
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -74,7 +74,66 @@ namespace mlir::triton::gpu {
 
 namespace {
 
-#ifdef __TLE__
+// Large rematerialization slices can lead to steep compile-time blowups.
+// Bail out once the backward slice exceeds this cap and keep the conversion.
+// This limit was already enforced by the MThreads fork before it started
+// sharing the phased implementation.
+constexpr unsigned kMaxRematSliceSize = 256;
+
+// Backend-calibrated constants used by the RLC profitability and writeback
+// guards.  Defaults preserve the NVIDIA implementation exactly.  A backend
+// may override individual values on the TTGPU module while it is being
+// qualified, without forking this pass:
+//
+//   ttg.rlc-minimum-writeback-bits
+//   ttg.rlc-convert-minimum-elements
+//   ttg.rlc-convert-minimum-element-bits
+//   ttg.rlc-convert-cost-per-byte
+//   ttg.rlc-cached-load-cost-per-byte
+//   ttg.rlc-expensive-math-cost-per-byte
+//   ttg.rlc-inter-warp-reduce-cost
+//
+// Values must be positive integers; absent or invalid values keep the
+// conservative defaults below.
+struct RlcBackendPolicy {
+  int64_t minimumWritebackBits = 32;
+  int64_t convertMinimumElements = 32;
+  int64_t convertMinimumElementBits = 32;
+  int64_t convertCostPerByte = 32;
+  int64_t cachedLoadCostPerByte = 8;
+  int64_t expensiveMathCostPerByte = 8;
+  int64_t interWarpReduceCost = 8;
+
+  static RlcBackendPolicy fromOperation(Operation *op) {
+    RlcBackendPolicy policy;
+    ModuleOp module = op ? op->getParentOfType<ModuleOp>() : ModuleOp();
+    if (!module)
+      return policy;
+
+    auto overridePositive = [&](StringRef name, int64_t &value) {
+      if (auto attr = module->getAttrOfType<IntegerAttr>(name))
+        if (attr.getInt() > 0)
+          value = attr.getInt();
+    };
+    overridePositive("ttg.rlc-minimum-writeback-bits",
+                     policy.minimumWritebackBits);
+    overridePositive("ttg.rlc-convert-minimum-elements",
+                     policy.convertMinimumElements);
+    overridePositive("ttg.rlc-convert-minimum-element-bits",
+                     policy.convertMinimumElementBits);
+    overridePositive("ttg.rlc-convert-cost-per-byte",
+                     policy.convertCostPerByte);
+    overridePositive("ttg.rlc-cached-load-cost-per-byte",
+                     policy.cachedLoadCostPerByte);
+    overridePositive("ttg.rlc-expensive-math-cost-per-byte",
+                     policy.expensiveMathCostPerByte);
+    overridePositive("ttg.rlc-inter-warp-reduce-cost",
+                     policy.interWarpReduceCost);
+    return policy;
+  }
+};
+
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 static bool touchesTleRemotePointerPath(Value value, DenseSet<Value> &visited) {
   if (!visited.insert(value).second)
     return false;
@@ -128,7 +187,7 @@ static bool valueOnTleRemotePointerPath(Value value) {
   return false;
 }
 #endif // __FLAGTREE_RLC_ENHANCE__
-#endif // __TLE__
+#endif
 
 #ifdef __FLAGTREE_RLC_ENHANCE__
 static Attribute getTensorEncoding(Value value) {
@@ -427,17 +486,14 @@ public:
   getConvertBackwardSlice(OpOperand &root, Attribute rootEncoding,
                           SetVector<Value> &slice,
                           DenseMap<Value, Attribute> &layout,
-                          std::function<bool(Operation *)> stopPropagation);
+                          std::function<bool(Operation *)> stopPropagation,
+                          unsigned maxSliceSize = 0);
 
   LogicalResult getRematerializableSlice(
       OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
       DenseMap<Value, Attribute> &layout,
-#ifdef __FLAGTREE_RLC_ENHANCE__
       std::function<bool(Operation *)> stopPropagation = nullptr,
-      bool allowDuplicableLoads = false);
-#else  // __FLAGTREE_RLC_ENHANCE__
-      std::function<bool(Operation *)> stopPropagation = nullptr);
-#endif // __FLAGTREE_RLC_ENHANCE__
+      unsigned maxSliceSize = 0, bool allowDuplicableLoads = false);
 
 private:
   void updateRematMapping(SmallVector<std::tuple<Value, Value>> &values);
@@ -497,6 +553,19 @@ void LayoutRematerialization::cleanup() {
 // Forward declaration (defined further below in the rematerialization section).
 static int64_t getByteCount(Value result, int64_t minElementCount,
                             int64_t minBitWidth);
+
+static int64_t getConvertLayoutCost(Value value) {
+  Operation *scope = value.getDefiningOp();
+  if (!scope)
+    if (auto blockArg = dyn_cast<BlockArgument>(value))
+      scope = blockArg.getOwner()->getParentOp();
+
+  RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(scope);
+  int64_t cost = policy.convertCostPerByte *
+                 getByteCount(value, policy.convertMinimumElements,
+                              policy.convertMinimumElementBits);
+  return cost == 0 ? 1 : cost;
+}
 #endif // __FLAGTREE_RLC_ENHANCE__
 
 // Return true if the op is an op with a layout we don't want to change. We will
@@ -512,8 +581,8 @@ bool isLayoutAnchor(Operation *op) {
     return true;
   if (isa<LoadOp, StoreOp>(op))
     return isExpensiveLoadOrStore(op);
-  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
-          AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op))
+  if (isa<mlir::triton::DotOpInterface, AtomicRMWOp, AtomicCASOp,
+          triton::nvidia_gpu::TMEMLoadOp>(op))
     return true;
   if (auto gatherOp = dyn_cast<GatherOp>(op))
     return gatherOp.getEfficientLayout();
@@ -706,9 +775,9 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
       setEncoding({afterArg, result}, info, changed, user);
       continue;
     }
-    if (auto dotWaitOp = dyn_cast<nvidia_gpu::WarpGroupDotWaitOp>(user)) {
+    if (user->hasTrait<OpTrait::PassthroughWaitLike>()) {
       unsigned opIndex = use.getOperandNumber();
-      Value result = dotWaitOp->getResult(opIndex);
+      Value result = user->getResult(opIndex);
       setEncoding(result, info, changed, user);
       continue;
     }
@@ -790,7 +859,8 @@ static bool isEncodingUniformPureOp(Operation *op);
 static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
                                            RankedTensorType valueType,
                                            Attribute targetEncoding,
-                                           bool allowNarrowerContiguity);
+                                           bool allowNarrowerContiguity,
+                                           const RlcBackendPolicy &policy);
 static unsigned getContigAlongMemoryOrder(RankedTensorType type);
 static bool isOrderIndifferentAccess(ModuleAxisInfoAnalysis *axisInfo,
                                      Value ptr);
@@ -973,8 +1043,10 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
       auto resultType = dyn_cast<RankedTensorType>(loadOp.getType());
       bool inLoop = defOp->getParentOfType<scf::ForOp>() != nullptr ||
                     defOp->getParentOfType<scf::WhileOp>() != nullptr;
-      if (!preservesWritebackMemoryAccess(ptrType, resultType, encoding,
-                                          /*allowNarrowerContiguity=*/false) &&
+      if (!preservesWritebackMemoryAccess(
+              ptrType, resultType, encoding,
+              /*allowNarrowerContiguity=*/false,
+              RlcBackendPolicy::fromOperation(loadOp)) &&
           (inLoop ||
            !isOrderIndifferentAccess(axisInfoAnalysis, loadOp.getPtr())))
         return false;
@@ -1318,8 +1390,8 @@ static bool isCoalescedLoadCopyValue(Value value, int depth) {
 static bool functionHasComputeAnchors(FuncOp funcOp) {
   bool hasCompute = false;
   funcOp.walk([&](Operation *op) {
-    if (isa<ReduceOp, ScanOp, AtomicRMWOp, AtomicCASOp, DotOp, DotScaledOp,
-            nvidia_gpu::WarpGroupDotOp>(op))
+    if (isa<ReduceOp, ScanOp, AtomicRMWOp, AtomicCASOp,
+            mlir::triton::DotOpInterface>(op))
       hasCompute = true;
   });
   return hasCompute;
@@ -1656,9 +1728,8 @@ bool LayoutPropagation::commitProposal(const Proposal &proposal) {
 }
 
 static bool isBackwardPropagationBoundaryOp(Operation *op) {
-  return isLayoutAnchor(op) ||
-         isa<LoadOp, LocalLoadOp, DotOp, DotScaledOp, AtomicRMWOp, AtomicCASOp,
-             nvidia_gpu::WarpGroupDotOp, nvidia_gpu::WarpGroupDotWaitOp,
+  return isLayoutAnchor(op) || op->hasTrait<OpTrait::PassthroughWaitLike>() ||
+         isa<LoadOp, LocalLoadOp, AtomicRMWOp, AtomicCASOp,
              nvidia_gpu::TMEMLoadOp, DescriptorLoadOp, DescriptorGatherOp,
              ReduceOp, scf::ForOp, scf::WhileOp, scf::IfOp, ReshapeOp, TransOp,
              JoinOp, SplitOp, GatherOp>(op);
@@ -1866,13 +1937,13 @@ static bool isBackwardPropagationSeedCandidate(ConvertLayoutOp cvtOp) {
   Value src = cvtOp.getSrc();
   if (isFrozenLayoutValue(src))
     return false;
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
   // Do not seed backward propagation on a TLE cluster remote-address chain (see
   // valueOnTleRemotePointerPath); retagging it corrupts the distributed access.
   if (valueOnTleRemotePointerPath(src) ||
       valueOnTleRemotePointerPath(cvtOp.getResult()))
     return false;
-#endif // __TLE__
+#endif
   if (!isBackwardPropagationSourceCandidate(src.getDefiningOp()))
     return false;
   if (!hasSingleUse(src) || !hasSingleUse(cvtOp.getResult()))
@@ -1959,8 +2030,8 @@ bool LayoutPropagation::propagateLayoutBackward() {
 }
 
 static bool isSmallComponentForbiddenOp(Operation *op) {
-  return isa<DotOp, DotScaledOp, AtomicRMWOp, AtomicCASOp,
-             nvidia_gpu::WarpGroupDotOp, nvidia_gpu::WarpGroupDotWaitOp,
+  return op->hasTrait<OpTrait::PassthroughWaitLike>() ||
+         isa<mlir::triton::DotOpInterface, AtomicRMWOp, AtomicCASOp,
              nvidia_gpu::TMEMLoadOp, DescriptorLoadOp, DescriptorGatherOp,
              DescriptorOpInterface, ReduceOp, ScanOp>(op);
 }
@@ -2025,7 +2096,8 @@ static unsigned getContigAlongMemoryOrder(RankedTensorType type) {
 static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
                                            RankedTensorType valueType,
                                            Attribute targetEncoding,
-                                           bool allowNarrowerContiguity) {
+                                           bool allowNarrowerContiguity,
+                                           const RlcBackendPolicy &policy) {
   if (!ptrType || !valueType || !targetEncoding ||
       !isa<DistributedEncodingTrait>(targetEncoding))
     return false;
@@ -2050,7 +2122,7 @@ static bool preservesWritebackMemoryAccess(RankedTensorType ptrType,
   Type elementType = valueType.getElementType();
   unsigned elementBits =
       elementType.isIntOrFloat() ? elementType.getIntOrFloatBitWidth() : 0;
-  return targetContig * elementBits >= 32;
+  return int64_t(targetContig) * elementBits >= policy.minimumWritebackBits;
 }
 
 // True if retagging the coalesced access at `ptr` to `targetEncoding` widens
@@ -2094,7 +2166,8 @@ static bool preservesStoreMemoryAccess(StoreOp storeOp,
   return preservesWritebackMemoryAccess(
       dyn_cast<RankedTensorType>(storeOp.getPtr().getType()),
       dyn_cast<RankedTensorType>(storeOp.getValue().getType()), targetEncoding,
-      /*allowNarrowerContiguity=*/false);
+      /*allowNarrowerContiguity=*/false,
+      RlcBackendPolicy::fromOperation(storeOp));
 }
 
 // Number of threads that own at least one element of `type`, i.e. the store's
@@ -2222,7 +2295,7 @@ bool LayoutPropagation::solveSmallComponents() {
                                 bool restrictWeakStoreProposals = false) {
     if (proposal.empty())
       return false;
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     // Skip any component on a TLE cluster remote-address chain; retagging it
     // corrupts the remote access (see valueOnTleRemotePointerPath). Nor retag
     // an explicit (tle.gpu.set_layout) value away from its encoding.
@@ -2230,7 +2303,7 @@ bool LayoutPropagation::solveSmallComponents() {
       if (valueOnTleRemotePointerPath(it.first) ||
           conflictsWithHardEncoding(it.first, it.second))
         return false;
-#endif // __TLE__
+#endif
     int removedConverts = countConvertsRemovedByProposal(proposal);
     if (removedConverts == 0)
       return false;
@@ -2349,7 +2422,8 @@ bool LayoutPropagation::solveSmallComponents() {
     if (!ptrType || !valType)
       return false;
     if (!preservesWritebackMemoryAccess(ptrType, valType, encoding,
-                                        /*allowNarrowerContiguity=*/false) ||
+                                        /*allowNarrowerContiguity=*/false,
+            RlcBackendPolicy::fromOperation(atomicOp)) ||
         widensPastVectorAccess(axisInfoAnalysis, atomicOp.getPtr(),
                                atomicOp.getMask(), valType.getElementType(),
                                encoding))
@@ -2659,7 +2733,7 @@ collectUseTargets(OpOperand &use, Attribute enc,
     targets.push_back({whileOp->getResult(argIndex), enc});
     return;
   }
-  if (isa<nvidia_gpu::WarpGroupDotWaitOp>(user)) {
+  if (user->hasTrait<OpTrait::PassthroughWaitLike>()) {
     Value result = user->getResult(use.getOperandNumber());
     if (getTensorEncoding(result))
       targets.push_back({result, enc});
@@ -2732,8 +2806,9 @@ LayoutPropagation::getDefiningOpConversionCost(Value value,
 
   if (!(defOp->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
         defOp->hasTrait<OpTrait::Elementwise>() ||
+        defOp->hasTrait<OpTrait::PassthroughWaitLike>() ||
         isa<LoadOp, ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
-            GatherOp, nvidia_gpu::WarpGroupDotWaitOp>(defOp)))
+            GatherOp>(defOp)))
     return 0;
 
   Attribute srcEncoding = inferSrcEncoding(defOp, encoding);
@@ -3716,12 +3791,13 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
 #endif // __FLAGTREE_RLC_ENHANCE__
   if (op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<OpTrait::Elementwise>() ||
+      op->hasTrait<OpTrait::PassthroughWaitLike>() ||
       isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp, GatherOp,
 #ifdef __FLAGTREE_RLC_ENHANCE__
-          ConvertLayoutOp, nvidia_gpu::WarpGroupDotWaitOp>(op) ||
+          ConvertLayoutOp>(op) ||
       (hasLayoutPropagationExtensions() && isEncodingUniformPureOp(op))) {
 #else  // __FLAGTREE_RLC_ENHANCE__
-          ConvertLayoutOp, nvidia_gpu::WarpGroupDotWaitOp>(op)) {
+          ConvertLayoutOp>(op)) {
 #endif // __FLAGTREE_RLC_ENHANCE__
     Operation *newOp = cloneElementwise(rewriter, op, encoding);
     for (auto [oldResult, newResult] :
@@ -3763,13 +3839,13 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
   auto loadOp = dyn_cast<LoadOp>(op);
   if (!loadOp || !encoding)
     return false;
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
   // A load from a TLE cluster remote pointer lowers to a vectorized
   // shared::cluster load; duplicating or retagging it corrupts that access, so
   // it is never duplicable (see valueOnTleRemotePointerPath).
   if (valueOnTleRemotePointerPath(loadOp.getPtr()))
     return false;
-#endif // __TLE__
+#endif
   auto ptrType = dyn_cast<RankedTensorType>(loadOp.getPtr().getType());
   auto resultType = dyn_cast<RankedTensorType>(loadOp.getType());
   if (!ptrType || !resultType)
@@ -3807,7 +3883,8 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
   }
 
   if (preservesWritebackMemoryAccess(ptrType, resultType, encoding,
-                                     /*allowNarrowerContiguity=*/false))
+                                     /*allowNarrowerContiguity=*/false,
+                                     RlcBackendPolicy::fromOperation(loadOp)))
     return true;
   // The order-indifference relaxation is limited to straight-line code: for a
   // loop-resident scatter load the retag reshapes every iteration's request
@@ -4054,7 +4131,7 @@ void LayoutRematerialization::rewriteSlice(SetVector<Value> &slice,
 LogicalResult LayoutRematerialization::getConvertBackwardSlice(
     OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
     DenseMap<Value, Attribute> &layout,
-    std::function<bool(Operation *)> stopPropagation) {
+    std::function<bool(Operation *)> stopPropagation, unsigned maxSliceSize) {
   // Allow re-using existing conversions for a value. Check dominance of any
   // reusable materializations against the root value. This is sufficient
   // because the conversions are processed in post-order.
@@ -4083,36 +4160,44 @@ LogicalResult LayoutRematerialization::getConvertBackwardSlice(
   };
 
   return mlir::getConvertBackwardSlice(root, slice, rootEncoding, layout,
-                                       stopPropagation, getExistingConversion);
+                                       stopPropagation, getExistingConversion,
+                                       maxSliceSize);
 }
 
 LogicalResult LayoutRematerialization::getRematerializableSlice(
-    OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
-    DenseMap<Value, Attribute> &layout,
-#ifdef __FLAGTREE_RLC_ENHANCE__
-    std::function<bool(Operation *)> stopPropagation,
+    OpOperand &root, Attribute rootEncoding, SetVector<Value> &sliceArg,
+    DenseMap<Value, Attribute> &layoutArg,
+    std::function<bool(Operation *)> stopPropagation, unsigned maxSliceSize,
     bool allowDuplicableLoads) {
-#else  // __FLAGTREE_RLC_ENHANCE__
-    std::function<bool(Operation *)> stopPropagation) {
-#endif // __FLAGTREE_RLC_ENHANCE__
-  LogicalResult result = getConvertBackwardSlice(root, rootEncoding, slice,
-                                                 layout, stopPropagation);
+  // A failed attempt must not leak a partial slice/layout into a later branch
+  // or hoist decision. This transaction-like behavior was already present in
+  // the MThreads fork and is required when both sides of a conditional share
+  // the same candidate state.
+  auto slice = sliceArg;
+  auto layout = layoutArg;
+  LogicalResult result = getConvertBackwardSlice(
+      root, rootEncoding, slice, layout, stopPropagation, maxSliceSize);
   if (result.failed() || slice.empty())
     return failure();
 
   // Check if all the operations in the slice can be rematerialized.
   for (Value v : slice) {
-    if (Operation *op = v.getDefiningOp()) {
+    Operation *op = v.getDefiningOp();
+    if (!op)
+      continue;
+    bool rematerializable = canBeRemat(op);
 #ifdef __FLAGTREE_RLC_ENHANCE__
-      if (canBeRemat(op))
-        continue;
-      if (allowDuplicableLoads &&
-          isDuplicableLoadInEncoding(op, layout.lookup(v), axisInfoAnalysis))
-        continue;
+    rematerializable |=
+        allowDuplicableLoads &&
+        isDuplicableLoadInEncoding(op, layout.lookup(v), axisInfoAnalysis);
+#else  // __FLAGTREE_RLC_ENHANCE__
+    (void)allowDuplicableLoads;
+#endif // __FLAGTREE_RLC_ENHANCE__
+    if (!rematerializable)
       return failure();
-    }
   }
 
+#ifdef __FLAGTREE_RLC_ENHANCE__
   // A duplicable-load remat must not cross a tt.dot that downgrades the
   // accumulator's register tiling: retagging the accumulator into the small
   // store layout cripples the tile. The intended use (a row broadcast onto an
@@ -4130,12 +4215,12 @@ LogicalResult LayoutRematerialization::getRematerializableSlice(
       ArrayRef<int64_t> shape = resultType.getShape();
       if (getTotalElemsPerThread(newEncoding, shape) <
           getTotalElemsPerThread(resultType.getEncoding(), shape))
-#else  // __FLAGTREE_RLC_ENHANCE__
-      if (!canBeRemat(op))
-#endif // __FLAGTREE_RLC_ENHANCE__
         return failure();
     }
   }
+#endif // __FLAGTREE_RLC_ENHANCE__
+  sliceArg = std::move(slice);
+  layoutArg = std::move(layout);
   return success();
 }
 
@@ -4261,9 +4346,10 @@ void LayoutRematerialization::backwardRematerialization(
   LogicalResult result = getRematerializableSlice(
 #ifdef __FLAGTREE_RLC_ENHANCE__
       convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout,
-      /*stopPropagation=*/nullptr, allowDuplicableLoads);
+      /*stopPropagation=*/nullptr, kMaxRematSliceSize, allowDuplicableLoads);
 #else  // __FLAGTREE_RLC_ENHANCE__
-      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout);
+      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout,
+      /*stopPropagation=*/nullptr, kMaxRematSliceSize);
 #endif // __FLAGTREE_RLC_ENHANCE__
   if (result.failed()) {
     LDBG("  getRematerializableSlice failed");
@@ -4317,18 +4403,16 @@ void LayoutRematerialization::backwardRematerialization(
     return singleUse;
   };
 
-  // Measure the number of bytes that we're manipulating with the
-  // ConvertLayoutOp. We pessimistically assume that we round-trip
-  // through shared memory and that we cannot vectorise sub-register
-  // loads/stores, so we set a minimum element count of 32 (the warp
-  // size and number of shared memory banks) and minimum bitwidth of
-  // 32 (the width per bank of the shared memory load/store unit).
-  int64_t convertLayoutBytes = getByteCount(convertOp.getSrc(), 32, 32);
-
-  // We measure costs in standardised milli-SM-cycles. The smem load
-  // and store each cost 8 * convertLayoutBytes, and then we double
-  // it to account for extra cost due to synchronisation.
-  int64_t convertLayoutCost = 32 * convertLayoutBytes;
+  // Measure the number of bytes that the ConvertLayoutOp manipulates. The
+  // defaults retain the original NVIDIA assumptions (32 elements, 32-bit
+  // shared-memory bank width, and 32 milli-SM-cycles per byte); other backends
+  // can override them through the module-level RLC policy attributes.
+  RlcBackendPolicy backendPolicy = RlcBackendPolicy::fromOperation(convertOp);
+  int64_t convertLayoutBytes =
+      getByteCount(convertOp.getSrc(), backendPolicy.convertMinimumElements,
+                   backendPolicy.convertMinimumElementBits);
+  int64_t convertLayoutCost =
+      backendPolicy.convertCostPerByte * convertLayoutBytes;
   int64_t rematerialisationCost = 0;
 
   // Evaluate single-use status for every operation in slice
@@ -4344,7 +4428,8 @@ void LayoutRematerialization::backwardRematerialization(
     } else if (isa<LoadOp>(op) || isa<LocalLoadOp>(op)) {
       // optimistically assume L1-cached:
       for (Value result : op->getResults()) {
-        rematerialisationCost += 8 * getByteCount(result);
+        rematerialisationCost +=
+            backendPolicy.cachedLoadCostPerByte * getByteCount(result);
       }
     } else if (isa<arith::ArithDialect, math::MathDialect>(dialect)) {
       // this is an arithmetic operation; we distinguish between cheap
@@ -4352,7 +4437,8 @@ void LayoutRematerialization::backwardRematerialization(
       // as halves of a single-cycle FMA instruction) and expensive
       // operations which use the special function unit and/or involve
       // multiple instructions.
-      int64_t multiplier = isExpensiveMathOp(op) ? 8 : 1;
+      int64_t multiplier =
+          isExpensiveMathOp(op) ? backendPolicy.expensiveMathCostPerByte : 1;
       for (Value result : op->getResults()) {
         rematerialisationCost += multiplier * getByteCount(result);
       }
@@ -4368,7 +4454,8 @@ void LayoutRematerialization::backwardRematerialization(
         return;
       }
       rematerialisationCost += helper.getIntraWarpSizeWithUniqueData();
-      rematerialisationCost += 8 * helper.getInterWarpSizeWithUniqueData();
+      rematerialisationCost += backendPolicy.interWarpReduceCost *
+                               helper.getInterWarpSizeWithUniqueData();
     }
   }
 
@@ -4490,7 +4577,8 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
       writebackOp->getParentOfType<scf::ForOp>() ||
       writebackOp->getParentOfType<scf::WhileOp>();
   if (!preservesWritebackMemoryAccess(ptrType, valueType, targetEncoding,
-                                      allowNarrowerContiguity))
+                                      allowNarrowerContiguity,
+            RlcBackendPolicy::fromOperation(writebackOp)))
     return false;
 
   // A contiguous (coalesced) store moves consecutive addresses across a warp
@@ -4602,13 +4690,13 @@ void LayoutRematerialization::hoistConvertDotOperand(
   auto targetType = convertOp.getType();
   // The pass is targeted to MMA dot operands
 
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
   {
     DenseSet<Value> visited;
     if (touchesTleRemotePointerPath(convertOp.getSrc(), visited))
       return;
   }
-#endif // __TLE__
+#endif
 
   auto canBePipelined = [&](ConvertLayoutOp convertOp) {
     // FIXME: Check that the parent is a for loop
@@ -4748,7 +4836,7 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   DenseMap<Value, Attribute> layout;
   LogicalResult result = getRematerializableSlice(
       convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout,
-      isExtOrBroadcastOp);
+      isExtOrBroadcastOp, kMaxRematSliceSize);
   if (result.failed())
     return;
 
@@ -4757,42 +4845,26 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   for (unsigned i = 0; i < sliceSize; i++) {
     Value v = slice[i];
     Operation *op = v.getDefiningOp();
-    if (!op)
+    if (!op || !isExtOrBroadcastOp(op))
       continue;
-    if (isExtOrBroadcastOp(op)) {
-      SetVector<Value> tempSlice;
-      DenseMap<Value, Attribute> tempLayout;
-      Attribute srcEncoding = inferSrcEncoding(op, layout[v]);
-      if (!srcEncoding)
-        return;
-      LogicalResult result = getRematerializableSlice(
-          op->getOpOperand(0), srcEncoding, tempSlice, tempLayout);
 
-      // If a value is already assigned to a _different_ layout,
-      // we cannot propagate past this op (as it would conflict with
-      // an already-assigned layout).
-      for (auto [val, enc] : tempLayout) {
-        auto preexistingLayout = layout.find(val);
-        if (preexistingLayout != layout.end() &&
-            preexistingLayout->second != enc) {
-          result = failure();
-          break;
-        }
-      }
+    Attribute srcEncoding = inferSrcEncoding(op, layout[v]);
+    if (!srcEncoding)
+      return;
 
-      // If we can rematerialize the rest of the ext slice we can ignore this
-      // ext as it won't need a convert.
-      if (result.succeeded()) {
-        slice.insert(tempSlice.begin(), tempSlice.end());
-        layout.insert(tempLayout.begin(), tempLayout.end());
-        continue;
-      }
-      // Only apply it if there is a single ext op otherwise we would have to
-      // duplicate the convert.
-      if (extOrBroadcastOp != nullptr)
-        return;
-      extOrBroadcastOp = op;
-    }
+    // If we can rematerialize the rest of the ext slice we can ignore this ext
+    // as it won't need a convert. getRematerializableSlice commits to the
+    // existing slice/layout only when the whole attempt succeeds.
+    if (succeeded(getRematerializableSlice(
+            op->getOpOperand(0), srcEncoding, slice, layout,
+            /*stopPropagation=*/nullptr, kMaxRematSliceSize)))
+      continue;
+
+    // Only apply it if there is a single ext op otherwise we would have to
+    // duplicate the convert.
+    if (extOrBroadcastOp != nullptr)
+      return;
+    extOrBroadcastOp = op;
   }
 
   if (extOrBroadcastOp == nullptr)
@@ -4831,7 +4903,7 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
   auto isIfOp = [](Operation *op) { return isa<scf::IfOp>(op); };
   if (failed(getRematerializableSlice(convertOp.getSrcMutable(),
                                       convertOp.getType().getEncoding(), slice,
-                                      layout, isIfOp)))
+                                      layout, isIfOp, kMaxRematSliceSize)))
     return;
 
   // These are the conditional edges above which conversions should be hoisted.
@@ -4863,21 +4935,19 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
     OpOperand &thenRes = thenYield.getResultsMutable()[resIdx];
     OpOperand &elseRes = elseYield.getResultsMutable()[resIdx];
 
-    SetVector<Value> thenSlice, elseSlice;
-    DenseMap<Value, Attribute> thenLayout, elseLayout;
+    auto newSlice = slice;
+    auto newLayout = layout;
 
     LogicalResult thenResult = getRematerializableSlice(
-        thenRes, rootLayout, thenSlice, thenLayout, isIfOp);
+        thenRes, rootLayout, newSlice, newLayout, isIfOp, kMaxRematSliceSize);
     LogicalResult elseResult = getRematerializableSlice(
-        elseRes, rootLayout, elseSlice, elseLayout, isIfOp);
+        elseRes, rootLayout, newSlice, newLayout, isIfOp, kMaxRematSliceSize);
 
     // If propagation across both edges of this conditional succeeded, then we
     // don't need to hoist across it. Merge into the current slice.
     if (succeeded(thenResult) && succeeded(elseResult)) {
-      slice.insert(thenSlice.begin(), thenSlice.end());
-      slice.insert(elseSlice.begin(), elseSlice.end());
-      layout.insert(thenLayout.begin(), thenLayout.end());
-      layout.insert(elseLayout.begin(), elseLayout.end());
+      slice = std::move(newSlice);
+      layout = std::move(newLayout);
       continue;
     }
 
@@ -4896,17 +4966,16 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
       continue;
     }
 
+    slice = std::move(newSlice);
+    layout = std::move(newLayout);
+
     // The layout conversion can be rematerialized along one edge but not the
     // other. We can hoist the conversion into the other branch. Push this
     // into the subslice list for analysis.
     if (succeeded(thenResult)) {
       hoistAbove.emplace_back(v, &elseRes);
-      slice.insert(thenSlice.begin(), thenSlice.end());
-      layout.insert(thenLayout.begin(), thenLayout.end());
     } else {
       hoistAbove.emplace_back(v, &thenRes);
-      slice.insert(elseSlice.begin(), elseSlice.end());
-      layout.insert(elseLayout.begin(), elseLayout.end());
     }
   }
 
@@ -4986,7 +5055,52 @@ bool rematerializeStoreLayout(ModuleOp module) {
 }
 #endif // __FLAGTREE_RLC_ENHANCE__
 
-#ifdef __TLE__
+#if defined(__TLE__) && defined(__FLAGTREE_MTHREADS_RLC__)
+// Preserve the MThreads TLE adapter's established contract: once LowerSqmma
+// has selected a native MUSASqmmaEncodingAttr accumulator, retarget the final
+// store operands to that encoding and remove the accumulator writeback
+// conversion. This remains gated by the existing TLE module attribute and is
+// independent of the opt-in phased RLC switch.
+bool retargetTleSqmmaStores(ModuleOp module) {
+  bool changed = false;
+  SmallVector<StoreOp> stores;
+  module.walk([&](StoreOp store) { stores.push_back(store); });
+  for (StoreOp store : stores) {
+    if (!store || !store->getBlock())
+      continue;
+    auto valueConvert = store.getValue().getDefiningOp<ConvertLayoutOp>();
+    if (!valueConvert)
+      continue;
+    auto targetTy = dyn_cast<RankedTensorType>(valueConvert.getSrc().getType());
+    if (!targetTy || !targetTy.getEncoding() ||
+        !isa<MUSASqmmaEncodingAttr>(targetTy.getEncoding()))
+      continue;
+
+    auto ptrTy = dyn_cast<RankedTensorType>(store.getPtr().getType());
+    if (!ptrTy || ptrTy.getShape() != targetTy.getShape())
+      continue;
+    OpBuilder builder(store);
+    auto nativePtrTy = ptrTy.cloneWithEncoding(targetTy.getEncoding());
+    Value nativePtr = ConvertLayoutOp::create(builder, store.getLoc(),
+                                              nativePtrTy, store.getPtr());
+    store.getPtrMutable().assign(nativePtr);
+    store.getValueMutable().assign(valueConvert.getSrc());
+    if (Value oldMask = store.getMask()) {
+      auto maskTy = cast<RankedTensorType>(oldMask.getType());
+      auto nativeMaskTy = maskTy.cloneWithEncoding(targetTy.getEncoding());
+      Value nativeMask = ConvertLayoutOp::create(builder, store.getLoc(),
+                                                 nativeMaskTy, oldMask);
+      store.getMaskMutable().assign(nativeMask);
+    }
+    if (valueConvert->use_empty())
+      valueConvert.erase();
+    changed = true;
+  }
+  return changed;
+}
+#endif
+
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 static void eraseOpsCreatedAfter(Operation *previous, Operation *insertBefore) {
   Operation *cur =
       previous ? previous->getNextNode() : &insertBefore->getBlock()->front();
@@ -5108,7 +5222,7 @@ bool rematerializeLocalStoreLayoutDemands(ModuleOp module) {
 
   return changed;
 }
-#endif // __TLE__
+#endif
 
 void hoistConvert(ModuleOp module) {
   SmallVector<ConvertLayoutOp> convertOps;
@@ -5250,14 +5364,19 @@ public:
         });
       }
 #endif // __FLAGTREE_RLC_ENHANCE__
-#ifdef __TLE__
+#if defined(__TLE__) && defined(__FLAGTREE_MTHREADS_RLC__)
+      if (m->hasAttr("tle.enable_encoding_rematerialization")) {
+        changed |= retargetTleSqmmaStores(m);
+        cleanupConvertOps();
+      }
+#elif defined(__TLE__)
       if (m->hasAttr(
               ::mlir::triton::tle::kTleEnableEncodingRematerializationAttr)) {
         changed |= rematerializeStoreLayoutDemands(m);
         changed |= rematerializeLocalStoreLayoutDemands(m);
         cleanupConvertOps();
       }
-#endif // __TLE__
+#endif
     } while (changed);
 #ifdef __FLAGTREE_RLC_ENHANCE__
     // 4. For remaining converts, try to hoist them above cast generating larger
@@ -5291,5 +5410,18 @@ public:
     });
   }
 };
+
+#ifdef __FLAGTREE_RLC_ENHANCE__
+std::unique_ptr<Pass>
+createTritonGPURemoveLayoutConversionsEnhanced(bool enhance, unsigned phaseMask) {
+  TritonGPURemoveLayoutConversionsOptions options;
+  options.enableRlcEnhance = enhance;
+  options.enableCostBasedResolution = (phaseMask & 1u) != 0;
+  options.enableBackwardPropagation = (phaseMask & 2u) != 0;
+  options.enableSmallComponentSolving = (phaseMask & 4u) != 0;
+  options.enableStoreLayoutRematerialization = (phaseMask & 8u) != 0;
+  return createTritonGPURemoveLayoutConversions(options);
+}
+#endif
 
 } // namespace mlir::triton::gpu
