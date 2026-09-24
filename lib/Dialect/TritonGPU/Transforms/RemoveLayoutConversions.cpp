@@ -954,6 +954,23 @@ LayoutPropagation::getOrCreateBackwardLayout(Value value) {
   return &entry;
 }
 
+// The conversion-only model does not price the changed lowering of a scalar
+// logarithm. Preserve its scalar lane grouping on MUSA when a writeback layout
+// would widen it to two lanes, in both backward and component proposals.
+static bool widensScalarLog(Value value, Attribute encoding) {
+#if defined(__FLAGTREE_MTHREADS_RLC__)
+  if (!value.getDefiningOp<math::LogOp>())
+    return false;
+  auto src = dyn_cast_or_null<BlockedEncodingAttr>(getTensorEncoding(value));
+  auto dst = dyn_cast_or_null<BlockedEncodingAttr>(encoding);
+  return src && dst && src.getSizePerThread().size() == 1 &&
+         dst.getSizePerThread().size() == 1 && src.getSizePerThread()[0] == 1 &&
+         dst.getSizePerThread()[0] == 2;
+#else
+  return false;
+#endif
+}
+
 bool LayoutPropagation::addBackwardEncoding(Value target, Attribute encoding) {
   if (!encoding || conflictsWithHardEncoding(target, encoding))
     return false;
@@ -981,6 +998,8 @@ bool LayoutPropagation::addSmallComponentEncoding(Value target,
 
 bool LayoutPropagation::addProposalValue(Proposal &proposal, Value target,
                                          Attribute encoding) const {
+  if (widensScalarLog(target, encoding))
+    return false;
   if (!encoding || !getTensorEncoding(target))
     return false;
   auto [it, inserted] = proposal.insert({target, encoding});
@@ -2026,6 +2045,22 @@ static bool producerConeReachesReduce(Value value, int depth) {
 // producer and whose result reaches a store/atomic through a short, single-use
 // local chain. This covers cheap cast/index tails without changing reductions,
 // scans, anchors, or control-flow-carried values.
+#if defined(__FLAGTREE_MTHREADS_RLC__)
+static bool producerConeWidensScalarLog(Value value, Attribute encoding,
+                                       unsigned depth = 6) {
+  if (widensScalarLog(value, encoding))
+    return true;
+  Operation *op = value.getDefiningOp();
+  if (!op || !depth ||
+      !(isRegionFreeElementwise(op) || isRegionFreeSameEncoding(op)))
+    return false;
+  for (Value operand : op->getOperands())
+    if (producerConeWidensScalarLog(operand, encoding, depth - 1))
+      return true;
+  return false;
+}
+#endif
+
 static bool isBackwardPropagationSeedCandidate(ConvertLayoutOp cvtOp) {
   if (isInsideStructuredControlFlow(cvtOp))
     return false;
@@ -2039,6 +2074,27 @@ static bool isBackwardPropagationSeedCandidate(ConvertLayoutOp cvtOp) {
     return false;
 
   Value src = cvtOp.getSrc();
+#if defined(__FLAGTREE_MTHREADS_RLC__)
+  // Value, address and mask seeds of the same store must agree: an index seed
+  // can otherwise pull the shared RNG producer chain around the value guard.
+  if (producerConeWidensScalarLog(src, dstEncoding))
+    return false;
+  Value tail = cvtOp.getResult();
+  for (unsigned depth = 0; depth <= 4 && hasSingleUse(tail); ++depth) {
+    Operation *user = *tail.getUsers().begin();
+    if (auto store = dyn_cast<StoreOp>(user)) {
+      Value stored = store.getValue();
+      if (auto cvt = stored.getDefiningOp<ConvertLayoutOp>())
+        stored = cvt.getSrc();
+      if (producerConeWidensScalarLog(stored, dstEncoding))
+        return false;
+      break;
+    }
+    if (!isBackwardPropagationTailUser(user, tail) || user->getNumResults() != 1)
+      break;
+    tail = user->getResult(0);
+  }
+#endif
   if (isFrozenLayoutValue(src))
     return false;
 #if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
