@@ -57,6 +57,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include <cstdlib>
 #include <deque>
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -71,6 +72,44 @@ namespace mlir::triton::gpu {
 #define DEBUG_TYPE "tritongpu-remove-layout-conversions"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+#ifdef __FLAGTREE_RLC_ENHANCE__
+// Internal phase bits, AND-ed with the runtime master switch (rlcEnhance).
+// Backward-propagation and small-component solving depend on cost-based
+// resolution (disabling it forces both off); store-layout remat is independent.
+// The Python binding exposes the mask for source-bound testing and attribution;
+// production compiler pipelines keep the all-phases default.
+static constexpr unsigned kRlcCostBasedResolution = 1u << 0;
+static constexpr unsigned kRlcBackwardPropagation = 1u << 1;
+static constexpr unsigned kRlcSmallComponentSolving = 1u << 2;
+static constexpr unsigned kRlcStoreLayoutRematerialization = 1u << 3;
+static constexpr unsigned kRlcAllPhases =
+    kRlcCostBasedResolution | kRlcBackwardPropagation |
+    kRlcSmallComponentSolving | kRlcStoreLayoutRematerialization;
+
+static bool isRlcRejectTraceEnabled() {
+  const char *value = std::getenv("FLAGTREE_RLC_TRACE_REJECTS");
+  if (!value)
+    return false;
+  StringRef setting(value);
+  return setting == "1" || setting.equals_insensitive("true") ||
+         setting.equals_insensitive("on");
+}
+
+static void traceRlcDecision(StringRef phase, StringRef outcome,
+                             StringRef reason, Operation *op = nullptr) {
+  if (!isRlcRejectTraceEnabled())
+    return;
+  llvm::raw_ostream &os = llvm::errs();
+  os << "FLAGTREE_RLC_TRACE phase=" << phase << " outcome=" << outcome
+     << " reason=" << reason;
+  if (op) {
+    os << " op=" << op->getName() << " loc=";
+    op->getLoc().print(os);
+  }
+  os << '\n';
+}
+#endif // __FLAGTREE_RLC_ENHANCE__
 
 namespace {
 
@@ -327,12 +366,12 @@ public:
   // Structure to keep track of the layout associated to a value.
   struct LayoutInfo {
     LayoutInfo(Attribute encoding) { encodings.insert(encoding); }
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     LayoutInfo(Attribute encoding, bool hard) { add(encoding, hard); }
 #endif // __TLE__
     LayoutInfo() {}
     void add(Attribute encoding) { encodings.insert(encoding); }
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     void add(Attribute encoding, bool hard) {
       encodings.insert(encoding);
       if (hard)
@@ -343,7 +382,7 @@ public:
     }
 #endif // __TLE__
     llvm::SmallSetVector<Attribute, 8> encodings;
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     llvm::SmallSetVector<Attribute, 8> hardEncodings;
 #endif // __TLE__
 #ifdef __FLAGTREE_RLC_ENHANCE__
@@ -598,7 +637,7 @@ static int64_t getConvertLayoutCost(Value value) {
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
   if (isa<triton::tle::ExtractTileOp, triton::tle::InsertTileOp>(op))
     return true;
   if (isTleExplicitConvertLayoutOp(op))
@@ -656,7 +695,7 @@ void LayoutPropagation::initAnchorLayout() {
         return;
 #endif // __FLAGTREE_RLC_ENHANCE__
       auto &info = layouts[v];
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
       info.add(anchorEncoding, hard);
 #else  // __TLE__
       info.add(anchorEncoding);
@@ -674,7 +713,7 @@ void LayoutPropagation::initAnchorLayout() {
   funcOp.walk([&](Operation *op) {
     if (isLayoutAnchor(op)) {
       for (auto result : op->getResults()) {
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
         bool hard = isTleExplicitConvertLayoutOp(op);
         Attribute explicitEncoding =
             hard ? getTleExplicitResultEncoding(op, result.getResultNumber())
@@ -732,7 +771,7 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
 #else  // __FLAGTREE_RLC_ENHANCE__
         hasChanged |= layoutInfo.encodings.insert(dstEncoding);
 #endif // __FLAGTREE_RLC_ENHANCE__
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
 #ifdef __FLAGTREE_RLC_ENHANCE__
         // A synthesized parent is only a candidate, never an explicit layout.
         if (info.isHard(encoding) && !derived)
@@ -953,9 +992,9 @@ bool LayoutPropagation::addProposalValue(Proposal &proposal, Value target,
 // Defined next to getContigAlongMemoryOrder. Producer-closure collection is
 // earlier in the file, so keep the declaration here with the proposal helpers.
 static bool requiresIntToFpContiguityBoundary(Value value,
-                                               Attribute candidateEncoding);
+                                              Attribute candidateEncoding);
 static unsigned getPreservedIntToFpVectorWidth(Value value,
-                                                Attribute candidateEncoding);
+                                               Attribute candidateEncoding);
 
 Attribute LayoutPropagation::getProposalEncoding(const Proposal &proposal,
                                                  Value value) const {
@@ -1012,12 +1051,10 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
   // example i1 -> f32) are layout-independent and need neither path.
   Operation *targetDefOp = target.getDefiningOp();
   if (targetDefOp &&
-      RlcBackendPolicy::fromOperation(targetDefOp)
-          .preserveIntToFpContiguity &&
+      RlcBackendPolicy::fromOperation(targetDefOp).preserveIntToFpContiguity &&
       requiresIntToFpContiguityBoundary(target, encoding)) {
     if (getPreservedIntToFpVectorWidth(target, encoding) != 0) {
-      traceRlcDecision("2", "preserve", "int-to-fp-vector-width",
-                       targetDefOp);
+      traceRlcDecision("2", "preserve", "int-to-fp-vector-width", targetDefOp);
     } else {
       traceRlcDecision("2", "preserve", "int-to-fp-contiguity-boundary",
                        targetDefOp);
@@ -1782,14 +1819,14 @@ bool LayoutPropagation::commitProposal(const Proposal &proposal) {
   for (auto &it : proposal) {
     changed |= addSmallComponentEncoding(it.first, it.second);
     Operation *defOp = it.first.getDefiningOp();
-    if (!defOp || !RlcBackendPolicy::fromOperation(defOp)
-                       .preserveIntToFpContiguity)
+    if (!defOp ||
+        !RlcBackendPolicy::fromOperation(defOp).preserveIntToFpContiguity)
       continue;
     unsigned width = getPreservedIntToFpVectorWidth(it.first, it.second);
     if (width != 0)
-      defOp->setAttr("ttg.rlc-preserve-int-to-fp-vector-width",
-                     IntegerAttr::get(IntegerType::get(defOp->getContext(), 32),
-                                      width));
+      defOp->setAttr(
+          "ttg.rlc-preserve-int-to-fp-vector-width",
+          IntegerAttr::get(IntegerType::get(defOp->getContext(), 32), width));
   }
   return changed;
 }
@@ -2173,8 +2210,8 @@ static bool isExactlyRepresentableIntToFp(Operation *op) {
   return intType.getWidth() <= floatType.getFPMantissaWidth();
 }
 
-static bool requiresIntToFpContiguityBoundary(
-    Value value, Attribute candidateEncoding) {
+static bool requiresIntToFpContiguityBoundary(Value value,
+                                              Attribute candidateEncoding) {
   Operation *defOp = value.getDefiningOp();
   if (!defOp || !isa<arith::SIToFPOp, arith::UIToFPOp>(defOp) ||
       isExactlyRepresentableIntToFp(defOp))
@@ -2194,8 +2231,8 @@ static bool requiresIntToFpContiguityBoundary(
 // narrow and online: only i32 -> f32, equal old/new elements per thread, and
 // widths already observed in the qualified MUSA paths are admitted. Every
 // other inexact conversion remains a hard proposal boundary.
-static unsigned getPreservedIntToFpVectorWidth(
-    Value value, Attribute candidateEncoding) {
+static unsigned getPreservedIntToFpVectorWidth(Value value,
+                                               Attribute candidateEncoding) {
   if (!requiresIntToFpContiguityBoundary(value, candidateEncoding))
     return 0;
   Operation *defOp = value.getDefiningOp();
@@ -2427,13 +2464,13 @@ bool LayoutPropagation::solveSmallComponents() {
   // values directly rather than through collectProducerClosure.
   auto proposalChangesUnsupportedIntToFpContiguity =
       [](const Proposal &proposal) {
-    for (auto &it : proposal) {
-      if (requiresIntToFpContiguityBoundary(it.first, it.second) &&
-          getPreservedIntToFpVectorWidth(it.first, it.second) == 0)
-        return true;
-    }
-    return false;
-  };
+        for (auto &it : proposal) {
+          if (requiresIntToFpContiguityBoundary(it.first, it.second) &&
+              getPreservedIntToFpVectorWidth(it.first, it.second) == 0)
+            return true;
+        }
+        return false;
+      };
 
   auto commitIfProfitable = [&](Proposal &proposal, bool requireBenefit,
                                 bool rejectReachableReductionOrScan = true,
@@ -2572,12 +2609,12 @@ bool LayoutPropagation::solveSmallComponents() {
     RlcBackendPolicy policy = RlcBackendPolicy::fromOperation(atomicOp);
     if (policy.atomicWritebackMaxElementsPerThreadRatio > 0) {
       int64_t currentElements = getTotalElemsPerThread(valType);
-      int64_t candidateElements = getTotalElemsPerThread(
-          valType.cloneWithEncoding(encoding));
+      int64_t candidateElements =
+          getTotalElemsPerThread(valType.cloneWithEncoding(encoding));
       if (candidateElements >
           currentElements * policy.atomicWritebackMaxElementsPerThreadRatio) {
-        traceRlcDecision("2", "reject",
-                         "atomic-elements-per-thread-expansion", atomicOp);
+        traceRlcDecision("2", "reject", "atomic-elements-per-thread-expansion",
+                         atomicOp);
         return false;
       }
     }
@@ -3475,7 +3512,7 @@ void LayoutPropagation::dump() {
     llvm::errs() << " \n encoding:\n";
     for (auto encoding : it.second.encodings) {
       encoding.print(llvm::errs());
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
       if (it.second.hardEncodings.contains(encoding))
         llvm::errs() << " [hard]";
 #endif // __TLE__
@@ -3911,7 +3948,7 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
 #endif // __FLAGTREE_RLC_ENHANCE__
     auto newType = tensorType.cloneWithEncoding(encoding);
     auto cvt = ConvertLayoutOp::create(rewriter, op->getLoc(), newType, src);
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     if (Attribute explicitEncoding = getTleExplicitResultEncoding(op, 0))
       cvt->setAttr(getTleExplicitEncodingAttrName(0), explicitEncoding);
 #endif // __TLE__

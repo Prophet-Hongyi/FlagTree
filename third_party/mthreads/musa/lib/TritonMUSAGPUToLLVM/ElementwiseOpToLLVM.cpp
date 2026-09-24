@@ -748,8 +748,8 @@ struct SIToFPOpConversion
       for (int64_t i = 0; i < width; ++i)
         inputVector = b.insert_element(inputVectorType, inputVector,
                                        operands[i][0], b.i32_val(i));
-      Value outputVector = LLVM::SIToFPOp::create(
-          rewriter, loc, outputVectorType, inputVector);
+      Value outputVector =
+          LLVM::SIToFPOp::create(rewriter, loc, outputVectorType, inputVector);
       SmallVector<Value> outputs;
       for (int64_t i = 0; i < width; ++i)
         outputs.push_back(
@@ -792,8 +792,8 @@ struct UIToFPOpConversion
       for (int64_t i = 0; i < width; ++i)
         inputVector = b.insert_element(inputVectorType, inputVector,
                                        operands[i][0], b.i32_val(i));
-      Value outputVector = LLVM::UIToFPOp::create(
-          rewriter, loc, outputVectorType, inputVector);
+      Value outputVector =
+          LLVM::UIToFPOp::create(rewriter, loc, outputVectorType, inputVector);
       SmallVector<Value> outputs;
       for (int64_t i = 0; i < width; ++i)
         outputs.push_back(
