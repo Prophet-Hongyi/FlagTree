@@ -289,8 +289,13 @@ static Attribute getExpandDimsParentEncoding(ExpandDimsOp op,
     result.push_back(axis);
     return result;
   };
+#ifdef __FLAGTREE_MTHREADS_RLC__
+  CGAEncodingAttr cta = blocked.getCGALayout();
+  auto parentCta = CGAEncodingAttr::fromSplitParams(
+#else
   CTAEncodingAttr cta = blocked.getCTALayout();
   auto parentCta = CTAEncodingAttr::fromSplitParams(
+#endif
       op.getContext(), insertOne(cta.getCTAsPerCGA()),
       insertOne(cta.getCTASplitNum()), insertSlowest(cta.getCTAOrder()));
   return BlockedEncodingAttr::get(op.getContext(),
@@ -674,7 +679,7 @@ bool LayoutPropagation::hasLayoutPropagationExtensions() const {
 // `encoding`; resolveConflicts always keeps the explicit one.
 bool LayoutPropagation::conflictsWithHardEncoding(Value value,
                                                   Attribute encoding) const {
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
   auto it = layouts.find(value);
   return it != layouts.end() && !it->second.hardEncodings.empty() &&
          !it->second.hardEncodings.contains(encoding);
@@ -3428,7 +3433,7 @@ void LayoutPropagation::resolveConflicts() {
           smallComponentPreferredEncoding.contains(it.first) ||
           !isa<RankedTensorType>(it.first.getType()))
         continue;
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
       if (!info.hardEncodings.empty())
         continue;
 #endif // __TLE__
@@ -3445,7 +3450,7 @@ void LayoutPropagation::resolveConflicts() {
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)
       continue;
-#ifdef __TLE__
+#if defined(__TLE__) && !defined(__FLAGTREE_MTHREADS_RLC__)
     // An explicit (tle.gpu.set_layout) encoding wins over every rule below.
     if (!info.hardEncodings.empty()) {
       Attribute encoding = *info.hardEncodings.begin();
@@ -5529,12 +5534,12 @@ public:
     // Per-phase options are AND-ed with the master option. Backward-propagation
     // and small-component solving depend on cost-based resolution (disabling it
     // forces both off); store-layout remat is independent.
-    bool costBased = enableRlcEnhance && enableCostBasedResolution;
-    bool backwardProp = enableRlcEnhance && enableBackwardPropagation;
+    bool costBased = enableRlcEnhance && enableCostBasedResolution && (rlcPhaseMask & 1u);
+    bool backwardProp = enableRlcEnhance && enableBackwardPropagation && (rlcPhaseMask & 2u);
     bool smallComponentSolving =
-        enableRlcEnhance && enableSmallComponentSolving;
+        enableRlcEnhance && enableSmallComponentSolving && (rlcPhaseMask & 4u);
     bool storeLayoutRemat =
-        enableRlcEnhance && enableStoreLayoutRematerialization;
+        enableRlcEnhance && enableStoreLayoutRematerialization && (rlcPhaseMask & 8u);
 
     if (!costBased) {
       backwardProp = false;

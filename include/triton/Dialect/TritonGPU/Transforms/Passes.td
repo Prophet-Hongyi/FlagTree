@@ -360,6 +360,8 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
 
 #ifdef __FLAGTREE_RLC_ENHANCE__
   let options = [
+    Option<"rlcPhaseMask", "rlc-phase-mask", "uint32_t", /*default=*/"15",
+           "Bit mask for enhanced RLC phases 1a, 1b, 2, and 3">,
     Option<"enableRlcEnhance", "enable-rlc-enhance",
            "bool", /*default=*/"false",
            "Master switch for the FlagTree phases (FLAGTREE_RLC_ENHANCE); the "
