@@ -170,4 +170,3 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 16 : i32, "ttg.rl
     tt.return
   }
 }
-
