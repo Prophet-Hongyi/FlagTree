@@ -440,6 +440,8 @@ class compilation_knobs(base_knobs):
     disable_line_info: env_bool = env_bool("TRITON_DISABLE_LINE_INFO")
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
     allow_non_constexpr_globals: env_bool = env_bool("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS")
+    # flagtree same warp layout shuffle; read by the layout analysis (Analysis/Utility.cpp)
+    same_warp_layout_shuffle: env_bool = env_bool("FLAGTREE_SAME_WARP_LAYOUT_SHUFFLE", True)
     # Instrumentation mode is checked on every run, which is expensive.
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
@@ -559,6 +561,10 @@ class runtime_knobs(base_knobs):
 class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
     default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
+    # flagtree low-precision float (fp8/fp4) support; 0 falls back to the upstream
+    # interpreter float conversion and drops the backend opt-ins
+    low_precision_float: env_bool = env_bool("FLAGTREE_LOW_PRECISION_FLOAT", True)
+    reorder_loop_loads: env_bool = env_bool("FLAGTREE_REORDER_LOOP_LOADS", True)  # flagtree reorder loop loads
 
 
 class nvidia_knobs(base_knobs):
@@ -572,7 +578,9 @@ class nvidia_knobs(base_knobs):
     ptxas_options: env_opt_str = env_opt_str("PTXAS_OPTIONS")
     mock_ptx_version: env_opt_str = env_opt_str("TRITON_MOCK_PTX_VERSION")
     dump_ptxas_log: env_bool = env_bool("TRITON_DUMP_PTXAS_LOG")
-    rlc_enhance: env_bool = env_bool("FLAGTREE_RLC_ENHANCE", True)
+    rlc_enhance: env_bool = env_bool("FLAGTREE_RLC_ENHANCE", True)  # flagtree rlc enhance
+    pipeline_enhance: env_bool = env_bool("FLAGTREE_PIPELINE_ENHANCE", True)  # flagtree pipeline enhance
+    concat_dot_operand: env_bool = env_bool("FLAGTREE_CONCAT_DOT_OPERAND", True)  # flagtree concat dot operand
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
@@ -666,6 +674,19 @@ class musa_knobs(base_knobs):
     replace_llir: env_opt_str = env_opt_str("TRITON_MUSA_REPLACE_LLIR")
     replace_mubin: env_opt_str = env_opt_str("TRITON_MUSA_REPLACE_MUBIN")
     libdevice_path: env_opt_str = env_opt_str("TRITON_MUSA_LIBDEVICE_PATH")
+    # Enhanced phases remain opt-in until qualified on MUSA.
+    rlc_enhance: env_bool = env_bool("FLAGTREE_MUSA_RLC_ENHANCE", False)
+    rlc_phase_mask: env_int = env_int("FLAGTREE_MUSA_RLC_PHASE_MASK", 0xF)
+    # MUSA scalarizes atomic tensor elements in one thread. Keep Phase 2 from
+    # increasing that per-thread atomic count; the RLC master switch remains
+    # default-off, and Phase 3 MMA atomic rematerialization is unaffected.
+    rlc_atomic_writeback_max_elements_per_thread_ratio: env_int = env_int(
+        "FLAGTREE_MUSA_RLC_ATOMIC_WRITEBACK_MAX_ELEMS_PER_THREAD_RATIO", 1)
+    # MUSA scalar and vector int-to-fp paths are not bit-identical at every
+    # rounding boundary. Phase 2 must not change that per-thread vector width.
+    rlc_preserve_int_to_fp_contiguity: env_bool = env_bool(
+        "FLAGTREE_MUSA_RLC_PRESERVE_INT_TO_FP_CONTIGUITY", True)
+    libprintf_path: env_opt_str = env_opt_str("TRITON_MUSA_LIBPRINTF_PATH")
 
 
 # flagtree ppu

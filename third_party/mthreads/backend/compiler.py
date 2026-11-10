@@ -1,7 +1,8 @@
-from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.backends.compiler import BaseBackend, DotCap, DotSupport, GPUTarget, Language
+from triton.backends.mthreads._musa_arch import musa_capability_from_arch, normalize_musa_arch
 from triton._C.libtriton import ir, passes, mthreads
 from triton import knobs
-from triton.runtime.errors import OutOfResources
+from triton.runtime.errors import OutOfResources, PTXASError
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,12 @@ import subprocess
 import tempfile
 
 _DEFAULT_MUSA_PREFIX = "/usr/local/musa"
+_RLC_POLICY_CACHE_VERSION = "fixed-cost-v1-late-proof-v3"
+
+# FlagGems uses this feature level to distinguish a backend that turns known
+# MTGPU register-allocation failures into recoverable autotuning failures from
+# an older backend that aborts the complete tuning run.
+MTHREADS_REGISTER_FAILURE_RECOVERY_VERSION = 1
 
 
 def min_dot_size(target: GPUTarget):
@@ -28,6 +35,80 @@ def min_dot_size(target: GPUTarget):
         return (1, 1, 1)
 
     return check_dot_compatibility
+
+
+# Whole-byte dtypes covered by the inherited async-copy/descriptor movement
+# paths; the fp8 portion follows the per-capability storage whitelist. The
+# async-copy path additionally gates on a >= 4-byte per-thread copy vector
+# (cp.async-style, dtype-agnostic); narrower copies fall back to ordinary
+# tt.load.
+_MOVEMENT_DTYPES = ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "fp16", "bf16", "fp32",
+                    "fp64")
+
+# fp8e4b15/fp8e4b8/fp8e5b16 are storage-only dtypes: the dot whitelist keeps
+# them out of tl.dot, so resolve_dot only ever sees the two OCP formats
+_FP8_DOT_DTYPES = ("fp8e4nv", "fp8e5")
+_NATIVE_SAME_TYPE_DOT_DTYPES = ("fp16", "bf16", "fp32", "fp64")
+
+# PH1 8-bit operand instruction tiles (WMMA m/n/k; the SQMMA K values {32, 64,
+# 128} are divisibility-implied). A shape that divides no tile cannot use the
+# matrix units and falls back to the FMA software path.
+_FP8_INSTR_TILES = ((8, 16, 16), (16, 8, 16), (16, 16, 16), (16, 16, 32), (16, 16, 64))
+
+
+def _product_name(capability: int) -> str:
+    return "MThreads S5000 (cap31)" if capability == 31 else f"MThreads (cap{capability})"
+
+
+def _hits_fp8_instr_tile(M: int, N: int, K: int) -> bool:
+    return any(M % m == 0 and N % n == 0 and K % k == 0 for m, n, k in _FP8_INSTR_TILES)
+
+
+def _make_resolve_dot(capability: int):
+    """resolve_dot rule: INT8xINT8->INT32 is native; same-type FP8 dot with an
+    fp32 accumulator is native from cap31 when the shape hits an instruction
+    tile; mixed fp8 and instruction-shape misses keep the preserved FMA
+    fallback (NON_NATIVE); every other combination is a compile-time error."""
+    product = _product_name(capability)
+
+    def resolve_dot(a_dtype, b_dtype, acc_dtype, M, N, K):
+        if a_dtype == "int8" and b_dtype == "int8":
+            return DotCap(DotSupport.NATIVE)
+        if a_dtype in _FP8_DOT_DTYPES and b_dtype in _FP8_DOT_DTYPES:
+            if capability >= 31 and a_dtype == b_dtype and acc_dtype == "fp32" and _hits_fp8_instr_tile(M, N, K):
+                return DotCap(DotSupport.NATIVE)
+            if capability < 31:
+                reason = "no native fp8 matrix instructions on this capability"
+            elif a_dtype != b_dtype:
+                reason = "mixed fp8 operand dtypes"
+            elif acc_dtype != "fp32":
+                reason = f"{acc_dtype} accumulator (accelerated fp8 dot requires fp32)"
+            else:
+                reason = f"shape {M}x{N}x{K} misses the 8-bit instruction tiles"
+            return DotCap(
+                DotSupport.NON_NATIVE, diag=f"FP8 dot on {product} is not native ({reason}): "
+                "non-native FMA software path (native=false)")
+        if a_dtype == b_dtype and a_dtype in _NATIVE_SAME_TYPE_DOT_DTYPES:
+            return DotCap(DotSupport.NATIVE)
+        return DotCap(
+            DotSupport.UNSUPPORTED, diag=f"tl.dot: {a_dtype} x {b_dtype} is not supported on {product}; "
+            "native alternatives: int8 / fp16 / bf16 / fp32 / fp64 dot")
+
+    return resolve_dot
+
+
+def _make_resolve_dot_scaled(capability: int):
+    """resolve_dot_scaled rule: no MUSA capability has a native scaled-MMA
+    path; every format combination decomposes to a promoted fp16/bf16 dot
+    and is declared NON_NATIVE with a compile-time warning."""
+    product = _product_name(capability)
+
+    def resolve_dot_scaled(lhs_format, rhs_format):
+        return DotCap(
+            DotSupport.NON_NATIVE, diag=f"tl.dot_scaled ({lhs_format} x {rhs_format}) on {product} is not native: "
+            "decomposed to a promoted fp16/bf16 dot (native=false)")
+
+    return resolve_dot_scaled
 
 
 def _module_text(mod) -> str:
@@ -140,7 +221,6 @@ def get_musa_version() -> str:
         return "unknown"
 
 
-@functools.lru_cache(None)
 def file_hash(path: str) -> str:
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -168,22 +248,14 @@ def _tool_version_signature(path: str) -> str:
 
 
 def _normalize_arch(arch: object) -> str:
-    arch_str = str(arch).lower()
-    if "." not in arch_str:
-        return arch_str
-    arch_major, arch_minor = arch_str.split(".", 1)
-    if arch_major.isdecimal() and arch_minor.isdecimal():
-        return f"{arch_major}{arch_minor}"
-    return arch_str
+    return normalize_musa_arch(arch)
 
 
 def _capability_from_arch(arch: object) -> int:
-    arch_str = _normalize_arch(arch)
-    if arch_str.startswith("ph1"):
-        return 31
-    if arch_str.isdecimal():
-        return int(arch_str)
-    raise ValueError(f"Unsupported MUSA arch: {arch}")
+    capability = musa_capability_from_arch(arch)
+    if capability is None:
+        raise ValueError(f"Unsupported MUSA arch: {arch}")
+    return capability
 
 
 def _warp_size_from_capability(capability: int) -> int:
@@ -197,6 +269,57 @@ def _max_static_shared_memory_from_arch(arch: object) -> Optional[int]:
     if capability == 22:
         return 73728
     return None
+
+
+def _rlc_phase2_enabled() -> bool:
+    """Phase 2 (0x4) also requires cost-based resolution (0x1)."""
+    musa = knobs.musa
+    return bool(musa.rlc_enhance) and (int(musa.rlc_phase_mask) & 0b0101) == 0b0101
+
+
+def _effective_atomic_writeback_ratio() -> int:
+    """Return the atomic policy only when its owning RLC phase can run."""
+    if not _rlc_phase2_enabled():
+        return 0
+    return int(getattr(knobs.musa, "rlc_atomic_writeback_max_elements_per_thread_ratio", 0) or 0)
+
+
+def _effective_preserve_int_to_fp_contiguity() -> bool:
+    """Return the Phase 2 int-to-fp guard only while its owner can run."""
+    if not _rlc_phase2_enabled():
+        return False
+    return bool(getattr(knobs.musa, "rlc_preserve_int_to_fp_contiguity", True))
+
+
+def _apply_musa_rlc_policy(mod) -> None:
+    """Apply atomic writeback and integer-to-float layout controls."""
+    if not knobs.musa.rlc_enhance:
+        return
+    builder = ir.builder(mod.context)
+    atomic_ratio = _effective_atomic_writeback_ratio()
+    if atomic_ratio > 0:
+        mod.set_attr("ttg.rlc-atomic-writeback-max-elements-per-thread-ratio",
+                     builder.get_int32_attr(atomic_ratio))
+    if _effective_preserve_int_to_fp_contiguity():
+        mod.set_attr("ttg.rlc-preserve-int-to-fp-contiguity",
+                     builder.get_int32_attr(1))
+        # The MUSA LLVM lowering explicitly preserves these pair/quad widths
+        # when RLC retags an inexact i32 -> f32 chain. Common RLC treats every
+        # unadvertised width as a hard boundary.
+        mod.set_attr("ttg.rlc-int-to-fp-vector-width-mask",
+                     builder.get_int32_attr((1 << 2) | (1 << 4)))
+
+
+def _rlc_policy_signature() -> str:
+    """Read live controls and keep fixed-cost compiles apart from old policies."""
+    musa = knobs.musa
+    return "-".join([
+        _RLC_POLICY_CACHE_VERSION,
+        str(int(bool(musa.rlc_enhance))),
+        str(int(musa.rlc_phase_mask)),
+        str(_effective_atomic_writeback_ratio()),
+        str(int(_effective_preserve_int_to_fp_contiguity())),
+    ])
 
 
 def _check_static_shared_memory(metadata: Dict[str, Any], arch: object) -> None:
@@ -243,12 +366,14 @@ def _local_backend_tool_path(binary: str) -> Optional[str]:
 
 
 def _select_tool_path(binary: str, explicit_path: Optional[str], tool_getter) -> Optional[str]:
-    local_path = _local_backend_tool_path(binary)
-    if local_path:
-        return local_path
+    # Honor an explicit toolchain override before the bundled binaries. New
+    # lowering contracts may require a newer MTCC than the wheel contains.
     path = _validated_tool_path(explicit_path)
     if path:
         return path
+    local_path = _local_backend_tool_path(binary)
+    if local_path:
+        return local_path
     return _maybe_tool_path(tool_getter())
 
 
@@ -292,6 +417,27 @@ def _tool_output(stdout: Optional[str], stderr: Optional[str]) -> str:
     return "\n".join(chunks)
 
 
+def _is_known_mtgpu_register_failure(tool_name: str, output: str, returncode: Optional[int] = None) -> bool:
+    """Recognize recoverable register-allocation failures from MTT LLVM tools.
+
+    The MTGPU backend aborts instead of returning a regular diagnostic for a
+    small set of register-pressure failures. These are invalid autotuning
+    candidates, not fatal compiler errors. Keep the predicate deliberately
+    narrow so unrelated LLVM failures still surface as ``RuntimeError``.
+    """
+    if tool_name not in {"llc", "llc-asm"}:
+        return False
+    text = output.lower()
+    if "no registers from class available to allocate" in text:
+        return True
+
+    # At -O0 the same limitation can reach the post-RA helper and terminate by
+    # signal. Require both the pass name and an explicit crash indication.
+    post_ra = "mtgpu post-ra internal registers related optimization" in text
+    crash_markers = ("segmentation fault", "sigsegv", "signal 11", "exit code 139")
+    return post_ra and (returncode in (-11, 139) or any(marker in text for marker in crash_markers))
+
+
 def _run_tool_command(tool_name: str, cmd: list[str], *, repro_dir: Path, dump_log: bool = False) -> None:
     proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
     output = _tool_output(proc.stdout, proc.stderr)
@@ -300,6 +446,11 @@ def _run_tool_command(tool_name: str, cmd: list[str], *, repro_dir: Path, dump_l
         print(output)
     if proc.returncode == 0:
         return
+    if _is_known_mtgpu_register_failure(tool_name, output, proc.returncode):
+        raise PTXASError("MTGPU register allocation rejected this candidate.\n"
+                         f"{output or '<empty>'}\n"
+                         f"Repro command: {shlex.join(cmd)}\n"
+                         f"Artifacts kept in: {repro_dir}")
     error = (f"`{tool_name}` failed with error code {proc.returncode}\n"
              f"`{tool_name}` output:\n{output or '<empty>'}\n"
              f"Repro command: {shlex.join(cmd)}\n"
@@ -639,18 +790,50 @@ def _llc_extra_options(metadata: Dict[str, object], options: "MUSAOptions", capa
         ],
     }
     opts = list(llc_options_map[(uses_sqmma, enable_backend_opt)])
+    # This option is deliberately narrow: it suppresses only the SQMMA
+    # optimized LLC scheduling flag when that flag is otherwise selected.
+    if options.disable_max_ilp_scheduler:
+        opts = [opt for opt in opts if opt != "-misched=mtgpu-max-ilp"]
     if capability == 22:
         opts.append("-mtgpu-alloc-shared-memory-from-zero=1")
     if options.llc_options:
-        opts.extend(shlex.split(options.llc_options))
+        # Explicit scheduler and MTGPU optimization-level switches replace the
+        # backend defaults. Several bundled llc versions reject conflicting
+        # duplicates instead of applying a deterministic last-one-wins rule.
+        user_opts = shlex.split(options.llc_options)
+        filtered_user_opts = []
+        override_prefixes = ("-misched=", "-mtgpu-opt-level=")
+        for user_opt in user_opts:
+            # The pass-manager -O level is emitted at a fixed command position
+            # by ``_llc_opt_level`` below.
+            if re.fullmatch(r"-O[0-3]", user_opt):
+                continue
+            if user_opt.startswith(override_prefixes):
+                prefix = user_opt.split("=", 1)[0] + "="
+                opts = [opt for opt in opts if not opt.startswith(prefix)]
+            elif user_opt in opts:
+                continue
+            filtered_user_opts.append(user_opt)
+        opts.extend(filtered_user_opts)
     return opts
+
+
+def _llc_opt_level(options: "MUSAOptions") -> str:
+    """Return the effective llc pass-manager optimization level."""
+    level = "-O2"
+    if not options.llc_options:
+        return level
+    for option in shlex.split(options.llc_options):
+        if re.fullmatch(r"-O[0-3]", option):
+            level = option
+    return level
 
 
 @dataclass(frozen=True)
 class MUSAOptions:
     num_warps: int = 4
     num_ctas: int = 1
-    num_stages: int = 3
+    num_stages: int = 1
     warp_size: int = 32
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)  # flagtree mthreads3.2
@@ -658,7 +841,10 @@ class MUSAOptions:
     launch_cooperative_grid: bool = False
     supported_fp8_dtypes: Tuple[str, ...] = ("fp8e5", )
     supported_fp8_storage_dtypes: Tuple[str, ...] = ("fp8e5", )
-    custom_fp8_dtypes: Tuple[str, ...] = ()
+    supported_fp8_cast_dtypes: Tuple[str, ...] = ()
+    custom_cast_fp8_dtypes: Tuple[str, ...] = ()
+    async_copy_dtypes: Tuple[str, ...] = ()
+    descriptor_dtypes: Tuple[str, ...] = ()
     deprecated_fp8_dot_operand_dtypes: Tuple[str, ...] = ()
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: Tuple[str, ...] = ("ieee", "tf32", "tf32x3", "bf16x3", "bf16x6")
@@ -670,6 +856,8 @@ class MUSAOptions:
     llc_options: Optional[str] = None
     enable_llc_opt: bool = False
     enable_backend_opt: bool = False
+    disable_max_ilp_scheduler: bool = False
+    disable_sqmma_m_split_preference: bool = False
     enable_fp8_burst2: bool = False
     enable_llvm_compat: bool = True
     extern_libs: Optional[tuple] = None
@@ -679,12 +867,18 @@ class MUSAOptions:
     arch: Optional[str] = None
     instrumentation_mode: str = ""
     inplace_alias_pairs: str = ""
+    # Compile-key fragment for FLAGTREE_MUSA_RLC_*. Stamped from knobs in
+    # parse_options so JITFunction.device_caches (which keys on str(options))
+    # cannot reuse an incumbent binary after an in-process enhance flip.
+    rlc_policy: str = ""
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if not extern_libs.get("libdevice", None):
             extern_libs["libdevice"] = knobs.musa.libdevice_path or str(default_libdir / "libdevice.31.bc")
+        if self.arch is not None and _capability_from_arch(self.arch) == 31 and not extern_libs.get("printf", None):
+            extern_libs["printf"] = knobs.musa.libprintf_path or str(default_libdir / "libprintf.bc")
         object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
             "num_warps must be a power of 2"
@@ -701,6 +895,7 @@ class MUSAOptions:
         hash_dict["llc_tool_signature"] = _tool_version_signature(llc_path)
         hash_dict["lld_tool_signature"] = _tool_version_signature(lld_path)
         hash_dict["llc_asm_tool_signature"] = _tool_version_signature(llc_asm_path or "")
+        hash_dict["musa_k128_sqmma_opt_in_live"] = os.getenv("TRITON_MUSA_ENABLE_K128_SQMMA", "") == "1"
         if hash_dict["extern_libs"]:
             hash_dict["extern_libs"] = tuple((k, file_hash(v)) for k, v in sorted(hash_dict["extern_libs"]))
         key = "_".join([f"{name}-{val}" for name, val in sorted(hash_dict.items())])
@@ -714,6 +909,13 @@ class MUSABackend(BaseBackend):
     @staticmethod
     def parse_attr(desc):
         assert isinstance(desc, str)
+        proof = re.fullmatch(r"RLC2B([0-9]+)D(2|4|8|16)", desc)
+        if proof:
+            tile, divisor = map(int, proof.groups())
+            if 2 <= tile <= 1024:
+                return [["musa.rlc_positive_even_divisor", divisor],
+                        ["musa.rlc_positive_even_block_upper_bound", tile]]
+            return []
         if desc == "D":
             return [["tt.divisibility", 16]]
         if desc in {"D8", "D4", "D2"}:
@@ -777,6 +979,93 @@ class MUSABackend(BaseBackend):
         return cached
 
     @staticmethod
+    def _find_bounded_writeback_plan(source, params):
+        """Find a possible bounded-width dual store; the RLC pass rechecks IR."""
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, TypeError):
+            return None
+
+        def names(node):
+            return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+        definitions, stores, cdivs = {}, [], []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store):
+                            definitions.setdefault(name.id, set()).update(names(node.value))
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if not isinstance(node.func.value, ast.Name) or node.func.value.id != "tl":
+                continue
+            if node.func.attr == "cdiv" and len(node.args) == 2 and all(isinstance(x, ast.Name) for x in node.args):
+                cdivs.append((node.args[0].id, node.args[1].id))
+            if node.func.attr == "store" and len(node.args) >= 2:
+                mask = next((k.value for k in node.keywords if k.arg == "mask"),
+                            node.args[2] if len(node.args) > 2 else None)
+                if mask is None:
+                    return None
+                stores.append((node.args[0], mask))
+
+        if len(stores) != 2:
+            return None
+        param_names = {p.name for p in params}
+
+        def roots(expr):
+            pending, seen, found = list(names(expr)), set(), set()
+            while pending:
+                name = pending.pop()
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name in param_names:
+                    found.add(name)
+                pending.extend(definitions.get(name, ()))
+            return found
+
+        store_roots = [(roots(ptr), roots(mask)) for ptr, mask in stores]
+        indices = {p.name: i for i, p in enumerate(params)}
+        return {(width, tile, indices[width], indices[tile]) for width, tile in cdivs
+                if width in indices and tile in indices
+                and all(width in ptr and width in mask for ptr, mask in store_roots)}
+
+    def _refine_bounded_writeback(self, bound_args, params, specialization, jit_function):
+        if jit_function is None:
+            return specialization
+        # Cache only source facts; evaluate per-parameter opt-outs on each call.
+        cache_key = ("bounded-writeback", jit_function.cache_key)
+        if cache_key not in self._device_descriptor_use_cache:
+            self._device_descriptor_use_cache[cache_key] = self._find_bounded_writeback_plan(jit_function.src, params)
+        selected = None
+        for width, tile_name, width_idx, tile_idx in self._device_descriptor_use_cache[cache_key] or ():
+            if width_idx >= len(params) or tile_idx >= len(params):
+                return specialization
+            p, t = params[width_idx], params[tile_idx]
+            if p.name != width or t.name != tile_name:
+                return specialization
+            if p.is_constexpr or p.do_not_specialize or p.do_not_specialize_on_alignment or not t.is_constexpr:
+                continue
+            if selected is not None:
+                return specialization
+            selected = width, tile_name, width_idx
+        if selected is None:
+            return specialization
+        width, tile_name, i = selected
+        value, tile = bound_args[width], bound_args[tile_name]
+        ty, _ = specialization[i]
+        if type(value) is not int or type(tile) is not int or ty != "i32":
+            return specialization
+        if not 2 <= tile <= 1024 or not 0 < value <= tile or value % 2:
+            return specialization
+        # Same 2/4/8/16 alignment classes as get_int_specialization().
+        divisor = min(value & -value, 16)
+        result = list(specialization)
+        result[i] = (ty, f"RLC2B{tile}D{divisor}")
+        return result
+
+    @staticmethod
     def _refine_specialization_key(arg, ty, key, align, refine_ints):
         if isinstance(arg, tuple) and isinstance(ty, tuple):
             old_keys = key if isinstance(key, tuple) else (None, ) * len(arg)
@@ -817,6 +1106,13 @@ class MUSABackend(BaseBackend):
                     refine_ints=refine_ints,
                 ),
             )
+        if _rlc_phase2_enabled():
+            try:
+                is_target = _capability_from_arch(self.target.arch) == 31
+            except (ValueError, TypeError):
+                is_target = False
+            if is_target:
+                refined = self._refine_bounded_writeback(bound_args, params, refined, jit_function)
         return refined
 
     @staticmethod
@@ -830,9 +1126,18 @@ class MUSABackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         opts = dict(opts)
+        if "k128_sqmma_opt_in" in opts:
+            raise ValueError("k128_sqmma_opt_in is not a per-kernel MThreads option; "
+                             "set TRITON_MUSA_ENABLE_K128_SQMMA=1 before compilation")
         arch = knobs.runtime.override_arch or opts.get("arch", None) or self.target.arch
         args = {"arch": _normalize_arch(arch)}
         capability = _capability_from_arch(args["arch"])
+        # The bundled MTGPU llc currently only provides processors through
+        # mp_32. Reject future numeric capabilities here rather than letting
+        # instruction selection terminate the compiler process.
+        if capability > 32:
+            raise ValueError(f"Unsupported MUSA arch {args['arch']}: "
+                             "this FlagTree toolchain supports capabilities up to 32")
         if opts.get("num_ctas", 1) > 1 and capability == 31:
             raise ValueError("num_ctas > 1 requires MUSA cluster launch support. "
                              f"Current target is {args['arch']} (capability {capability}).")
@@ -844,15 +1149,23 @@ class MUSABackend(BaseBackend):
                 supported_fp8_dtypes.add("fp8e4nv")
             args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
         if "supported_fp8_storage_dtypes" not in opts:
-            supported_fp8_storage_dtypes = set(args.get("supported_fp8_dtypes", ()))
+            supported_fp8_storage_dtypes = set(opts.get("supported_fp8_dtypes") or args.get("supported_fp8_dtypes", ()))
             if capability >= 31:
                 supported_fp8_storage_dtypes.update({"fp8e4b15", "fp8e4b8", "fp8e5b16"})
             args["supported_fp8_storage_dtypes"] = tuple(sorted(supported_fp8_storage_dtypes))
-        if "custom_fp8_dtypes" not in opts:
-            custom_fp8_dtypes = set()
+        storage_dtypes = opts.get("supported_fp8_storage_dtypes") or args.get("supported_fp8_storage_dtypes", ())
+        if "supported_fp8_cast_dtypes" not in opts:
+            # every storable fp8 dtype has a hardware or software cast lowering
+            args["supported_fp8_cast_dtypes"] = tuple(storage_dtypes)
+        if "custom_cast_fp8_dtypes" not in opts:
+            custom_cast_fp8_dtypes = set()
             if capability >= 31:
-                custom_fp8_dtypes.update({"fp8e4b15", "fp8e4b8", "fp8e5b16"})
-            args["custom_fp8_dtypes"] = tuple(sorted(custom_fp8_dtypes))
+                custom_cast_fp8_dtypes.update({"fp8e4b15", "fp8e4b8", "fp8e5b16"})
+            args["custom_cast_fp8_dtypes"] = tuple(sorted(custom_cast_fp8_dtypes))
+        if "async_copy_dtypes" not in opts:
+            args["async_copy_dtypes"] = tuple(sorted(set(_MOVEMENT_DTYPES) | set(storage_dtypes)))
+        if "descriptor_dtypes" not in opts:
+            args["descriptor_dtypes"] = opts.get("async_copy_dtypes") or args.get("async_copy_dtypes", ())
         if "deprecated_fp8_dot_operand_dtypes" not in opts:
             args["deprecated_fp8_dot_operand_dtypes"] = ()
         if "llc_path" not in opts:
@@ -872,9 +1185,17 @@ class MUSABackend(BaseBackend):
         maxnreg = opts.get("maxnreg", None)
         if maxnreg is not None and (not isinstance(maxnreg, int) or maxnreg <= 0):
             raise ValueError(f"maxnreg must be a positive integer, got {maxnreg!r}")
-        args.update({k: opts[k] for k in MUSAOptions.__dataclass_fields__.keys() if k in opts and opts[k] is not None})
+        # ``arch`` has already been resolved using the backend precedence
+        # (runtime override, per-kernel option, then target) and canonicalized
+        # above.  Do not copy the raw user spelling back over it here.
+        args.update({
+            k: opts[k]
+            for k in MUSAOptions.__dataclass_fields__.keys()
+            if k != "arch" and k in opts and opts[k] is not None
+        })
         if "warp_size" not in args:
             args["warp_size"] = _warp_size_from_capability(capability)
+        args["rlc_policy"] = _rlc_policy_signature()
         return MUSAOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -887,10 +1208,16 @@ class MUSABackend(BaseBackend):
     def get_codegen_implementation(self, options):
         from triton.language.extra.musa import utils as musa_utils
 
-        return {
+        capability = _capability_from_arch(options.arch)
+        codegen_fns = {
             "convert_custom_types": musa_utils.convert_custom_float8,
             "min_dot_size": min_dot_size(self.target),
         }
+        # without the resolve_dot contract the semantic layer keeps the dot whitelist rules
+        if knobs.language.low_precision_float:
+            codegen_fns["resolve_dot"] = _make_resolve_dot(capability)
+            codegen_fns["resolve_dot_scaled"] = _make_resolve_dot_scaled(capability)
+        return codegen_fns
 
     def get_module_map(self) -> Dict[str, object]:
         try:
@@ -929,6 +1256,12 @@ class MUSABackend(BaseBackend):
     def make_ttgir(mod, metadata, opt, arch, capability):
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
+        _apply_musa_rlc_policy(mod)
+        if opt.disable_sqmma_m_split_preference:
+            mod.set_attr(
+                "musa_tle.disable_sqmma_m_split_preference",
+                ir.builder(mod.context).get_int32_attr(1),
+            )
 
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
@@ -937,7 +1270,8 @@ class MUSABackend(BaseBackend):
         passes.ttir.add_convert_to_ttgpuir(pm, f"musa:{arch}", opt.num_warps, opt.warp_size, opt.num_ctas)
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emu_tf32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(
+            pm, knobs.musa.rlc_enhance, knobs.musa.rlc_phase_mask)
         passes.ttgpuir.add_optimize_thread_locality(pm)
 
         if hasattr(mthreads.passes.ttgpuir, "add_tle_optimize_local_pointer_async_stores"):
@@ -959,7 +1293,8 @@ class MUSABackend(BaseBackend):
         if hasattr(mthreads.passes.ttgpuir, "add_tle_lower_pipe"):
             mthreads.passes.ttgpuir.add_tle_lower_pipe(pm)
         mthreads.passes.ttgpuir.add_accelerate_matmul(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(
+            pm, knobs.musa.rlc_enhance, knobs.musa.rlc_phase_mask)
         mthreads.passes.ttgpuir.add_optimize_dot_operands(pm)
         mthreads.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -975,6 +1310,8 @@ class MUSABackend(BaseBackend):
             passes.ttgpuir.add_schedule_loops(pm)
             mthreads.passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         else:
+            passes.ttgpuir.add_fuse_nested_loops(pm)
+            passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
 
         passes.common.add_canonicalizer(pm)
@@ -986,7 +1323,8 @@ class MUSABackend(BaseBackend):
         passes.ttgpuir.add_coalesce_async_copy(pm)
         mthreads.passes.ttgpuir.add_tme_lowering(pm)
         mthreads.passes.ttgpuir.add_canonicalize_sqmma_result_conversions(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(
+            pm, knobs.musa.rlc_enhance, knobs.musa.rlc_phase_mask)
         mthreads.passes.ttgpuir.add_issue_barrier_insertion(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
@@ -1035,7 +1373,7 @@ class MUSABackend(BaseBackend):
         mthreads.passes.ttgpuir.add_allocate_shared_memory(pm, capability)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         mthreads.passes.ttgpuir.add_mtgpu_to_llvm(pm, capability)
-        mthreads.passes.ttgpuir.add_to_llvmir(pm, capability)
+        mthreads.passes.ttgpuir.add_to_llvmir(pm, capability, options.enable_fp8_burst2)
         if has_static_ws:
             # The retained operation still owns the default and static worker
             # regions here. Lower their hardware barriers once, then emit
@@ -1061,8 +1399,12 @@ class MUSABackend(BaseBackend):
         mthreads.attach_datalayout(llvm_mod)
 
         if options.extern_libs:
-            paths = [path for (name, path) in options.extern_libs]
-            llvm.link_extern_libs(llvm_mod, paths)
+            inline_paths = [path for (name, path) in options.extern_libs if name != "printf"]
+            printf_paths = [path for (name, path) in options.extern_libs if name == "printf"]
+            if inline_paths:
+                llvm.link_extern_libs(llvm_mod, inline_paths)
+            if printf_paths:
+                llvm.link_extern_libs(llvm_mod, printf_paths, force_inline=False)
 
         MUSABackend._optimize_llir_module(llvm_mod, metadata, capability)
         maxntidx = max(1, int(launch_num_warps) * int(options.warp_size))
@@ -1133,7 +1475,7 @@ class MUSABackend(BaseBackend):
             print(ir_text)
 
         capability = _capability_from_arch(arch)
-        llc_opt_level = "-O2"
+        llc_opt_level = _llc_opt_level(opt)
         llc_opts = [
             "-march=mtgpu",
             f"-mcpu=mp_{capability}",
@@ -1225,7 +1567,9 @@ class MUSABackend(BaseBackend):
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, arch)
 
-    @functools.lru_cache()
     def hash(self):
+        # Do not lru_cache: RLC knobs are process environment. A no-arg cache
+        # freezes the first FLAGTREE_MUSA_RLC_ENHANCE value for the backend
+        # instance and makes later enhance flips a disk-cache no-op.
         version = get_musa_version()
-        return f"{version}-{self.target.arch}"
+        return f"{version}-{self.target.arch}-rlc{_rlc_policy_signature()}"

@@ -1,3 +1,4 @@
+#include "Dialect/MUSA/IR/Dialect.h"
 #include "TritonMUSACommon/MMAOperandUtils.h"
 #include "TritonMUSACommon/SqmmaAttrUtils.h"
 #include "TritonMUSAGPUToLLVM/Allocation.h"
@@ -7,6 +8,7 @@
 #ifdef __TLE__
 #include "Conversion/MUSATLEToLLVM/LocalPointersOpToLLVM.h"
 #include "Dialect/MUSATLE/IR/Dialect.h"
+#include "MUSATLE/Transforms/TransformAttrs.h"
 #include "TritonMUSACommon/TMEUtils.h"
 #endif
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -56,6 +58,15 @@ namespace triton {
 using namespace mlir;
 using mlir::triton::MUSA::TargetInfo;
 namespace {
+
+// Two asynchronous TME global-to-shared copies need no thread barrier between
+// them, even when they write the same allocation: a thread barrier does not
+// order the copy engine's writes; the mbarrier each copy completes on does.
+// NVIDIA::canSkipBarSync makes the same exception for TMA copies.
+bool canSkipMusaBarSync(Operation *before, Operation *after, Allocation *) {
+  return isa<triton::musa::AsyncTMECopyGlobalToLocalOp>(before) &&
+         isa<triton::musa::AsyncTMECopyGlobalToLocalOp>(after);
+}
 
 enum class InplaceLoadDataKind {
   Unsupported,
@@ -385,6 +396,8 @@ struct ConvertTritonMUSAGPUToLLVM
   ConvertTritonMUSAGPUToLLVM() = default;
   ConvertTritonMUSAGPUToLLVM(int32_t computeCapability)
       : ConvertTritonMUSAGPUToLLVMBase({computeCapability}) {}
+  ConvertTritonMUSAGPUToLLVM(int32_t computeCapability, bool enableFp8Burst2)
+      : ConvertTritonMUSAGPUToLLVMBase({computeCapability, enableFp8Burst2}) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -432,7 +445,7 @@ struct ConvertTritonMUSAGPUToLLVM
     ModuleAllocation allocation(
         mod, mlir::triton::musa_gpu::getMusaAllocationAnalysisScratchSizeFn(
                  targetInfo));
-    ModuleMembarAnalysis membarPass(&allocation);
+    ModuleMembarAnalysis membarPass(&allocation, canSkipMusaBarSync);
     membarPass.run();
 
     mlir::LowerToLLVMOptions option(context);
@@ -479,7 +492,7 @@ struct ConvertTritonMUSAGPUToLLVM
                                                       benefit, targetInfo);
     mlir::triton::MUSA::populateElementwiseOpToLLVMPatterns(
         typeConverter, patterns, axisInfoAnalysis, computeCapability,
-        targetInfo, benefit);
+        enableFp8Burst2, targetInfo, benefit);
     mlir::triton::MUSA::populateLoadStoreOpToLLVMPatterns(
         typeConverter, targetInfo, computeCapability, patterns,
         axisInfoAnalysis, benefit);
@@ -542,7 +555,7 @@ struct ConvertTritonMUSAGPUToLLVM
       auto ws = dyn_cast<triton::gpu::WarpSpecializeOp>(op);
       if (!ws)
         ws = op->getParentOfType<triton::gpu::WarpSpecializeOp>();
-      if (ws && ws->hasAttr("musa_tle.static_warp_specialize"))
+      if (ws && ws->hasAttr(triton::musa_tle::kMUSATLEStaticWarpSpecializeAttr))
         staticWarpSpecializeOps.push_back(op);
     });
     for (Operation *op : staticWarpSpecializeOps)
@@ -601,6 +614,13 @@ createConvertTritonMUSAGPUToLLVMPass() {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonMUSAGPUToLLVMPass(int32_t computeCapability) {
   return std::make_unique<ConvertTritonMUSAGPUToLLVM>(computeCapability);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonMUSAGPUToLLVMPass(int32_t computeCapability,
+                                     bool enableFp8Burst2) {
+  return std::make_unique<ConvertTritonMUSAGPUToLLVM>(computeCapability,
+                                                      enableFp8Burst2);
 }
 
 } // namespace mlir::triton

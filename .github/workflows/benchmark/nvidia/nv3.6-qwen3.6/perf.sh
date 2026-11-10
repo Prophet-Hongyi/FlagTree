@@ -19,11 +19,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
+set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 source ~/env.sh
 source "${SCRIPT_DIR}/disable_local_proxy.sh"
+
+export VLLM_PLUGINS=fl
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   echo "[FATAL] CUDA_VISIBLE_DEVICES is unset." >&2
@@ -48,8 +50,8 @@ nvidia-smi --query-gpu=index,name,clocks.gr,clocks.mem,utilization.gpu --format=
 # numactl --cpunodebind=1 --membind=1 \
 # python3 ${SCRIPT_DIR}/all_perf.py --input-len=32768 --output-len=1024 --concurrency=16
 
-numactl --cpunodebind=1 --membind=1 \
-python3 ${SCRIPT_DIR}/all_perf.py --input-len=16384 --output-len=1024 --concurrency=16
+# numactl --cpunodebind=1 --membind=1 \
+# python3 ${SCRIPT_DIR}/all_perf.py --input-len=16384 --output-len=1024 --concurrency=16
 
 numactl --cpunodebind=1 --membind=1 \
 python3 ${SCRIPT_DIR}/all_perf.py --input-len=4096  --output-len=1024 --concurrency=16
