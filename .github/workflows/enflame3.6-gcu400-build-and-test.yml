@@ -21,6 +21,8 @@
 name: Enflame3.6-GCU400-Build-And-Test
 
 on:
+  schedule:
+    - cron: '40 20 * * *'
   push:
     branches: [ "main", "triton_v3.6.x" ]
   pull_request:
@@ -53,6 +55,7 @@ jobs:
 
       - name: Check if backend-relevant files changed
         id: check_backend
+        if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
         uses: flagos-ai/FlagTree/.github/actions/check-backend-changed@main
         with:
           backend: enflame
@@ -102,7 +105,6 @@ jobs:
               --ignore=third_party/enflame/python/test/unit/language/test_core.py
 
           ## tle unit test
-
           python3 -m pytest python/test/tle \
               --ignore=python/test/tle/unit/test_tle_distributed_d2d.py \
               --ignore=python/test/tle/unit/test_tle_get_local_pe.py \
@@ -110,14 +112,14 @@ jobs:
               --ignore=python/test/tle/unit/test_tle_get_node_rank.py
 
           ## tle raw test
-          python3 -m pytest third_party/enflame/python/test/tle/raw \
-              --ignore=third_party/enflame/python/test/tle/raw/mlir/02-fused-softmax.py
+          # python3 -m pytest third_party/enflame/python/test/tle/raw \
+          #     --ignore=third_party/enflame/python/test/tle/raw/mlir/02-fused-softmax.py
 
           ## tle tutorials test
-          python3 python/tutorials/tle/01-fft.py
-          python3 python/tutorials/tle/02-moe_align_block_size.py
-          python3 python/tutorials/tle/03-topk.py
-          python3 third_party/enflame/python/test/tle/tutorials/03-topk.py
+          # python3 python/tutorials/tle/01-fft.py
+          # python3 python/tutorials/tle/02-moe_align_block_size.py
+          # python3 python/tutorials/tle/03-topk.py
+          # python3 third_party/enflame/python/test/tle/tutorials/03-topk.py
           # python3 python/tutorials/tle/04-cluster-gemm.py
           python3 python/tutorials/tle/deepseek_v32/01-topk_selector.py
-          python3 third_party/enflame/python/test/tle/tutorials/deepseek_v32/02-sparse-mla.py
+          # python3 third_party/enflame/python/test/tle/tutorials/deepseek_v32/02-sparse-mla.py

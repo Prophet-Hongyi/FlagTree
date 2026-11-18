@@ -81,6 +81,31 @@ try:
 except ImportError:
     pass
 
+try:
+    from triton._flagtree_backend import FLAGTREE_BACKEND
+    if FLAGTREE_BACKEND == "iluvatar":
+        from .iluvatar import CorexJITFunction, CorexCudaAliasJITFunction
+        registry["corex"] = CorexJITFunction
+        # CUDA-like raw sources are accepted under "cuda" as well, but they are
+        # built by the corex clang for the Iluvatar GPGPU target rather than by
+        # the NVIDIA CUDA toolchain, so the alias warns on first use and the
+        # region dialect that reaches the IR stays "corex".
+        registry["cuda"] = CorexCudaAliasJITFunction
+except ImportError:
+    pass
+
+try:
+    from triton._flagtree_backend import FLAGTREE_BACKEND
+    if FLAGTREE_BACKEND == "hcu":
+        from .hcu import HCUJITFunction
+        registry["hcu"] = HCUJITFunction
+        registry["hip"] = HCUJITFunction
+        # Existing tutorials use @dialect(name="cuda"). On an HCU build the
+        # same .cu source is compiled by DTK Clang in HIP device mode.
+        registry["cuda"] = HCUJITFunction
+except (ImportError, RuntimeError):
+    pass
+
 
 def dialect(
     *,

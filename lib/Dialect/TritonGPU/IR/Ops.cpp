@@ -34,6 +34,9 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#ifdef __TLE__
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#endif
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
@@ -757,6 +760,30 @@ LogicalResult MemDescReshapeOp::verify() {
   return OpTrait::impl::verifyEquivalentType(expectedTy, dstType);
 }
 
+#ifdef __TLE__
+static bool canHoldNVMMASwizzleCore(ArrayRef<int64_t> shape,
+                                    NVMMASharedEncodingAttr encoding) {
+  if (encoding.getSwizzlingByteWidth() == 0)
+    return true;
+  if (shape.size() < 2)
+    return false;
+
+  auto shapePerCTA = getShapePerCTA(encoding, shape);
+  auto tmaShape = triton::nvidia_gpu::getTMABlockShape(encoding, shapePerCTA,
+                                                       /*packedSize=*/true);
+  int64_t rows = product<int64_t>(ArrayRef<int64_t>(tmaShape).drop_back());
+  int64_t columns = tmaShape.back();
+  if (encoding.getTransposed())
+    std::swap(rows, columns);
+  auto core = getCoreMatrixLinearLayout(encoding, /*disableSwizzle=*/false);
+  auto *ctx = encoding.getContext();
+  int packingFactor = encoding.getFp4Padded() ? 2 : 1;
+  return rows >= core.getOutDimSize(StringAttr::get(ctx, "dim0")) &&
+         columns * packingFactor >=
+             core.getOutDimSize(StringAttr::get(ctx, "dim1"));
+}
+#endif
+
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
                                                    Attribute srcEnc,
                                                    ArrayRef<int64_t> dstShape,
@@ -778,12 +805,26 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
             ctx, mmaEncoding.getSwizzlingByteWidth(),
             mmaEncoding.getTransposed(), mmaEncoding.getElementBitWidth(),
             mmaEncoding.getFp4Padded(), CTALayout);
+#ifdef __TLE__
+        // An unchanged innermost dimension is insufficient for rank-changing
+        // views: the collapsed row extent must still contain a swizzle core.
+        // Only form a candidate linear layout after proving its geometry legal.
+        if (canHoldNVMMASwizzleCore(dstShape, candidateEncoding)) {
+          auto srcLL = toLinearLayout(srcShape, srcEnc);
+          auto dstLL = toLinearLayout(dstShape, candidateEncoding);
+          if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
+            dstEnc = candidateEncoding;
+            return success();
+          }
+        }
+#else
         auto srcLL = toLinearLayout(srcShape, srcEnc);
         auto dstLL = toLinearLayout(dstShape, candidateEncoding);
         if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
           dstEnc = candidateEncoding;
           return success();
         }
+#endif
       }
     }
   } else if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
@@ -983,9 +1024,11 @@ LogicalResult MemDescIndexOp::verify() {
   }
 
   bool isSubview = srcTy.getAllocShape() != srcTy.getShape();
+#ifndef __TLE__
   if (isSubview) {
     return emitError("We don't support memdesc_index of a subview");
   }
+#endif
 
   auto srcEnc = srcTy.getEncoding();
   auto dstEnc = dstTy.getEncoding();
@@ -997,10 +1040,22 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
+#ifdef __TLE__
+  ArrayRef<int64_t> expectedDstAllocShape =
+      isSubview ? srcTy.getAllocShape() : dstTy.getShape();
+  if (dstTy.getAllocShape() != expectedDstAllocShape) {
+    if (!isSubview)
+      return emitError("alloc shape must match shape for both result and src");
+    return emitError("result alloc shape must be ")
+           << expectedDstAllocShape
+           << " to preserve the indexed subview allocation";
+  }
+#else
   if (dstTy.getAllocShape() != dstTy.getShape() ||
       srcTy.getAllocShape() != srcTy.getShape()) {
     return emitError("alloc shape must match shape for both result and src");
   }
+#endif
 
   if (isa<triton::nvidia_gpu::TensorMemoryEncodingAttr>(srcEnc)) {
     // We support only 3D -> 2D subviews with only first offset being non-zero.
